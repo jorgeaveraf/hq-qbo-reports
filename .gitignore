@@ -1,0 +1,4 @@
+**/client_secret_*.apps.googleusercontent.com.json
+**/.clasp.json
+**/.clasprc*.json
+**/node_modules/
