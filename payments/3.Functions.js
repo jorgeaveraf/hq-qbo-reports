@@ -1155,14 +1155,36 @@ function normalizePayment_(client, range, payment, loadedAt) {
 function validatePaymentReconciliation_(header, rows) {
   const totalCents = Math.round(Number(header.TotalAmount || 0) * 100);
   const unappliedCents = Math.round(Number(header.UnappliedAmount || 0) * 100);
-  const signedLineCents = rows.filter(row => row.RecordType === PAYMENT_RECORD_TYPES.line)
+  const lineRows = rows.filter(row => row.RecordType === PAYMENT_RECORD_TYPES.line);
+  const signedLineCents = lineRows
     .reduce((sum, row) => sum + Math.round(Number(row.LineAmountSigned || 0) * 100), 0);
+  const result = { totalAmount: totalCents / 100, signedLineAmount: signedLineCents / 100, unappliedAmount: unappliedCents / 100 };
+
+  // QBO zeroes a voided payment header but may retain its historical application lines.
+  if (header.IsVoided) {
+    if (Math.abs(totalCents) > PAYMENT_RECONCILIATION_TOLERANCE_CENTS || Math.abs(unappliedCents) > PAYMENT_RECONCILIATION_TOLERANCE_CENTS) {
+      throw new Error('Voided payment contains non-zero header amounts. PaymentId=' + header.PaymentId +
+        ', TotalAmount=' + header.TotalAmount + ', UnappliedAmount=' + header.UnappliedAmount);
+    }
+    return result;
+  }
+
+  // A credit-only application moves no cash, so TotalAmount and UnappliedAmount
+  // are zero while credit-side linked transactions retain negative amounts.
+  const isCreditOnlyPayment =
+    Math.abs(totalCents) <= PAYMENT_RECONCILIATION_TOLERANCE_CENTS &&
+    Math.abs(unappliedCents) <= PAYMENT_RECONCILIATION_TOLERANCE_CENTS &&
+    lineRows.length > 0 &&
+    signedLineCents < -PAYMENT_RECONCILIATION_TOLERANCE_CENTS &&
+    lineRows.every(row => getPaymentLineSign_(row.LinkedTxnType) < 0);
+  if (isCreditOnlyPayment) return result;
+
   const difference = totalCents - (signedLineCents + unappliedCents);
   if (Math.abs(difference) > PAYMENT_RECONCILIATION_TOLERANCE_CENTS) {
     throw new Error('Payment reconciliation failed. PaymentId=' + header.PaymentId + ', TotalAmount=' + header.TotalAmount +
       ', SignedLineAmount=' + signedLineCents / 100 + ', UnappliedAmount=' + header.UnappliedAmount + ', Difference=' + difference / 100);
   }
-  return { totalAmount: totalCents / 100, signedLineAmount: signedLineCents / 100, unappliedAmount: unappliedCents / 100 };
+  return result;
 }
 
 function paymentUpdatedInRange_(payment, range) {
