@@ -60,6 +60,70 @@ function debugPaymentSnapshotAssembly() {
   return output;
 }
 
+function debugPaymentBackfillPlan() {
+  const plan = planPaymentBackfill_({
+    startDate: PAYMENT_BACKFILL_CONFIG.startDate
+  });
+  const result = {
+    event: 'payment_backfill_plan_debug',
+    modifiesBigQuery: false,
+    modifiesSheets: false,
+    createsTriggers: false,
+    startDate: plan.startDate,
+    horizonDate: plan.horizonDate,
+    today: plan.today,
+    periodCount: plan.periodCount,
+    firstPeriod: plan.firstPeriod,
+    lastPeriod: plan.lastPeriod
+  };
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function debugPaymentBackfillPoc() {
+  const execution = buildPaymentBackfillPoc_({
+    startDate: PAYMENT_BACKFILL_CONFIG.startDate
+  });
+  const result = {
+    event: 'payment_backfill_poc_debug',
+    modifiesBigQuery: false,
+    modifiesSheets: false,
+    createsTriggers: false,
+    execution
+  };
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function debugPaymentBackfillState() {
+  const state = readPaymentBackfillState_();
+  const result = state
+    ? { event: 'payment_backfill_state_debug', ...summarizePaymentBackfillState_(state, false) }
+    : { event: 'payment_backfill_state_debug', status: 'not_found' };
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function debugRunPaymentBackfillWorker() {
+  const result = processPaymentBackfill();
+  Logger.log(JSON.stringify({ event: 'payment_backfill_worker_debug', result }, null, 2));
+  return result;
+}
+
+function debugResetPaymentBackfill() {
+  const deletedTriggerCount = deletePaymentBackfillWorkerTriggers_();
+  PropertiesService.getScriptProperties().deleteProperty(
+    PAYMENT_BACKFILL_CONFIG.statePropertyKey
+  );
+  const result = {
+    event: 'payment_backfill_reset',
+    deletedTriggerCount,
+    stateDeleted: true
+  };
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
 function debugPaymentBigQuerySchema() {
   const result = validatePaymentBigQuerySchema_();
   Logger.log(JSON.stringify({ event: 'payment_bigquery_schema_debug', ...result }, null, 2));

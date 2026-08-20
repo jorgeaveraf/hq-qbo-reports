@@ -241,31 +241,50 @@ function refreshPaymentConnectedSheetsStage_(stage, spreadsheetOverride) {
   const spreadsheet = spreadsheetOverride || getPaymentReportSpreadsheet_();
   SpreadsheetApp.enableBigQueryExecution();
   const targets = getPaymentConnectedSheetTargets_(spreadsheet, stage);
-  targets.forEach(target => target.refresh());
+  let refreshStartedCount = 0;
+  targets.forEach(target => {
+    const currentState = String(target.getStatus().getExecutionState());
+    if (currentState === 'RUNNING') return;
+    target.refresh();
+    refreshStartedCount++;
+  });
   spreadsheet.waitForAllDataExecutionsCompletion(PAYMENT_CONNECTED_SHEETS_CONFIG.timeoutSeconds);
 
-  const executions = targets.map(target => {
-    const status = target.getStatus();
-    const lastRefreshedTime = status.getLastRefreshedTime();
-    const lastExecutionTime = status.getLastExecutionTime();
-    return {
-      name: target.name,
-      type: target.type,
-      state: String(status.getExecutionState()),
-      errorCode: String(status.getErrorCode()),
-      errorMessage: String(status.getErrorMessage() || '').trim() || null,
-      lastExecutionAt: lastExecutionTime ? lastExecutionTime.toISOString() : null,
-      lastRefreshedAt: lastRefreshedTime ? lastRefreshedTime.toISOString() : null,
-      truncated: status.isTruncated() === true
-    };
-  });
+  const deadline = Date.now() + PAYMENT_CONNECTED_SHEETS_CONFIG.timeoutSeconds * 1000;
+  let executions;
+  while (true) {
+    executions = targets.map(target => {
+      const status = target.getStatus();
+      const lastRefreshedTime = status.getLastRefreshedTime();
+      const lastExecutionTime = status.getLastExecutionTime();
+      return {
+        name: target.name,
+        type: target.type,
+        state: String(status.getExecutionState()),
+        errorCode: String(status.getErrorCode()),
+        errorMessage: String(status.getErrorMessage() || '').trim() || null,
+        lastExecutionAt: lastExecutionTime ? lastExecutionTime.toISOString() : null,
+        lastRefreshedAt: lastRefreshedTime ? lastRefreshedTime.toISOString() : null,
+        truncated: status.isTruncated() === true
+      };
+    });
 
-  const failures = executions.filter(execution => execution.state !== 'SUCCESS' || execution.errorCode !== 'NONE' || execution.truncated);
-  if (failures.length) {
-    throw new Error('Payments Connected Sheets stage failed: ' + JSON.stringify({ stage, failures }));
+    const running = executions.filter(execution => execution.state === 'RUNNING');
+    const terminalFailures = executions.filter(execution =>
+      execution.state !== 'RUNNING' &&
+      (execution.state !== 'SUCCESS' || execution.errorCode !== 'NONE' || execution.truncated)
+    );
+    if (terminalFailures.length) {
+      throw new Error('Payments Connected Sheets stage failed: ' + JSON.stringify({ stage, failures: terminalFailures }));
+    }
+    if (!running.length) break;
+    if (Date.now() >= deadline) {
+      throw new Error('Payments Connected Sheets stage timed out: ' + JSON.stringify({ stage, executions }));
+    }
+    Utilities.sleep(5000);
   }
 
-  const result = { status: 'passed', stage, refreshedObjectCount: executions.length, executions };
+  const result = { status: 'passed', stage, refreshedObjectCount: executions.length, refreshStartedCount, executions };
   Logger.log(JSON.stringify({ event: 'payment_connected_sheets_stage_completed', ...result }));
   return result;
 }
