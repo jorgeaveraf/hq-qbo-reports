@@ -8,6 +8,23 @@ function getAgingQboApiKey_() {
   return apiKey;
 }
 
+function getTargetSpreadsheet_() {
+  const active = SpreadsheetApp.getActiveSpreadsheet();
+  if (active) return active;
+
+  const spreadsheetId = PropertiesService
+    .getScriptProperties()
+    .getProperty('TARGET_SPREADSHEET_ID');
+
+  if (!spreadsheetId) {
+    throw new Error(
+      'Missing Script Property: TARGET_SPREADSHEET_ID'
+    );
+  }
+
+  return SpreadsheetApp.openById(spreadsheetId);
+}
+
 /***********************
  * Central Entity Configuration
  ***********************/
@@ -521,63 +538,77 @@ function applyAgingPushedConfiguration_(pushPayload, configuration) {
 
   if (existing) {
     if (incomingVersion < existing.configuration_version) {
-      throw new Error('Incoming Aging configuration is stale. Current=' + existing.configuration_version + ', incoming=' + incomingVersion);
+      throw new Error(
+        'Incoming Aging configuration is stale. Current=' +
+          existing.configuration_version +
+          ', incoming=' +
+          incomingVersion
+      );
     }
-    if (incomingVersion === existing.configuration_version && incomingHash !== existing.configuration_hash) {
-      throw new Error('Incoming Aging configuration conflicts with the current version hash.');
-    }
-    if (incomingVersion === existing.configuration_version && incomingHash === existing.configuration_hash) {
-      cacheAgingEntityConfiguration_(existing);
-      const receipt = buildAgingPushReceipt_(pushPayload, 'idempotent');
-      persistAgingPushReceipt_(receipt);
-      return {
-        success: true,
-        status: 'idempotent',
-        reportKey: AGING_ENTITY_CONTROL.reportKey,
-        configurationVersion: existing.configuration_version,
-        configurationHash: existing.configuration_hash
-      };
+
+    if (
+      incomingVersion === existing.configuration_version &&
+      incomingHash !== existing.configuration_hash
+    ) {
+      throw new Error(
+        'Incoming Aging configuration conflicts with the current version hash.'
+      );
     }
   }
 
-  persistAgingEntityConfiguration_(configuration);
+  if (
+    !existing ||
+    incomingVersion > existing.configuration_version
+  ) {
+    persistAgingEntityConfiguration_(configuration);
+  }
   cacheAgingEntityConfiguration_(configuration);
-  const deployment = queueAgingConfigurationDeployment_(pushPayload, configuration);
-  const receipt = buildAgingPushReceipt_(pushPayload, deployment.queued ? 'queued' : 'idempotent');
+
+  const deployment = queueAgingConfigurationDeployment_(
+    pushPayload,
+    configuration,
+    {
+      source: 'configuration_push',
+      range: buildAgingSnapshotRange_()
+    }
+  );
+  const responseStatus = deployment.queued ? 'queued' : 'idempotent';
+  const receipt = buildAgingPushReceipt_(pushPayload, responseStatus);
   receipt.operation_id = deployment.operationId;
   receipt.deployment_status = deployment.status;
   receipt.current_stage = deployment.currentStage;
+  receipt.snapshot_date = deployment.range &&
+    deployment.range.snapshotDate || null;
+  receipt.snapshot_week = deployment.range &&
+    deployment.range.snapshotWeek || null;
   persistAgingPushReceipt_(receipt);
 
   Logger.log(JSON.stringify({
-    event: 'aging_entity_configuration_push_queued',
+    event: deployment.queued
+      ? 'aging_entity_configuration_push_queued'
+      : 'aging_entity_configuration_push_idempotent',
     configurationVersion: configuration.configuration_version,
     configurationHash: configuration.configuration_hash,
     operationId: deployment.operationId,
+    deploymentStatus: deployment.status,
     currentStage: deployment.currentStage,
+    snapshotDate: receipt.snapshot_date,
     entityCount: configuration.entities.length
   }));
 
-  if (!deployment.queued) {
-    return {
-      success: true,
-      status: 'idempotent',
-      reportKey: AGING_ENTITY_CONTROL.reportKey,
-      configurationVersion: configuration.configuration_version,
-      configurationHash: configuration.configuration_hash
-    };
-  }
   return {
     success: true,
-    status: 'queued',
+    status: responseStatus,
     reportKey: AGING_ENTITY_CONTROL.reportKey,
     configurationVersion: configuration.configuration_version,
     configurationHash: configuration.configuration_hash,
     operationId: deployment.operationId,
     deploymentStatus: deployment.status,
-    currentStage: deployment.currentStage
+    currentStage: deployment.currentStage,
+    snapshotDate: receipt.snapshot_date
   };
 }
+
 
 function buildAgingPushReceipt_(pushPayload, status) {
   return {
@@ -713,7 +744,7 @@ function getOrCreateAgingSheet_(spreadsheet, sheetName) {
 }
 
 function writeOutputSheet_(rows, sheetName) {
-  const sheet = getOrCreateAgingSheet_(SpreadsheetApp.getActiveSpreadsheet(), sheetName);
+  const sheet = getOrCreateAgingSheet_(getTargetSpreadsheet_(), sheetName);
   sheet.clearContents();
   sheet.getRange(1, 1, 1, EXPORT_COLUMNS.length).setValues([EXPORT_COLUMNS]);
   if (!rows.length) return;
@@ -762,14 +793,31 @@ function fetchJsonResponse_(url) {
  ***********************/
 
 function snapshotAgingToBigQuery() {
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(5000)) throw new Error('Another Aging snapshot or deployment execution is already running.');
-  try {
-    return executeAgingBigQuerySnapshot_();
-  } finally {
-    lock.releaseLock();
+  const loaded = loadAgingEntityConfiguration_();
+  const range = buildAgingSnapshotRange_();
+  const deployment = queueAgingConfigurationDeployment_(
+    { request_id: Utilities.getUuid() },
+    loaded.configuration,
+    {
+      source: 'scheduled_snapshot',
+      range
+    }
+  );
+
+  if (deployment.status === 'completed' && deployment.queued !== true) {
+    Logger.log(JSON.stringify({
+      event: 'aging_snapshot_deployment_idempotent',
+      operationId: deployment.operationId,
+      snapshotDate: range.snapshotDate,
+      configurationVersion: deployment.configurationVersion,
+      configurationHash: deployment.configurationHash
+    }));
+    return deployment;
   }
+
+  return processAgingConfigurationDeployment();
 }
+
 
 function executeAgingBigQuerySnapshot_(loadedEntityConfiguration) {
   Logger.log('--- BQ AGING SNAPSHOT START ---');
@@ -796,59 +844,155 @@ function executeAgingBigQuerySnapshot_(loadedEntityConfiguration) {
 }
 
 function buildAgingSnapshot_(loadedEntityConfiguration) {
-  const snapshotDate = todayIsoDate_();
-  const snapshotWeek = getWeekStartMonday_(snapshotDate);
+  const range = buildAgingSnapshotRange_();
   const loadedAt = new Date().toISOString();
-  const selection = resolveAgingEntitySelection_(loadedEntityConfiguration);
-  const clientsById = selection.clientsById;
-  const clientIds = Object.keys(clientsById);
+  const snapshotClients = getAgingSnapshotClients_(loadedEntityConfiguration);
   const rows = [];
   const reportRowCounts = { AR: 0, AP: 0 };
-  Logger.log('Clientes filtrados: ' + clientIds.length);
-  clientIds.forEach(clientId => {
-    const client = clientsById[clientId];
-    ['customer', 'vendor'].forEach(reportKind => {
-      const payload = fetchReport_(clientId, reportKind);
-      if (!payload) return;
-      const asOfDate = extractAsOfDate_(payload);
-      const flatRows = flattenReport_(payload);
-      if (!flatRows.length) {
-        Logger.log('Sin filas para clientId=' + clientId + ', reportKind=' + reportKind);
-        return;
-      }
-      const exportRows = mapToExportRows_(flatRows, client, reportKind, asOfDate);
-      exportRows.forEach(row => rows.push({
-        snapshot_date: snapshotDate,
-        snapshot_week: snapshotWeek,
-        report_type: row[0],
-        entity: row[1],
-        as_of_date: row[2],
-        bucket: row[3],
-        counterparty: row[4],
-        document_number: row[5] || null,
-        document_type: row[6],
-        transaction_date: row[7] || null,
-        due_date: row[8] || null,
-        days_overdue: row[9] === '' ? null : Number(row[9]),
-        open_amount: Number(row[10] || 0),
-        currency: row[11],
-        source: row[12],
-        client_id: clientId,
-        client_name: client.name,
-        loaded_at: loadedAt
-      }));
-      reportRowCounts[reportKind === 'customer' ? 'AR' : 'AP'] += exportRows.length;
-      Logger.log('BQ filas preparadas: ' + exportRows.length + ' para clientId=' + clientId + ', reportKind=' + reportKind);
-    });
+
+  Logger.log('Clientes filtrados: ' + snapshotClients.clients.length);
+
+  snapshotClients.clients.forEach(client => {
+    const clientSnapshot = buildAgingClientSnapshot_(client, range, loadedAt);
+    clientSnapshot.rows.forEach(row => rows.push(row));
+    reportRowCounts.AR += clientSnapshot.reportRowCounts.AR;
+    reportRowCounts.AP += clientSnapshot.reportRowCounts.AP;
   });
+
   return {
-    entityConfiguration: buildAgingEntityConfigurationSummary_(selection),
-    snapshotDate,
-    snapshotWeek,
-    clientCount: clientIds.length,
+    entityConfiguration: buildAgingEntityConfigurationSummary_(snapshotClients.selection),
+    snapshotDate: range.snapshotDate,
+    snapshotWeek: range.snapshotWeek,
+    clientCount: snapshotClients.clients.length,
     reportRowCounts,
     rows
   };
+}
+
+
+function buildAgingSnapshotRange_(snapshotDateOverride) {
+  const snapshotDate = String(snapshotDateOverride || todayIsoDate_()).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotDate)) {
+    throw new Error('Invalid Aging snapshot date: ' + snapshotDate);
+  }
+  const snapshotWeek = getWeekStartMonday_(snapshotDate);
+  return {
+    snapshotDate,
+    snapshotWeek,
+    periodKey: snapshotDate
+  };
+}
+
+function normalizeAgingLoadedEntityConfiguration_(loadedEntityConfiguration) {
+  if (loadedEntityConfiguration && loadedEntityConfiguration.configuration) {
+    return {
+      source: String(loadedEntityConfiguration.source || 'provided_configuration'),
+      configuration: validateAgingEntityConfiguration_(loadedEntityConfiguration.configuration)
+    };
+  }
+  if (loadedEntityConfiguration && loadedEntityConfiguration.report_key) {
+    return {
+      source: 'provided_configuration',
+      configuration: validateAgingEntityConfiguration_(loadedEntityConfiguration)
+    };
+  }
+  return loadAgingEntityConfiguration_();
+}
+
+function getAgingSnapshotClients_(loadedEntityConfiguration) {
+  const loaded = normalizeAgingLoadedEntityConfiguration_(loadedEntityConfiguration);
+  const selection = resolveAgingEntitySelection_(loaded);
+  const clients = Object.keys(selection.clientsById)
+    .map(clientId => selection.clientsById[clientId])
+    .sort((left, right) => {
+      const byName = String(left.name || '').localeCompare(String(right.name || ''));
+      return byName || String(left.id || '').localeCompare(String(right.id || ''));
+    })
+    .map(client => ({
+      id: String(client.id || '').trim(),
+      name: String(client.name || '').trim(),
+      entity: String(client.entity || '').trim(),
+      entityAlias: String(client.entityAlias || '').trim(),
+      outputSheetName: String(client.outputSheetName || '').trim(),
+      authorizationMatchType: String(client.authorizationMatchType || '').trim()
+    }));
+
+  return { loaded, selection, clients };
+}
+
+function buildAgingClientSnapshot_(client, range, loadedAt) {
+  if (!client || !String(client.id || '').trim()) {
+    throw new Error('A valid Aging client is required.');
+  }
+
+  const clientId = String(client.id).trim();
+  const rows = [];
+  const reportRowCounts = { AR: 0, AP: 0 };
+  const openAmountCents = { AR: 0, AP: 0 };
+
+  ['customer', 'vendor'].forEach(reportKind => {
+    const payload = fetchReport_(clientId, reportKind);
+    if (!payload) return;
+
+    const reportType = reportKind === 'customer' ? 'AR' : 'AP';
+    const asOfDate = extractAsOfDate_(payload);
+    const flatRows = flattenReport_(payload);
+
+    if (!flatRows.length) {
+      Logger.log('Sin filas para clientId=' + clientId + ', reportKind=' + reportKind);
+      return;
+    }
+
+    const exportRows = mapToExportRows_(flatRows, client, reportKind, asOfDate);
+    exportRows.forEach(exportRow => {
+      const row = {
+        snapshot_date: range.snapshotDate,
+        snapshot_week: range.snapshotWeek,
+        report_type: exportRow[0],
+        entity: exportRow[1],
+        as_of_date: exportRow[2],
+        bucket: exportRow[3],
+        counterparty: exportRow[4],
+        document_number: exportRow[5] || null,
+        document_type: exportRow[6],
+        transaction_date: exportRow[7] || null,
+        due_date: exportRow[8] || null,
+        days_overdue: exportRow[9] === '' ? null : Number(exportRow[9]),
+        open_amount: Number(exportRow[10] || 0),
+        currency: exportRow[11],
+        source: exportRow[12],
+        client_id: clientId,
+        client_name: client.name,
+        loaded_at: loadedAt
+      };
+      rows.push(row);
+      openAmountCents[reportType] += agingAmountToCents_(row.open_amount);
+    });
+
+    reportRowCounts[reportType] += exportRows.length;
+    Logger.log(
+      'BQ filas preparadas: ' + exportRows.length +
+      ' para clientId=' + clientId +
+      ', reportKind=' + reportKind
+    );
+  });
+
+  return {
+    client,
+    rows,
+    rowCount: rows.length,
+    uniqueRowCount: countUniqueAgingRows_(rows),
+    reportRowCounts,
+    openAmountCents
+  };
+}
+
+function agingAmountToCents_(value) {
+  const amount = Number(value || 0);
+  if (!Number.isFinite(amount)) {
+    throw new Error('Invalid Aging amount: ' + value);
+  }
+  return Math.round((amount + Number.EPSILON) * 100);
 }
 
 function validateAgingBigQuerySchema_() {
@@ -943,30 +1087,288 @@ function countUniqueAgingRows_(rows) {
 }
 
 function verifyAgingSnapshotPartition_(snapshotDate, expectedRowCount, expectedUniqueRowCount) {
-  const query = [
+  return verifyAgingSnapshotPartitionDetailed_(snapshotDate, {
+    rowCount: Number(expectedRowCount || 0),
+    uniqueRowCount: Number(
+      expectedUniqueRowCount === undefined ? expectedRowCount : expectedUniqueRowCount
+    )
+  });
+}
+
+
+function escapeAgingBigQueryString_(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'");
+}
+
+function buildAgingPartitionClearQuery_(snapshotDate) {
+  return (
+    'DELETE FROM `' + AGING_BIGQUERY_TABLE + '` ' +
+    "WHERE snapshot_date = DATE '" + escapeAgingBigQueryString_(snapshotDate) + "'"
+  );
+}
+
+function buildAgingClientDeleteQuery_(snapshotDate, clientId) {
+  return (
+    'DELETE FROM `' + AGING_BIGQUERY_TABLE + '` ' +
+    "WHERE snapshot_date = DATE '" + escapeAgingBigQueryString_(snapshotDate) + "' " +
+    "AND client_id = '" + escapeAgingBigQueryString_(clientId) + "'"
+  );
+}
+
+function buildAgingVerificationQuery_(snapshotDate) {
+  return [
     'SELECT',
     '  COUNT(*) AS row_count,',
     "  COUNTIF(client_id IS NULL OR TRIM(client_id) = '' OR entity IS NULL OR TRIM(entity) = '' OR report_type IS NULL OR TRIM(report_type) = '') AS missing_key_count,",
-    '  COUNT(DISTINCT FARM_FINGERPRINT(TO_JSON_STRING(t))) AS unique_row_count',
+    '  COUNT(DISTINCT FARM_FINGERPRINT(TO_JSON_STRING(t))) AS unique_row_count,',
+    '  COUNT(DISTINCT client_id) AS client_count,',
+    "  COUNTIF(report_type = 'AR') AS ar_row_count,",
+    "  COUNTIF(report_type = 'AP') AS ap_row_count,",
+    "  COUNTIF(report_type NOT IN ('AR', 'AP')) AS invalid_report_type_count,",
+    "  COALESCE(SUM(IF(report_type = 'AR', open_amount, 0)), 0) AS ar_open_amount,",
+    "  COALESCE(SUM(IF(report_type = 'AP', open_amount, 0)), 0) AS ap_open_amount",
     'FROM `' + AGING_BIGQUERY_TABLE + '` AS t',
-    "WHERE snapshot_date = DATE '" + snapshotDate + "'"
+    "WHERE snapshot_date = DATE '" + escapeAgingBigQueryString_(snapshotDate) + "'"
   ].join('\n');
-  const result = runAgingBigQueryQuery_(query);
-  const values = result.rows && result.rows.length ? result.rows[0].f : [];
-  const actualRowCount = Number(values[0] ? values[0].v : 0);
-  const missingKeyCount = Number(values[1] ? values[1].v : 0);
-  const actualUniqueRowCount = Number(values[2] ? values[2].v : 0);
-  const expectedUnique = Number(expectedUniqueRowCount === undefined ? expectedRowCount : expectedUniqueRowCount);
-  if (actualRowCount !== expectedRowCount) throw new Error('Aging partition row count mismatch. Expected=' + expectedRowCount + ', actual=' + actualRowCount);
-  if (missingKeyCount !== 0) throw new Error('Aging partition contains rows with missing operational keys. Missing=' + missingKeyCount);
-  if (actualUniqueRowCount !== expectedUnique) throw new Error('Aging partition unique-row mismatch. ExpectedUnique=' + expectedUnique + ', actualUnique=' + actualUniqueRowCount);
+}
+
+function buildAgingBigQueryJobId_(operationId, snapshotDate, jobKind, clientId, generation) {
+  const operationToken = String(operationId || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 20);
+  const dateToken = String(snapshotDate || '').replace(/-/g, '');
+  const clientToken = clientId ? agingSha256Hex_(String(clientId)).slice(0, 16) : 'all';
+  const kindToken = String(jobKind || 'job').replace(/[^A-Za-z0-9_]/g, '_').slice(0, 30);
+  return [
+    'aging',
+    kindToken,
+    dateToken,
+    operationToken || 'operation',
+    clientToken,
+    'g' + Number(generation || 0)
+  ].join('_');
+}
+
+function getAgingBigQueryJobIfExists_(jobId) {
+  try {
+    return BigQuery.Jobs.get(BQ_CONFIG.projectId, jobId);
+  } catch (error) {
+    const message = String(error && error.message || error);
+    if (/not[ -]?found|notFound/i.test(message)) return null;
+    throw error;
+  }
+}
+
+function assertAgingBigQueryJobSucceeded_(job) {
+  if (!job || !job.status || job.status.state !== 'DONE') {
+    throw new Error('Aging BigQuery job is not complete.');
+  }
+  if (job.status.errorResult) {
+    throw new Error('Aging BigQuery job failed: ' + JSON.stringify({
+      jobId: job.jobReference && job.jobReference.jobId || null,
+      errorResult: job.status.errorResult,
+      errors: job.status.errors || []
+    }));
+  }
+  return job;
+}
+
+function waitForAgingBigQueryJobOrYield_(jobReference, timeoutMs) {
+  const startedAt = Date.now();
+  const projectId = jobReference.projectId || BQ_CONFIG.projectId;
+  let job;
+
+  while (true) {
+    job = BigQuery.Jobs.get(projectId, jobReference.jobId);
+    if (job.status && job.status.state === 'DONE') {
+      return { done: true, job: assertAgingBigQueryJobSucceeded_(job) };
+    }
+    if (Date.now() - startedAt >= Number(timeoutMs || AGING_OPERATIONAL_DEPLOYMENT.bigQueryJobWaitMs)) {
+      return { done: false, job };
+    }
+    Utilities.sleep(1000);
+  }
+}
+
+function ensureAgingBigQueryQueryJob_(jobId, query) {
+  let job = getAgingBigQueryJobIfExists_(jobId);
+  if (!job) {
+    job = BigQuery.Jobs.insert({
+      jobReference: {
+        projectId: BQ_CONFIG.projectId,
+        jobId
+      },
+      configuration: {
+        query: {
+          query,
+          useLegacySql: false
+        }
+      }
+    }, BQ_CONFIG.projectId);
+  }
+
+  if (!job || !job.jobReference) {
+    throw new Error('BigQuery did not return a job reference for Aging query job ' + jobId + '.');
+  }
+
+  const waited = waitForAgingBigQueryJobOrYield_(
+    job.jobReference,
+    AGING_OPERATIONAL_DEPLOYMENT.bigQueryJobWaitMs
+  );
   return {
-    status: 'passed', snapshotDate, partitionId: snapshotDate.replace(/-/g, ''),
-    expectedRowCount, actualRowCount, missingKeyCount,
-    expectedUniqueRowCount: expectedUnique,
-    actualUniqueRowCount,
-    sourceDuplicateRowCount: expectedRowCount - expectedUnique
+    done: waited.done,
+    job: waited.job,
+    jobId
   };
+}
+
+function ensureAgingBigQueryLoadJob_(jobId, snapshotDate, rows) {
+  let job = getAgingBigQueryJobIfExists_(jobId);
+  let payloadBytes = null;
+
+  if (!job) {
+    if (!Array.isArray(rows)) {
+      throw new Error('Aging rows are required to create load job ' + jobId + '.');
+    }
+
+    const preparedRows = rows.map((row, index) => {
+      validateAgingBigQueryRow_(row, index, snapshotDate);
+      return AGING_BIGQUERY_COLUMNS.reduce((json, column) => {
+        json[column] = row[column] === undefined ? null : row[column];
+        return json;
+      }, {});
+    });
+
+    const ndjson = preparedRows.map(JSON.stringify).join('\n');
+    const partitionId = snapshotDate.replace(/-/g, '');
+    const blob = Utilities.newBlob(
+      ndjson,
+      'application/octet-stream',
+      'aging_client_' + partitionId + '.ndjson'
+    );
+    payloadBytes = blob.getBytes().length;
+
+    job = BigQuery.Jobs.insert({
+      jobReference: {
+        projectId: BQ_CONFIG.projectId,
+        jobId
+      },
+      configuration: {
+        load: {
+          destinationTable: {
+            projectId: BQ_CONFIG.projectId,
+            datasetId: BQ_CONFIG.datasetId,
+            tableId: BQ_CONFIG.tableId + '$' + partitionId
+          },
+          sourceFormat: 'NEWLINE_DELIMITED_JSON',
+          createDisposition: 'CREATE_NEVER',
+          writeDisposition: 'WRITE_APPEND',
+          autodetect: false,
+          ignoreUnknownValues: false,
+          maxBadRecords: 0
+        }
+      }
+    }, BQ_CONFIG.projectId, blob);
+  }
+
+  if (!job || !job.jobReference) {
+    throw new Error('BigQuery did not return a job reference for Aging load job ' + jobId + '.');
+  }
+
+  const waited = waitForAgingBigQueryJobOrYield_(
+    job.jobReference,
+    AGING_OPERATIONAL_DEPLOYMENT.bigQueryJobWaitMs
+  );
+  const outputRows = waited.done && waited.job.statistics && waited.job.statistics.load &&
+    waited.job.statistics.load.outputRows !== undefined
+    ? Number(waited.job.statistics.load.outputRows)
+    : null;
+
+  return {
+    done: waited.done,
+    job: waited.job,
+    jobId,
+    outputRows,
+    payloadBytes
+  };
+}
+
+function getAgingBigQueryQueryResult_(jobId) {
+  let result = BigQuery.Jobs.getQueryResults(BQ_CONFIG.projectId, jobId, { maxResults: 10 });
+  if (!result.jobComplete) {
+    return { done: false, result };
+  }
+  if (result.errors && result.errors.length) {
+    throw new Error('Aging BigQuery query failed: ' + JSON.stringify(result.errors));
+  }
+  return { done: true, result };
+}
+
+function parseAgingVerificationResult_(snapshotDate, queryResult, expected) {
+  const values = queryResult.rows && queryResult.rows.length ? queryResult.rows[0].f : [];
+  const actual = {
+    rowCount: Number(values[0] ? values[0].v : 0),
+    missingKeyCount: Number(values[1] ? values[1].v : 0),
+    uniqueRowCount: Number(values[2] ? values[2].v : 0),
+    clientCount: Number(values[3] ? values[3].v : 0),
+    arRowCount: Number(values[4] ? values[4].v : 0),
+    apRowCount: Number(values[5] ? values[5].v : 0),
+    invalidReportTypeCount: Number(values[6] ? values[6].v : 0),
+    arOpenAmountCents: agingAmountToCents_(values[7] ? values[7].v : 0),
+    apOpenAmountCents: agingAmountToCents_(values[8] ? values[8].v : 0)
+  };
+
+  const normalizedExpected = {
+    rowCount: Number(expected.rowCount || 0),
+    uniqueRowCount: Number(expected.uniqueRowCount === undefined ? expected.rowCount : expected.uniqueRowCount),
+    clientCount: expected.clientCount === undefined ? null : Number(expected.clientCount),
+    arRowCount: expected.reportRowCounts ? Number(expected.reportRowCounts.AR || 0) : null,
+    apRowCount: expected.reportRowCounts ? Number(expected.reportRowCounts.AP || 0) : null,
+    arOpenAmountCents: expected.openAmountCents ? Number(expected.openAmountCents.AR || 0) : null,
+    apOpenAmountCents: expected.openAmountCents ? Number(expected.openAmountCents.AP || 0) : null
+  };
+
+  if (actual.rowCount !== normalizedExpected.rowCount) {
+    throw new Error('Aging partition row count mismatch. Expected=' + normalizedExpected.rowCount + ', actual=' + actual.rowCount);
+  }
+  if (actual.missingKeyCount !== 0) {
+    throw new Error('Aging partition contains rows with missing operational keys. Missing=' + actual.missingKeyCount);
+  }
+  if (actual.uniqueRowCount !== normalizedExpected.uniqueRowCount) {
+    throw new Error('Aging partition unique-row mismatch. ExpectedUnique=' + normalizedExpected.uniqueRowCount + ', actualUnique=' + actual.uniqueRowCount);
+  }
+  if (actual.invalidReportTypeCount !== 0) {
+    throw new Error('Aging partition contains invalid report_type values. Count=' + actual.invalidReportTypeCount);
+  }
+  if (normalizedExpected.clientCount !== null && actual.clientCount !== normalizedExpected.clientCount) {
+    throw new Error('Aging partition client count mismatch. Expected=' + normalizedExpected.clientCount + ', actual=' + actual.clientCount);
+  }
+  if (normalizedExpected.arRowCount !== null && actual.arRowCount !== normalizedExpected.arRowCount) {
+    throw new Error('Aging AR row count mismatch. Expected=' + normalizedExpected.arRowCount + ', actual=' + actual.arRowCount);
+  }
+  if (normalizedExpected.apRowCount !== null && actual.apRowCount !== normalizedExpected.apRowCount) {
+    throw new Error('Aging AP row count mismatch. Expected=' + normalizedExpected.apRowCount + ', actual=' + actual.apRowCount);
+  }
+  if (normalizedExpected.arOpenAmountCents !== null && actual.arOpenAmountCents !== normalizedExpected.arOpenAmountCents) {
+    throw new Error('Aging AR open amount mismatch. ExpectedCents=' + normalizedExpected.arOpenAmountCents + ', actualCents=' + actual.arOpenAmountCents);
+  }
+  if (normalizedExpected.apOpenAmountCents !== null && actual.apOpenAmountCents !== normalizedExpected.apOpenAmountCents) {
+    throw new Error('Aging AP open amount mismatch. ExpectedCents=' + normalizedExpected.apOpenAmountCents + ', actualCents=' + actual.apOpenAmountCents);
+  }
+
+  return {
+    status: 'passed',
+    snapshotDate,
+    partitionId: snapshotDate.replace(/-/g, ''),
+    expected: normalizedExpected,
+    actual,
+    sourceDuplicateRowCount: normalizedExpected.rowCount - normalizedExpected.uniqueRowCount
+  };
+}
+
+function verifyAgingSnapshotPartitionDetailed_(snapshotDate, expected) {
+  const queryResult = runAgingBigQueryQuery_(buildAgingVerificationQuery_(snapshotDate));
+  return parseAgingVerificationResult_(snapshotDate, queryResult, expected);
 }
 
 function runAgingBigQueryQuery_(query) {
@@ -1584,8 +1986,7 @@ function todayIsoDate_() {
 }
 function getSpreadsheetTimeZone_() {
   try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const tz = ss ? ss.getSpreadsheetTimeZone() : null;
+    const tz = getTargetSpreadsheet_().getSpreadsheetTimeZone();
 
     return tz || Session.getScriptTimeZone() || 'Etc/UTC';
   } catch (e) {

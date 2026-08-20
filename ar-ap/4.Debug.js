@@ -79,7 +79,7 @@ function debugFilteredClients() {
 
 function debugEnsureAgingOutputSheets() {
   const selection = resolveAgingEntitySelection_();
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const spreadsheet = getTargetSpreadsheet_();
   const aliases = [...new Set(Object.keys(selection.clientsById).map(id => selection.clientsById[id].outputSheetName))];
   const results = aliases.map(alias => {
     const existed = Boolean(spreadsheet.getSheetByName(alias));
@@ -451,4 +451,150 @@ function debugAgingConnectedSheetsObjects() {
   const extracts = spreadsheet.getDataSourceTables().map(table => ({ name: table.getRange().getSheet().getName(), type: 'extract', range: table.getRange().getA1Notation() }));
   const result = { event: 'aging_connected_sheets_objects_debug', modifiesBigQuery: false, modifiesSheets: false, createsTriggers: false, spreadsheetId: spreadsheet.getId(), sourceSheets, extracts };
   Logger.log(JSON.stringify(result, null, 2)); return result;
+}
+
+/***********************
+ * Timeout-Resilient Aging Debug
+ ***********************/
+
+function initializeAgingOperationalDeployment() {
+  const spreadsheet = getTargetSpreadsheet_();
+
+  PropertiesService.getScriptProperties().setProperty(
+    AGING_OPERATIONAL_DEPLOYMENT.reportSpreadsheetIdProperty,
+    spreadsheet.getId()
+  );
+
+  const result = {
+    event: 'aging_operational_deployment_initialized',
+    spreadsheetIdProperty:
+      AGING_OPERATIONAL_DEPLOYMENT.reportSpreadsheetIdProperty,
+    spreadsheetId: spreadsheet.getId(),
+    spreadsheetName: spreadsheet.getName(),
+    workerHandler: AGING_OPERATIONAL_DEPLOYMENT.workerHandler,
+    checkpointPropertyKey:
+      AGING_OPERATIONAL_DEPLOYMENT.checkpointPropertyKey,
+    maxClientsPerExecution:
+      AGING_OPERATIONAL_DEPLOYMENT.maxClientsPerExecution,
+    executionBudgetMs: AGING_OPERATIONAL_DEPLOYMENT.executionBudgetMs,
+    watchdogDelayMs: AGING_OPERATIONAL_DEPLOYMENT.watchdogDelayMs
+  };
+
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function debugAgingBigQueryCheckpoint() {
+  const checkpoint = readAgingBigQueryCheckpoint_();
+  const result = {
+    event: 'aging_bigquery_checkpoint_debug',
+    modifiesBigQuery: false,
+    modifiesSheets: false,
+    createsTriggers: false,
+    checkpoint
+  };
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function debugAgingBigQueryBatchAssembly() {
+  const loaded = loadAgingEntityConfiguration_();
+  const range = buildAgingSnapshotRange_();
+  const loadedAt = new Date().toISOString();
+  const snapshotClients = getAgingSnapshotClients_(loaded);
+  const clients = snapshotClients.clients.slice(
+    0,
+    AGING_OPERATIONAL_DEPLOYMENT.maxClientsPerExecution
+  );
+
+  const clientResults = clients.map(client => {
+    const snapshot = buildAgingClientSnapshot_(client, range, loadedAt);
+    return {
+      clientId: client.id,
+      clientName: client.name,
+      entity: client.entityAlias || client.entity,
+      rowCount: snapshot.rowCount,
+      uniqueRowCount: snapshot.uniqueRowCount,
+      reportRowCounts: snapshot.reportRowCounts,
+      openAmount: {
+        AR: snapshot.openAmountCents.AR / 100,
+        AP: snapshot.openAmountCents.AP / 100
+      }
+    };
+  });
+
+  const result = {
+    event: 'aging_bigquery_batch_assembly_debug',
+    modifiesBigQuery: false,
+    modifiesSheets: false,
+    createsTriggers: false,
+    period: range,
+    maxClientsPerExecution:
+      AGING_OPERATIONAL_DEPLOYMENT.maxClientsPerExecution,
+    totalFilteredClientCount: snapshotClients.clients.length,
+    assembledClientCount: clientResults.length,
+    clients: clientResults
+  };
+
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function debugRunAgingBigQueryContinuation() {
+  const state = readAgingDeploymentState_();
+  if (!state) throw new Error('No Aging deployment state exists.');
+  if (state.current_stage !== 'bigquery') {
+    throw new Error(
+      'The current Aging deployment stage is not bigquery. Current=' +
+        state.current_stage
+    );
+  }
+
+  const execution = processAgingConfigurationDeployment();
+  const result = {
+    event: 'aging_bigquery_continuation_debug',
+    modifiesBigQuery: true,
+    modifiesSheets: false,
+    createsTriggers: true,
+    execution
+  };
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function debugCleanupAgingBigQueryCheckpoint() {
+  const checkpoint = readAgingBigQueryCheckpoint_();
+  const deleted = deleteAgingBigQueryCheckpoint_(
+    checkpoint && checkpoint.operation_id || null
+  );
+  const result = {
+    event: 'aging_bigquery_checkpoint_cleaned',
+    modifiesBigQuery: false,
+    modifiesSheets: false,
+    createsTriggers: false,
+    deleted
+  };
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function debugResetAgingConfigurationDeployment() {
+  const properties = PropertiesService.getScriptProperties();
+  const state = readAgingDeploymentState_();
+  const checkpoint = readAgingBigQueryCheckpoint_();
+  properties.deleteProperty(AGING_OPERATIONAL_DEPLOYMENT.statePropertyKey);
+  properties.deleteProperty(AGING_OPERATIONAL_DEPLOYMENT.checkpointPropertyKey);
+  const deletedTriggerCount = deleteAgingDeploymentWorkerTriggers_();
+
+  const result = {
+    event: 'aging_configuration_deployment_reset',
+    modifiesBigQuery: false,
+    modifiesSheets: false,
+    createsTriggers: false,
+    stateDeleted: Boolean(state),
+    checkpointDeleted: Boolean(checkpoint),
+    deletedTriggerCount
+  };
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
 }
