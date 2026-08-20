@@ -9,6 +9,7 @@ function snapshotPaymentsToBigQuery() {
   }
 
   try {
+    assertPaymentBackfillIdle_('scheduled Payments snapshot');
     return executePaymentBigQuerySnapshot_();
   } finally {
     lock.releaseLock();
@@ -631,8 +632,65 @@ function getPreviousCompletedWeekRange_(referenceIsoDate) {
     snapshotWeek,
     dateFrom: snapshotWeek,
     dateTo: dateToIso,
-    periodKey: snapshotWeek + '|' + dateToIso
+    periodKey: snapshotWeek + '|' + dateToIso,
+    updatedSince: snapshotWeek + 'T00:00:00.000Z',
+    updatedThroughExclusive: snapshotDate + 'T00:00:00.000Z'
   };
+}
+
+function normalizePaymentSnapshotRange_(rangeOverride) {
+  if (!rangeOverride) return getPreviousCompletedWeekRange_();
+  if (typeof rangeOverride !== 'object' || Array.isArray(rangeOverride)) {
+    throw new Error('Payment snapshot range must be an object.');
+  }
+
+  const dateFrom = normalizeDateForOutput_(rangeOverride.dateFrom);
+  const dateTo = normalizeDateForOutput_(rangeOverride.dateTo);
+  const fromDate = safeParseDate_(dateFrom);
+  const toDate = safeParseDate_(dateTo);
+  if (!fromDate || !toDate) {
+    throw new Error('Payment snapshot range requires valid dateFrom and dateTo values.');
+  }
+  if (fromDate.getTime() > toDate.getTime()) {
+    throw new Error('Payment snapshot dateFrom cannot be later than dateTo.');
+  }
+
+  const weekStart = new Date(fromDate.getTime());
+  weekStart.setUTCDate(weekStart.getUTCDate() - ((weekStart.getUTCDay() + 6) % 7));
+  const weekEnd = new Date(weekStart.getTime());
+  weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
+  if (toDate.getTime() > weekEnd.getTime()) {
+    throw new Error('Payment snapshot range cannot cross an ISO week boundary.');
+  }
+
+  const dayAfter = new Date(toDate.getTime());
+  dayAfter.setUTCDate(dayAfter.getUTCDate() + 1);
+  const snapshotWeek = formatUtcDate_(weekStart);
+  const snapshotDate = formatUtcDate_(dayAfter);
+  const normalized = {
+    snapshotDate,
+    snapshotWeek,
+    dateFrom,
+    dateTo,
+    periodKey: dateFrom + '|' + dateTo,
+    updatedSince: dateFrom + 'T00:00:00.000Z',
+    updatedThroughExclusive: snapshotDate + 'T00:00:00.000Z'
+  };
+
+  if (
+    rangeOverride.snapshotWeek &&
+    normalizeDateForOutput_(rangeOverride.snapshotWeek) !== snapshotWeek
+  ) {
+    throw new Error('Payment snapshot snapshotWeek does not match dateFrom.');
+  }
+  if (
+    rangeOverride.snapshotDate &&
+    normalizeDateForOutput_(rangeOverride.snapshotDate) !== snapshotDate
+  ) {
+    throw new Error('Payment snapshot snapshotDate does not match dateTo.');
+  }
+
+  return normalized;
 }
 
 function formatUtcDate_(date) {
@@ -671,43 +729,79 @@ function safeParseDate_(value) {
  * HTTP and Payment Fetching
  ***********************/
 
+function isTransientPaymentHttpStatus_(status) {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+function getPaymentRequestRetryDelayMs_(attempt) {
+  const baseDelay = Math.max(0, Number(PAYMENT_CONFIG.requestRetryBaseDelayMs) || 1000);
+  const maxDelay = Math.max(baseDelay, Number(PAYMENT_CONFIG.requestRetryMaxDelayMs) || 8000);
+  return Math.min(maxDelay, baseDelay * Math.pow(2, Math.max(0, attempt - 1)));
+}
+
 function fetchJsonOrThrow_(url, contextLabel) {
   const apiKey = String(PropertiesService.getScriptProperties().getProperty(PAYMENT_CONFIG.apiKeyProperty) || '').trim();
   if (!apiKey) throw new Error('Missing Script Property: ' + PAYMENT_CONFIG.apiKeyProperty);
-  let response;
-  try {
-    response = UrlFetchApp.fetch(url, {
-      method: 'get',
-      headers: { 'X-API-Key': apiKey },
-      muteHttpExceptions: true
-    });
-  } catch (error) {
-    throw new Error('Network error for ' + contextLabel + ': ' + String(error));
+  const maxAttempts = Math.max(1, Number(PAYMENT_CONFIG.requestMaxAttempts) || 1);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let response;
+    try {
+      response = UrlFetchApp.fetch(url, {
+        method: 'get',
+        headers: { 'X-API-Key': apiKey },
+        muteHttpExceptions: true
+      });
+    } catch (error) {
+      if (attempt >= maxAttempts) {
+        throw new Error('Network error for ' + contextLabel + ' after ' + attempt + ' attempts: ' + String(error));
+      }
+      const delayMs = getPaymentRequestRetryDelayMs_(attempt);
+      Logger.log(JSON.stringify({ event: 'payment_gateway_retry', context: contextLabel, reason: 'network_error', attempt, maxAttempts, delayMs }));
+      Utilities.sleep(delayMs);
+      continue;
+    }
+
+    const status = response.getResponseCode();
+    const body = response.getContentText();
+    if (status >= 200 && status < 300) {
+      try { return JSON.parse(body); }
+      catch (error) { throw new Error('Invalid JSON returned by ' + contextLabel + ': ' + String(error)); }
+    }
+
+    if (!isTransientPaymentHttpStatus_(status) || attempt >= maxAttempts) {
+      throw new Error(contextLabel + ' returned HTTP ' + status + ' after ' + attempt + ' attempt(s).');
+    }
+
+    const delayMs = getPaymentRequestRetryDelayMs_(attempt);
+    Logger.log(JSON.stringify({ event: 'payment_gateway_retry', context: contextLabel, status, attempt, maxAttempts, delayMs }));
+    Utilities.sleep(delayMs);
   }
-  const status = response.getResponseCode();
-  const body = response.getContentText();
-  if (status < 200 || status >= 300) {
-    throw new Error(contextLabel + ' returned HTTP ' + status + ': ' + body.slice(0, 500));
-  }
-  try { return JSON.parse(body); }
-  catch (error) { throw new Error('Invalid JSON returned by ' + contextLabel + ': ' + String(error)); }
+
+  throw new Error('Unexpected payment gateway retry state for ' + contextLabel + '.');
 }
 
-function buildPaymentsUrl_(clientId, updatedSince, startPosition) {
+function buildPaymentsUrl_(clientId, updatedSince, startPosition, updatedBefore) {
   const query = [
     'environment=' + encodeURIComponent(PAYMENT_CONFIG.environment),
     'updated_since=' + encodeURIComponent(updatedSince),
+    'updated_before=' + encodeURIComponent(updatedBefore),
     'startposition=' + encodeURIComponent(startPosition),
     'maxresults=' + encodeURIComponent(PAYMENT_CONFIG.pageSize)
   ].join('&');
   return PAYMENT_CONFIG.baseUrl + '/qbo/' + encodeURIComponent(clientId) + '/payments?' + query;
 }
 
-function fetchPayments_(clientId, updatedSince) {
+function fetchPayments_(clientId, updatedSince, updatedBefore) {
   const normalizedClientId = String(clientId || '').trim();
   const normalizedUpdatedSince = normalizeTimestampForOutput_(updatedSince);
+  const normalizedUpdatedBefore = normalizeTimestampForOutput_(updatedBefore);
   if (!normalizedClientId) throw new Error('Client ID is required to fetch payments.');
   if (!normalizedUpdatedSince) throw new Error('A valid updated_since timestamp is required to fetch payments.');
+  if (!normalizedUpdatedBefore) throw new Error('A valid updated_before timestamp is required to fetch payments.');
+  if (Date.parse(normalizedUpdatedBefore) <= Date.parse(normalizedUpdatedSince)) {
+    throw new Error('updated_before must be later than updated_since.');
+  }
 
   const items = [];
   const pages = [];
@@ -726,7 +820,7 @@ function fetchPayments_(clientId, updatedSince) {
     seenStartPositions[startPosition] = true;
 
     const payload = fetchJsonOrThrow_(
-      buildPaymentsUrl_(normalizedClientId, normalizedUpdatedSince, startPosition),
+      buildPaymentsUrl_(normalizedClientId, normalizedUpdatedSince, startPosition, normalizedUpdatedBefore),
       '/qbo/' + normalizedClientId + '/payments page ' + pageNumber
     );
     if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !Array.isArray(payload.items)) {
@@ -750,7 +844,7 @@ function fetchPayments_(clientId, updatedSince) {
     if (startPosition !== null && PAYMENT_CONFIG.pageDelayMs > 0) Utilities.sleep(PAYMENT_CONFIG.pageDelayMs);
   }
 
-  return { clientId: normalizedClientId, updatedSince: normalizedUpdatedSince, paymentCount: items.length, pageCount: pages.length, pages, items };
+  return { clientId: normalizedClientId, updatedSince: normalizedUpdatedSince, updatedBefore: normalizedUpdatedBefore, paymentCount: items.length, pageCount: pages.length, pages, items };
 }
 
 /***********************
@@ -994,6 +1088,49 @@ function getPaymentLineSign_(linkedTxnType, context) {
   return PAYMENT_LINE_SIGN_BY_TXN_TYPE[normalizedType];
 }
 
+function isBidirectionalPaymentLineType_(linkedTxnType) {
+  return PAYMENT_BIDIRECTIONAL_LINE_TXN_TYPES.indexOf(String(linkedTxnType || '').trim()) >= 0;
+}
+
+function resolvePaymentLineSigns_(header, rows) {
+  if (header.IsVoided) return rows;
+  const lineRows = rows.filter(row => row.RecordType === PAYMENT_RECORD_TYPES.line);
+  const flexibleTypes = Array.from(new Set(
+    lineRows.map(row => row.LinkedTxnType).filter(isBidirectionalPaymentLineType_)
+  )).sort();
+  if (!flexibleTypes.length) return rows;
+
+  const targetCents = Math.round((Number(header.TotalAmount || 0) - Number(header.UnappliedAmount || 0)) * 100);
+  const candidates = [];
+  const combinationCount = Math.pow(2, flexibleTypes.length);
+  for (let mask = 0; mask < combinationCount; mask++) {
+    const signs = {};
+    flexibleTypes.forEach((type, index) => {
+      signs[type] = (mask & (1 << index)) === 0 ? getPaymentLineSign_(type) : -getPaymentLineSign_(type);
+    });
+    const signedCents = lineRows.reduce((sum, row) => {
+      const sign = isBidirectionalPaymentLineType_(row.LinkedTxnType)
+        ? signs[row.LinkedTxnType]
+        : getPaymentLineSign_(row.LinkedTxnType);
+      return sum + Math.round(Number(row.LineAmountRaw || 0) * sign * 100);
+    }, 0);
+    if (Math.abs(targetCents - signedCents) <= PAYMENT_RECONCILIATION_TOLERANCE_CENTS) {
+      candidates.push({ signs, mask });
+    }
+  }
+
+  if (!candidates.length) return rows;
+  candidates.sort((left, right) => left.mask - right.mask);
+  const selectedSigns = candidates[0].signs;
+  lineRows.forEach(row => {
+    const sign = isBidirectionalPaymentLineType_(row.LinkedTxnType)
+      ? selectedSigns[row.LinkedTxnType]
+      : getPaymentLineSign_(row.LinkedTxnType);
+    row.LineAmountSigned = Number(row.LineAmountRaw || 0) * sign;
+  });
+  return rows;
+}
+
 function buildPaymentIdempotencyKey_(row) {
   const parts = [
     'payment', row.SnapshotWeek, row.ClientId, row.PaymentId, row.RecordType,
@@ -1148,6 +1285,7 @@ function normalizePayment_(client, range, payment, loadedAt) {
   const header = buildPaymentHeaderContext_(client, range, payment, loadedAt);
   const rows = [buildPaymentHeaderRow_(header)];
   header.lines.forEach((line, index) => rows.push(buildPaymentLineRow_(header, line, index + 1)));
+  resolvePaymentLineSigns_(header, rows);
   validatePaymentReconciliation_(header, rows);
   return { paymentId: header.PaymentId, rows };
 }
@@ -1176,7 +1314,9 @@ function validatePaymentReconciliation_(header, rows) {
     Math.abs(unappliedCents) <= PAYMENT_RECONCILIATION_TOLERANCE_CENTS &&
     lineRows.length > 0 &&
     signedLineCents < -PAYMENT_RECONCILIATION_TOLERANCE_CENTS &&
-    lineRows.every(row => getPaymentLineSign_(row.LinkedTxnType) < 0);
+    lineRows.every(row =>
+      Number(row.LineAmountSigned || 0) < 0 && getPaymentLineSign_(row.LinkedTxnType) < 0
+    );
   if (isCreditOnlyPayment) return result;
 
   const difference = totalCents - (signedLineCents + unappliedCents);
@@ -1239,11 +1379,7 @@ function validatePaymentSnapshotHierarchy_(rows) {
 
 function buildPaymentSnapshot_(loadedEntityConfigurationOverride, options) {
   const settings = options || {};
-  const range = getPreviousCompletedWeekRange_();
-  range.updatedSince = range.dateFrom + 'T00:00:00.000Z';
-  const dayAfter = safeParseDate_(range.dateTo);
-  dayAfter.setUTCDate(dayAfter.getUTCDate() + 1);
-  range.updatedThroughExclusive = formatUtcDate_(dayAfter) + 'T00:00:00.000Z';
+  const range = normalizePaymentSnapshotRange_(settings.range);
   const loadedAt = new Date().toISOString();
   const loadedEntityConfiguration = loadedEntityConfigurationOverride
     ? { source: String(loadedEntityConfigurationOverride.source || 'configuration_deployment'), configuration: validatePaymentEntityConfiguration_(loadedEntityConfigurationOverride.configuration) }
@@ -1261,7 +1397,7 @@ function buildPaymentSnapshot_(loadedEntityConfigurationOverride, options) {
   Logger.log('Filtered payment clients: ' + clients.length);
   clients.forEach(client => {
     Logger.log('Fetching payments for ' + client.name + ' [' + client.id + ']');
-    const response = fetchPayments_(client.id, range.updatedSince);
+    const response = fetchPayments_(client.id, range.updatedSince, range.updatedThroughExclusive);
     pageCount += response.pageCount;
     sourcePaymentCount += response.items.length;
     const currentPayments = response.items.filter(payment => paymentUpdatedInRange_(payment, range));
@@ -1393,8 +1529,13 @@ function validatePaymentBigQueryRow_(row, index) {
   if (row.RecordType === PAYMENT_RECORD_TYPES.line) {
     if (Number(row.RecordOrder) < 1) throw new Error('Payment LINE row must have RecordOrder>=1.');
     if (!row.LinkedTxnId || !row.LinkedTxnType) throw new Error('Payment LINE row is missing LinkedTxn identity.');
-    const expectedSigned = Number(row.LineAmountRaw) * getPaymentLineSign_(row.LinkedTxnType);
-    if (Math.abs(Math.round(expectedSigned * 100) - Math.round(Number(row.LineAmountSigned) * 100)) > PAYMENT_RECONCILIATION_TOLERANCE_CENTS) {
+    const rawCents = Math.round(Number(row.LineAmountRaw) * 100);
+    const signedCents = Math.round(Number(row.LineAmountSigned) * 100);
+    const defaultSignedCents = rawCents * getPaymentLineSign_(row.LinkedTxnType);
+    const signIsValid = isBidirectionalPaymentLineType_(row.LinkedTxnType)
+      ? Math.abs(Math.abs(signedCents) - Math.abs(rawCents)) <= PAYMENT_RECONCILIATION_TOLERANCE_CENTS
+      : Math.abs(defaultSignedCents - signedCents) <= PAYMENT_RECONCILIATION_TOLERANCE_CENTS;
+    if (!signIsValid) {
       throw new Error('Payment row ' + index + ' contains inconsistent LineAmountSigned.');
     }
   }

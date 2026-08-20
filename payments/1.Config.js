@@ -13,7 +13,10 @@ const PAYMENT_CONFIG = {
   firstStartPosition: 1,
   pageSize: 100,
   maxPages: 1000,
-  pageDelayMs: 100
+  pageDelayMs: 100,
+  requestMaxAttempts: 4,
+  requestRetryBaseDelayMs: 1000,
+  requestRetryMaxDelayMs: 8000
 };
 
 const PAYMENT_ENTITY_CONTROL = {
@@ -48,6 +51,21 @@ const PAYMENT_OPERATIONAL_DEPLOYMENT = {
   failureRetryDelayMs: 60000,
   maxStageAttempts: 3,
   staleRunningSeconds: 900,
+  maxStateBytes: 9000
+};
+
+const PAYMENT_BACKFILL_CONFIG = {
+  statePropertyKey: 'QBO_PAYMENT_BACKFILL_STATE',
+  workerHandler: 'processPaymentBackfill',
+  startDate: '2026-01-01',
+  initialDelayMs: 5000,
+  continuationDelayMs: 60000,
+  busyRetryDelayMs: 60000,
+  failureRetryDelayMs: 60000,
+  watchdogDelayMs: 13 * 60 * 1000,
+  staleRunningSeconds: 15 * 60,
+  maxAttemptsPerPeriod: 3,
+  maxStageAttempts: 3,
   maxStateBytes: 9000
 };
 
@@ -113,7 +131,15 @@ const PAYMENT_BIGQUERY_PARTITION_FIELD = 'SnapshotWeek';
 const PAYMENT_BIGQUERY_CLUSTER_FIELDS = ['Entity', 'ClientId', 'PaymentId', 'RecordType'];
 const PAYMENT_BIGQUERY_TABLE = [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, BQ_CONFIG.snapshotsTableId].join('.');
 const PAYMENT_RECORD_TYPES = { header: 'HEADER', line: 'LINE' };
-const PAYMENT_LINE_SIGN_BY_TXN_TYPE = { Invoice: 1, CreditMemo: -1, JournalEntry: -1, Deposit: -1 };
+const PAYMENT_LINE_SIGN_BY_TXN_TYPE = {
+  Invoice: 1,
+  CreditMemo: -1,
+  JournalEntry: -1,
+  Deposit: -1,
+  Check: -1,
+  Expense: -1
+};
+const PAYMENT_BIDIRECTIONAL_LINE_TXN_TYPES = ['JournalEntry', 'Deposit', 'Check', 'Expense'];
 const PAYMENT_RECONCILIATION_TOLERANCE_CENTS = 1;
 const PAYMENT_SCHEMA_BASELINE_VERSION = 1;
 const PAYMENT_SCHEMA_BASELINE_PREFIX = 'PAYMENT_SCHEMA_BASELINE_V1_';
