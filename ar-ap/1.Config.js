@@ -70,15 +70,27 @@ const BQ_CONFIG = {
 
 const AGING_OPERATIONAL_DEPLOYMENT = {
   statePropertyKey: 'QBO_AGING_CONFIGURATION_DEPLOYMENT_STATE',
-  reportSpreadsheetIdProperty: 'QBO_REPORT_SPREADSHEET_ID',
+  checkpointPropertyKey: 'QBO_AGING_BIGQUERY_CHECKPOINT',
+  reportSpreadsheetIdProperty: 'TARGET_SPREADSHEET_ID',
   workerHandler: 'processAgingConfigurationDeployment',
+
   initialDelayMs: 5000,
   nextStageDelayMs: 5000,
+  continuationDelayMs: 60000,
+  watchdogDelayMs: 13 * 60 * 1000,
   busyRetryDelayMs: 60000,
   failureRetryDelayMs: 60000,
+
   maxStageAttempts: 3,
-  staleRunningSeconds: 900,
-  maxStateBytes: 9000
+  maxTimeoutRecoveries: 5,
+  maxContinuationCount: 50,
+  maxClientsPerExecution: 5,
+  executionBudgetMs: 10 * 60 * 1000,
+  bigQueryJobWaitMs: 120000,
+  staleRunningSeconds: 15 * 60,
+
+  maxStateBytes: 9000,
+  maxCheckpointBytes: 9000
 };
 
 const AGING_BIGQUERY_SCHEMA = [
