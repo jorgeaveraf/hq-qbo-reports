@@ -69,6 +69,7 @@ const BQ_CONFIG = {
 
 
 const AGING_OPERATIONAL_DEPLOYMENT = {
+  pipelineVersion: 2,
   statePropertyKey: 'QBO_AGING_CONFIGURATION_DEPLOYMENT_STATE',
   checkpointPropertyKey: 'QBO_AGING_BIGQUERY_CHECKPOINT',
   reportSpreadsheetIdProperty: 'TARGET_SPREADSHEET_ID',

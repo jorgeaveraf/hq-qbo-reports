@@ -10,6 +10,8 @@ function queueAgingConfigurationDeployment_(pushPayload, configuration, options)
   const current = readAgingDeploymentState_();
 
   const sameOperation = current &&
+    Number(current.pipeline_version || 0) ===
+      Number(AGING_OPERATIONAL_DEPLOYMENT.pipelineVersion) &&
     current.configuration_version === validatedConfiguration.configuration_version &&
     current.configuration_hash === validatedConfiguration.configuration_hash &&
     current.range &&
@@ -30,7 +32,8 @@ function queueAgingConfigurationDeployment_(pushPayload, configuration, options)
 
   const now = new Date().toISOString();
   const state = {
-    schema_version: '1.1',
+    schema_version: '1.2',
+    pipeline_version: AGING_OPERATIONAL_DEPLOYMENT.pipelineVersion,
     operation_id: Utilities.getUuid(),
     request_id: String(pushPayload && pushPayload.request_id || Utilities.getUuid()),
     report_key: AGING_ENTITY_CONTROL.reportKey,
@@ -40,9 +43,11 @@ function queueAgingConfigurationDeployment_(pushPayload, configuration, options)
     configuration: validatedConfiguration,
     range,
     status: 'pending',
-    current_stage: 'bigquery',
+    current_stage: 'output_sheets',
     attempts: {
+      output_sheets: 0,
       bigquery: 0,
+      output_sheet_export: 0,
       data_source_sheets: 0,
       extracts: 0
     },
@@ -51,7 +56,9 @@ function queueAgingConfigurationDeployment_(pushPayload, configuration, options)
     completed_at: null,
     last_error: null,
     stages: {
+      output_sheets: createAgingDeploymentStageState_(),
       bigquery: createAgingDeploymentStageState_(),
+      output_sheet_export: createAgingDeploymentStageState_(),
       data_source_sheets: createAgingDeploymentStageState_(),
       extracts: createAgingDeploymentStageState_()
     }
@@ -392,6 +399,10 @@ function processAgingConfigurationDeployment() {
 }
 
 function executeAgingDeploymentStage_(stage, state) {
+  if (stage === 'output_sheets') {
+    return executeAgingOutputSheetsProvisionStage_(state);
+  }
+
   if (stage === 'bigquery') {
     const configuration = validateAgingEntityConfiguration_(
       state.configuration,
@@ -407,6 +418,10 @@ function executeAgingDeploymentStage_(stage, state) {
 
   if (stage === 'data_source_sheets') {
     return refreshAgingConnectedSheetsStage_('data_source_sheets');
+  }
+
+  if (stage === 'output_sheet_export') {
+    return executeAgingOutputSheetExportStage_(state);
   }
 
   if (stage === 'extracts') {
@@ -1087,7 +1102,13 @@ function getAgingReportSpreadsheet_() {
 }
 
 function getNextAgingDeploymentStage_(state) {
-  const sequence = ['bigquery', 'data_source_sheets', 'extracts'];
+  const sequence = [
+    'output_sheets',
+    'bigquery',
+    'output_sheet_export',
+    'data_source_sheets',
+    'extracts'
+  ];
   for (let index = 0; index < sequence.length; index++) {
     const stage = sequence[index];
     const status = state && state.stages && state.stages[stage] &&
@@ -1258,6 +1279,25 @@ function compactAgingDeploymentStageResult_(stage, result) {
     };
   }
 
+  if (stage === 'output_sheets') {
+    return {
+      status: result.status,
+      sheetCount: result.sheetCount,
+      createdSheetCount: result.createdSheetCount,
+      shownSheetCount: result.shownSheetCount
+    };
+  }
+
+  if (stage === 'output_sheet_export') {
+    return {
+      status: result.status,
+      snapshotDate: result.snapshotDate,
+      sheetCount: result.sheetCount,
+      rowCount: result.rowCount,
+      reportRowCounts: result.reportRowCounts
+    };
+  }
+
   return {
     status: result.status,
     refreshedObjectCount: result.refreshedObjectCount,
@@ -1271,6 +1311,7 @@ function summarizeAgingDeploymentState_(state, queued) {
     operationId: state.operation_id,
     status: state.status,
     currentStage: state.current_stage,
+    pipelineVersion: Number(state.pipeline_version || 0),
     configurationVersion: state.configuration_version,
     configurationHash: state.configuration_hash,
     range: state.range || null,

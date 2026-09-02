@@ -740,7 +740,9 @@ function updateAgingExport() {
 function getOrCreateAgingSheet_(spreadsheet, sheetName) {
   const finalName = String(sheetName || QBO_CONFIG.outputSheetName || '').trim();
   if (!finalName) throw new Error('Aging output sheet name is required.');
-  return spreadsheet.getSheetByName(finalName) || spreadsheet.insertSheet(finalName);
+  const sheet = spreadsheet.getSheetByName(finalName) || spreadsheet.insertSheet(finalName);
+  if (sheet.isSheetHidden()) sheet.showSheet();
+  return sheet;
 }
 
 function writeOutputSheet_(rows, sheetName) {
@@ -748,8 +750,247 @@ function writeOutputSheet_(rows, sheetName) {
   sheet.clearContents();
   sheet.getRange(1, 1, 1, EXPORT_COLUMNS.length).setValues([EXPORT_COLUMNS]);
   if (!rows.length) return;
+  const requiredRowCount = rows.length + 1;
+  if (sheet.getMaxRows() < requiredRowCount) {
+    sheet.insertRowsAfter(
+      sheet.getMaxRows(),
+      requiredRowCount - sheet.getMaxRows()
+    );
+  }
   sheet.getRange(2, 1, rows.length, EXPORT_COLUMNS.length).setValues(rows);
   sheet.getRange(2, 11, rows.length, 1).setNumberFormat('0.00');
+}
+
+function getAgingOutputSheetNames_(selection) {
+  return [...new Set(Object.keys(selection.clientsById)
+    .map(clientId => String(selection.clientsById[clientId].outputSheetName || '').trim())
+    .filter(Boolean))]
+    .sort();
+}
+
+function resolveAgingDeploymentSelection_(state, source) {
+  if (!state || typeof state !== 'object') {
+    throw new Error('Aging deployment state is required for sheet processing.');
+  }
+
+  const configuration = validateAgingEntityConfiguration_(
+    state.configuration,
+    state.configuration_version
+  );
+  if (configuration.configuration_hash !== state.configuration_hash) {
+    throw new Error(
+      'Deployment configuration hash no longer matches the sheet operation.'
+    );
+  }
+
+  return resolveAgingEntitySelection_({
+    source: String(source || 'configuration_deployment'),
+    configuration
+  });
+}
+
+function executeAgingOutputSheetsProvisionStage_(state) {
+  const selection = resolveAgingDeploymentSelection_(
+    state,
+    'configuration_deployment_output_sheets'
+  );
+  const spreadsheet = getTargetSpreadsheet_();
+  const sheetNames = getAgingOutputSheetNames_(selection);
+  const sheets = sheetNames.map(sheetName => {
+    const existing = spreadsheet.getSheetByName(sheetName);
+    const wasHidden = Boolean(existing && existing.isSheetHidden());
+    const sheet = getOrCreateAgingSheet_(spreadsheet, sheetName);
+
+    if (!existing) {
+      sheet.getRange(1, 1, 1, EXPORT_COLUMNS.length).setValues([EXPORT_COLUMNS]);
+    }
+
+    return {
+      sheetName,
+      status: existing ? (wasHidden ? 'shown' : 'existing') : 'created'
+    };
+  });
+
+  const result = {
+    status: 'passed',
+    event: 'aging_output_sheets_provisioned',
+    entityConfiguration: buildAgingEntityConfigurationSummary_(selection),
+    sheetCount: sheets.length,
+    createdSheetCount: sheets.filter(item => item.status === 'created').length,
+    shownSheetCount: sheets.filter(item => item.status === 'shown').length,
+    sheets
+  };
+  Logger.log(JSON.stringify(result));
+  return result;
+}
+
+function executeAgingOutputSheetExportStage_(state) {
+  const bigQueryStage = state && state.stages && state.stages.bigquery;
+  if (!bigQueryStage || bigQueryStage.status !== 'completed') {
+    throw new Error('Aging output sheet export requires a completed BigQuery stage.');
+  }
+
+  const selection = resolveAgingDeploymentSelection_(
+    state,
+    'configuration_deployment_output_sheet_export'
+  );
+  const sheetNames = getAgingOutputSheetNames_(selection);
+  const rowsBySheet = {};
+  sheetNames.forEach(sheetName => rowsBySheet[sheetName] = []);
+
+  const snapshotDate = state.range && state.range.snapshotDate;
+  const queryResult = queryAgingSnapshotExportRows_(snapshotDate);
+  const reportRowCounts = { AR: 0, AP: 0 };
+
+  queryResult.rows.forEach(item => {
+    const client = selection.clientsById[item.clientId];
+    if (!client) {
+      throw new Error(
+        'Aging snapshot contains an unauthorized client during sheet export. ClientId=' +
+        item.clientId
+      );
+    }
+
+    const sheetName = String(client.outputSheetName || '').trim();
+    if (!rowsBySheet[sheetName]) rowsBySheet[sheetName] = [];
+    rowsBySheet[sheetName].push(item.exportRow);
+    reportRowCounts[item.exportRow[0]] =
+      Number(reportRowCounts[item.exportRow[0]] || 0) + 1;
+  });
+
+  const expectedRowCountValue = bigQueryStage.result &&
+    bigQueryStage.result.rowCount;
+  const expectedRowCount = expectedRowCountValue === null ||
+    expectedRowCountValue === undefined
+    ? null
+    : Number(expectedRowCountValue);
+  if (
+    expectedRowCount !== null &&
+    Number.isFinite(expectedRowCount) &&
+    queryResult.rows.length !== expectedRowCount
+  ) {
+    throw new Error(
+      'Aging sheet export row count does not match the completed BigQuery stage. Expected=' +
+      expectedRowCount + ', actual=' + queryResult.rows.length
+    );
+  }
+
+  const sheets = Object.keys(rowsBySheet).sort().map(sheetName => {
+    const rows = rowsBySheet[sheetName];
+    sortExportRows_(rows);
+    writeOutputSheet_(rows, sheetName);
+    return { sheetName, rowCount: rows.length };
+  });
+
+  const result = {
+    status: 'passed',
+    event: 'aging_output_sheet_export_completed',
+    entityConfiguration: buildAgingEntityConfigurationSummary_(selection),
+    snapshotDate,
+    sheetCount: sheets.length,
+    rowCount: queryResult.rows.length,
+    reportRowCounts,
+    sheets
+  };
+  Logger.log(JSON.stringify(result));
+  return result;
+}
+
+function queryAgingSnapshotExportRows_(snapshotDate) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(snapshotDate || ''))) {
+    throw new Error('Invalid Aging snapshot date for sheet export: ' + snapshotDate);
+  }
+
+  const query = `
+    SELECT
+      report_type,
+      entity,
+      as_of_date,
+      bucket,
+      counterparty,
+      document_number,
+      document_type,
+      transaction_date,
+      due_date,
+      days_overdue,
+      open_amount,
+      currency,
+      source,
+      client_id
+    FROM \`${AGING_BIGQUERY_TABLE}\`
+    WHERE snapshot_date = @snapshot_date
+  `;
+  const request = {
+    query,
+    useLegacySql: false,
+    parameterMode: 'NAMED',
+    queryParameters: [{
+      name: 'snapshot_date',
+      parameterType: { type: 'DATE' },
+      parameterValue: { value: snapshotDate }
+    }],
+    maxResults: 10000,
+    timeoutMs: 120000
+  };
+
+  let response = BigQuery.Jobs.query(request, BQ_CONFIG.projectId);
+  if (!response || !response.jobReference) {
+    throw new Error('BigQuery did not return a job reference for Aging sheet export.');
+  }
+
+  const jobId = response.jobReference.jobId;
+  while (!response.jobComplete) {
+    Utilities.sleep(500);
+    response = BigQuery.Jobs.getQueryResults(BQ_CONFIG.projectId, jobId, {
+      maxResults: 10000
+    });
+  }
+
+  const rows = [];
+  let page = response;
+  while (page) {
+    if (page.errors && page.errors.length) {
+      throw new Error('Aging sheet export query failed: ' + JSON.stringify(page.errors));
+    }
+
+    (page.rows || []).forEach(row => {
+      const values = row.f || [];
+      const valueAt = index => values[index] ? values[index].v : null;
+      const daysOverdue = valueAt(9);
+      const openAmount = Number(valueAt(10) || 0);
+      if (!Number.isFinite(openAmount)) {
+        throw new Error('Invalid open amount returned for Aging sheet export.');
+      }
+
+      rows.push({
+        clientId: String(valueAt(13) || '').trim(),
+        exportRow: [
+          String(valueAt(0) || ''),
+          String(valueAt(1) || ''),
+          String(valueAt(2) || ''),
+          String(valueAt(3) || ''),
+          String(valueAt(4) || ''),
+          valueAt(5) === null ? '' : String(valueAt(5)),
+          String(valueAt(6) || ''),
+          valueAt(7) === null ? '' : String(valueAt(7)),
+          valueAt(8) === null ? '' : String(valueAt(8)),
+          daysOverdue === null ? '' : Number(daysOverdue),
+          openAmount,
+          String(valueAt(11) || ''),
+          String(valueAt(12) || '')
+        ]
+      });
+    });
+
+    page = page.pageToken
+      ? BigQuery.Jobs.getQueryResults(BQ_CONFIG.projectId, jobId, {
+          pageToken: page.pageToken,
+          maxResults: 10000
+        })
+      : null;
+  }
+
+  return { jobId, snapshotDate, rows };
 }
 
 function fetchJsonResponse_(url) {
