@@ -138,6 +138,7 @@ test('sheet export groups the verified BigQuery snapshot by output alias', () =>
   installFunction(context, 'writeOutputSheet_', (rows, sheetName) => {
     writes[sheetName] = rows.map(row => [...row]);
   });
+  installFunction(context, 'getTargetSpreadsheet_', () => ({}));
 
   const result = context.executeAgingOutputSheetExportStage_({
     range: { snapshotDate: '2026-09-01' },
@@ -214,4 +215,242 @@ test('BigQuery sheet export reads every result page and maps nullable fields', (
   assert.equal(result.rows[1].exportRow[9], 17);
   assert.equal(apiCalls.length, 2);
   assert.equal(apiCalls[1].options.pageToken, 'next-page');
+});
+
+test('direct export fetches reports in bounded concurrent batches', () => {
+  const context = loadAgingContext();
+  const batchSizes = [];
+  const selection = {
+    clientsById: {
+      a: { id: 'a', outputSheetName: 'alpha' },
+      b: { id: 'b', outputSheetName: 'beta' },
+      c: { id: 'c', outputSheetName: 'gamma' },
+      d: { id: 'd', outputSheetName: 'delta' }
+    }
+  };
+
+  installFunction(context, 'getAgingQboApiKey_', () => 'test-key');
+  installFunction(context, 'extractAsOfDate_', () => '2026-09-01');
+  installFunction(context, 'flattenReport_', payload => [payload]);
+  installFunction(context, 'mapToExportRows_', (rows, client, reportKind) => [[
+    reportKind === 'customer' ? 'AR' : 'AP',
+    client.outputSheetName,
+    '2026-09-01',
+    'Current',
+    client.id,
+    '',
+    reportKind,
+    '',
+    '',
+    0,
+    1,
+    'USD',
+    'QBO'
+  ]]);
+
+  context.Utilities = { sleep: () => {} };
+  context.UrlFetchApp = {
+    fetchAll: requests => {
+      batchSizes.push(requests.length);
+      return requests.map(request => ({
+        getResponseCode: () => 200,
+        getContentText: () => JSON.stringify({ url: request.url })
+      }));
+    }
+  };
+
+  const result = context.fetchAgingDirectExport_(selection);
+
+  assert.deepEqual(batchSizes, [6, 2]);
+  assert.equal(result.requestCount, 8);
+  assert.equal(result.batchCount, 2);
+  assert.equal(result.failedReportCount, 0);
+  assert.equal(result.sheets.length, 4);
+  result.sheets.forEach(sheet => {
+    assert.equal(sheet.status, 'fresh_qbo');
+    assert.equal(sheet.expectedReportCount, 2);
+    assert.equal(sheet.successfulReportCount, 2);
+    assert.equal(sheet.rows.length, 2);
+  });
+});
+
+test('a failed report affects only its output entity', () => {
+  const context = loadAgingContext();
+  const selection = {
+    clientsById: {
+      a: { id: 'a', outputSheetName: 'alpha' },
+      b: { id: 'b', outputSheetName: 'beta' }
+    }
+  };
+
+  installFunction(context, 'fetchAgingReportBatch_', requests => requests.map(request => ({
+    ...request,
+    success: !(request.clientId === 'a' && request.reportKind === 'vendor'),
+    status: request.clientId === 'a' && request.reportKind === 'vendor' ? 503 : 200,
+    attempts: 2,
+    payload: {},
+    error: request.clientId === 'a' && request.reportKind === 'vendor'
+      ? 'Gateway returned HTTP 503'
+      : null
+  })));
+  installFunction(context, 'extractAsOfDate_', () => '2026-09-01');
+  installFunction(context, 'flattenReport_', () => [{}]);
+  installFunction(context, 'mapToExportRows_', (rows, client, reportKind) => [[
+    reportKind === 'customer' ? 'AR' : 'AP', client.outputSheetName
+  ]]);
+
+  const result = context.fetchAgingDirectExport_(selection);
+  const alpha = result.sheets.find(sheet => sheet.sheetName === 'alpha');
+  const beta = result.sheets.find(sheet => sheet.sheetName === 'beta');
+
+  assert.equal(alpha.status, 'incomplete_qbo');
+  assert.equal(alpha.failures.length, 1);
+  assert.equal(beta.status, 'fresh_qbo');
+  assert.equal(beta.rows.length, 2);
+  assert.equal(result.failedReportCount, 1);
+});
+
+test('transient gateway failures retry only the affected reports', () => {
+  const context = loadAgingContext();
+  const callUrls = [];
+  let callNumber = 0;
+  const requests = [
+    { clientId: 'a', client: {}, sheetName: 'alpha', reportKind: 'customer', url: 'customer-url' },
+    { clientId: 'a', client: {}, sheetName: 'alpha', reportKind: 'vendor', url: 'vendor-url' }
+  ];
+
+  installFunction(context, 'getAgingQboApiKey_', () => 'test-key');
+  context.Utilities = { sleep: () => {} };
+  context.UrlFetchApp = {
+    fetchAll: batch => {
+      callUrls.push(batch.map(request => request.url));
+      callNumber++;
+      return batch.map(request => ({
+        getResponseCode: () => callNumber === 1 && request.url === 'vendor-url' ? 503 : 200,
+        getContentText: () => callNumber === 1 && request.url === 'vendor-url'
+          ? JSON.stringify({ error: 'temporary' })
+          : JSON.stringify({ ok: true })
+      }));
+    }
+  };
+
+  const results = context.fetchAgingReportBatch_(requests);
+
+  assert.deepEqual(JSON.parse(JSON.stringify(callUrls)), [
+    ['customer-url', 'vendor-url'],
+    ['vendor-url']
+  ]);
+  assert.equal(results.length, 2);
+  assert.equal(results.every(result => result.success), true);
+  assert.equal(results.find(result => result.reportKind === 'customer').attempts, 1);
+  assert.equal(results.find(result => result.reportKind === 'vendor').attempts, 2);
+});
+
+test('completed BigQuery fallback is grouped by entity and validated by row count', () => {
+  const context = loadAgingContext();
+  const selection = {
+    configuration: { configuration_version: 26, configuration_hash: 'hash-26' },
+    clientsById: {
+      a: { outputSheetName: 'alpha' },
+      b: { outputSheetName: 'beta' }
+    }
+  };
+  const state = {
+    status: 'completed',
+    pipeline_version: 2,
+    configuration_version: 26,
+    configuration_hash: 'hash-26',
+    range: { snapshotDate: '2026-09-01' },
+    stages: {
+      bigquery: { status: 'completed', result: { rowCount: 2 } },
+      output_sheet_export: { status: 'completed' }
+    }
+  };
+
+  installFunction(context, 'queryAgingSnapshotExportRows_', () => ({
+    rows: [
+      { clientId: 'a', exportRow: ['AR', 'alpha'] },
+      { clientId: 'b', exportRow: ['AP', 'beta'] }
+    ]
+  }));
+
+  const fallback = context.loadAgingCompletedSnapshotFallback_(selection, state);
+
+  assert.equal(fallback.available, true);
+  assert.equal(fallback.snapshotDate, '2026-09-01');
+  assert.equal(fallback.rowsBySheet.alpha.length, 1);
+  assert.equal(fallback.rowsBySheet.beta.length, 1);
+});
+
+test('fallback preserves a sheet that is already from the same snapshot date', () => {
+  const context = loadAgingContext();
+  const spreadsheet = {
+    getSheetByName: () => ({
+      getLastRow: () => 2,
+      getRange: () => ({ getDisplayValues: () => [['2026-09-01']] })
+    })
+  };
+
+  const decision = context.chooseAgingSheetFallback_(spreadsheet, 'alpha', {
+    available: true,
+    snapshotDate: '2026-09-01',
+    rowsBySheet: { alpha: [['AR', 'alpha']] }
+  });
+
+  assert.equal(decision.source, 'preserved');
+  assert.equal(decision.reason, 'existing_sheet_is_same_or_newer_than_snapshot');
+});
+
+test('scheduled export delegates when the configuration deployment is active', () => {
+  const context = loadAgingContext();
+  let released = false;
+  context.LockService = {
+    getScriptLock: () => ({
+      tryLock: () => true,
+      releaseLock: () => { released = true; }
+    })
+  };
+  installFunction(context, 'readAgingDeploymentState_', () => ({
+    status: 'processing',
+    operation_id: 'operation-1',
+    current_stage: 'bigquery'
+  }));
+  installFunction(context, 'resolveAgingEntitySelection_', () => {
+    throw new Error('selection must not run while deployment is active');
+  });
+
+  const result = context.updateAgingExport();
+
+  assert.equal(result.status, 'delegated_to_configuration_deployment');
+  assert.equal(result.currentStage, 'bigquery');
+  assert.equal(released, true);
+});
+
+test('sheet writes clear only the export columns and reuse the supplied spreadsheet', () => {
+  const context = loadAgingContext();
+  const calls = [];
+  const sheet = {
+    isSheetHidden: () => false,
+    getMaxRows: () => 20,
+    getLastRow: () => 8,
+    getRange: (row, column, rowCount, columnCount) => ({
+      clearContent: () => calls.push({ type: 'clear', row, column, rowCount, columnCount }),
+      setValues: values => calls.push({ type: 'values', row, column, rowCount, columnCount, values }),
+      setNumberFormat: format => calls.push({ type: 'format', row, column, rowCount, columnCount, format })
+    })
+  };
+  const spreadsheet = {
+    getSheetByName: name => name === 'alpha' ? sheet : null
+  };
+
+  context.writeOutputSheet_([
+    ['AR', 'alpha', '2026-09-01', 'Current', 'A', '', 'Invoice', '', '', 0, 10, 'USD', 'QBO'],
+    ['AP', 'alpha', '2026-09-01', 'Current', 'B', '', 'Bill', '', '', 0, 20, 'USD', 'QBO']
+  ], 'alpha', spreadsheet);
+
+  const clear = calls.find(call => call.type === 'clear');
+  assert.deepEqual(clear, {
+    type: 'clear', row: 1, column: 1, rowCount: 8, columnCount: 13
+  });
+  assert.equal(calls.some(call => call.type === 'values' && call.row === 2 && call.rowCount === 2), true);
 });

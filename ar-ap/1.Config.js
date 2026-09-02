@@ -33,6 +33,13 @@ const QBO_CONFIG = {
   sourceDefault: 'QBO'
 };
 
+const AGING_DIRECT_EXPORT_CONFIG = {
+  maxConcurrentRequests: 6,
+  maxFetchAttempts: 2,
+  retryDelayMs: 1500,
+  lockWaitMs: 5000
+};
+
 const AGING_ENTITY_CONTROL = {
   reportKey: 'aging',
   spreadsheetIdProperty: 'QBO_CONTROL_SPREADSHEET_ID',
