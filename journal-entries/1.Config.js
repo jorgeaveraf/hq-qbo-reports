@@ -70,6 +70,20 @@ const JOURNAL_OPERATIONAL_DEPLOYMENT = {
   maxCheckpointBytes: 9000
 };
 
+const JOURNAL_BACKFILL_CONFIG = {
+  statePropertyKey: 'QBO_JOURNAL_BACKFILL_STATE',
+  workerHandler: 'processJournalBackfill',
+  startDate: '2026-01-01',
+  initialDelayMs: 5000,
+  continuationDelayMs: 60000,
+  busyRetryDelayMs: 60000,
+  failureRetryDelayMs: 60000,
+  watchdogDelayMs: 13 * 60 * 1000,
+  staleRunningSeconds: 15 * 60,
+  maxAttemptsPerPeriod: 3,
+  maxStateBytes: 9000
+};
+
 const BQ_CONFIG = {
   projectId: 'qbo-gateway-reporting',
   rawDatasetId: 'raw',

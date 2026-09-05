@@ -839,8 +839,8 @@ function fetchJournalReport_(clientId, dateFrom, dateTo) {
  * Journal Normalization
  ***********************/
 
-// NORMALIZATION FIX v3 (2026-08-04): skip QBO informational rows without debit/credit
-// and accept an empty transaction summary only when the transaction has no accounting impact.
+// NORMALIZATION FIX v4 (2026-09-04): tolerate consecutive fragments of the same
+// account-less zero-value QBO row while preserving strict accounting validation.
 function normalizeJournalReport_(journalReport) {
   if (!journalReport || !Array.isArray(journalReport.rows) || !journalReport.columnMap) {
     throw new Error('A valid fetched journal report is required for normalization.');
@@ -988,16 +988,28 @@ function normalizeJournalReport_(journalReport) {
        */
       if (!accountName && amountPresent && amountIsZero) {
         if (pendingSplitRow) {
-          throw new Error(
-            'Multiple incomplete journal split rows detected for transaction ' +
-              currentTransaction.transactionId
+          /*
+           * Some historical QBO reports split one zero-value placeholder into
+           * multiple consecutive metadata fragments before emitting the
+           * account continuation. Consolidate the fragments into one pending
+           * row. This cannot change accounting totals: every accepted fragment
+           * has an explicit zero amount, and an account is still required
+           * before a snapshot row can be emitted.
+           */
+          pendingSplitRow.colData = mergeJournalSplitColData_(
+            pendingSplitRow.colData,
+            colData
           );
+          pendingSplitRow.fragmentCount =
+            Number(pendingSplitRow.fragmentCount || 1) + 1;
+          return;
         }
 
         pendingSplitRow = {
           transactionId: currentTransaction.transactionId,
           sourceIndex,
-          colData
+          colData,
+          fragmentCount: 1
         };
         return;
       }
@@ -1075,12 +1087,13 @@ function normalizeJournalReport_(journalReport) {
 
     if (rowType === 'Section') {
       if (pendingSplitRow) {
-        throw new Error(
-          'Journal transaction section was reached before a split row was completed. Transaction=' +
-            pendingSplitRow.transactionId +
-            ', source row=' +
-            (pendingSplitRow.sourceIndex + 1)
-        );
+        /*
+         * Historical QBO journals can end a transaction with an account-less,
+         * zero-value placeholder. A following Section is a definitive boundary,
+         * so the placeholder has no accounting impact and can be discarded.
+         * The section totals below still have to match every retained row.
+         */
+        pendingSplitRow = null;
       }
 
       const summaryColData =
@@ -1600,8 +1613,10 @@ function fetchClients_(loadedEntityConfiguration) {
   return clientsById;
 }
 
-function buildJournalSnapshot_(loadedEntityConfigurationOverride) {
-  const range = getPreviousCompletedWeekRange_();
+function buildJournalSnapshot_(loadedEntityConfigurationOverride, rangeOverride) {
+  const range = normalizeJournalDeploymentRange_(
+    rangeOverride || getPreviousCompletedWeekRange_()
+  );
   const loadedAt = new Date().toISOString();
   const loadedEntityConfiguration = normalizeJournalLoadedEntityConfiguration_(
     loadedEntityConfigurationOverride

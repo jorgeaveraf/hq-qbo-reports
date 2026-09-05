@@ -19,6 +19,7 @@ function queueJournalConfigurationDeployment_(
   configuration,
   options
 ) {
+  assertJournalBackfillIdle_('the Journal Entries deployment');
   const validatedConfiguration =
     validateJournalEntityConfiguration_(configuration);
   const deploymentOptions = options || {};

@@ -123,6 +123,117 @@ test('still merges a genuine zero-value split row with its account continuation'
   assert.equal(result.rows[0].memoDescription, 'split memo');
 });
 
+test('reproduces transaction 101012: consecutive zero-value fragments precede a normal accounting line', () => {
+  const context = loadJournalContext();
+  const journalReport = report([
+    data({
+      tx_date: { value: '2026-05-18' },
+      txn_type: { value: 'Journal Entry', id: '101012' },
+      memo: { value: 'first placeholder fragment' },
+      debt_amt: { value: '0.00' }
+    }),
+    data({
+      tx_date: { value: '0-00-00' },
+      txn_type: { id: '101012' },
+      name: { value: 'metadata from second fragment', id: 'name-1' },
+      credit_amt: { value: '0.00' }
+    }),
+    data({
+      tx_date: { value: '0-00-00' },
+      txn_type: { id: '101012' },
+      account_name: { value: 'Cash', id: 'cash' },
+      debt_amt: { value: '125.00' }
+    }),
+    data({
+      tx_date: { value: '0-00-00' },
+      txn_type: { id: '101012' },
+      account_name: { value: 'Equity', id: 'equity' },
+      credit_amt: { value: '125.00' }
+    }),
+    section('101012', '125.00', '125.00'),
+    section('TOTAL', '125.00', '125.00')
+  ]);
+
+  const result = context.normalizeJournalReport_(journalReport);
+
+  assert.equal(result.transactionCount, 1);
+  assert.equal(result.rows.length, 2);
+  assert.equal(result.rows[0].accountName, 'Cash');
+  assert.equal(result.rows[0].debitAmount, 125);
+  assert.equal(result.rows[0].memoDescription, 'first placeholder fragment');
+  assert.equal(result.rows[0].name, 'metadata from second fragment');
+  assert.equal(result.rows[1].accountName, 'Equity');
+  assert.equal(result.rows[1].creditAmount, 125);
+});
+
+test('consolidates consecutive zero-value fragments before a zero-value account continuation', () => {
+  const context = loadJournalContext();
+  const journalReport = report([
+    data({
+      tx_date: { value: '2026-05-18' },
+      txn_type: { value: 'Journal Entry', id: 'split-zero-many' },
+      memo: { value: 'first fragment' },
+      debt_amt: { value: '0.00' }
+    }),
+    data({
+      tx_date: { value: '0-00-00' },
+      txn_type: { id: 'split-zero-many' },
+      name: { value: 'second fragment' },
+      credit_amt: { value: '0.00' }
+    }),
+    data({
+      tx_date: { value: '0-00-00' },
+      txn_type: { id: 'split-zero-many' },
+      account_name: { value: 'Clearing', id: 'clearing' }
+    }),
+    section('split-zero-many', '0.00', '0.00'),
+    section('TOTAL', '0.00', '0.00')
+  ]);
+
+  const result = context.normalizeJournalReport_(journalReport);
+
+  assert.equal(result.transactionCount, 1);
+  assert.equal(result.rows.length, 1);
+  assert.equal(result.rows[0].accountName, 'Clearing');
+  assert.equal(result.rows[0].debitAmount, 0);
+  assert.equal(result.rows[0].creditAmount, 0);
+  assert.equal(result.rows[0].memoDescription, 'first fragment');
+  assert.equal(result.rows[0].name, 'second fragment');
+});
+
+test('ignores a trailing account-less zero placeholder at the transaction section', () => {
+  const context = loadJournalContext();
+  const journalReport = report([
+    data({
+      tx_date: { value: '2026-01-06' },
+      txn_type: { value: 'Journal Entry', id: '25985' },
+      account_name: { value: 'Cash', id: 'cash' },
+      debt_amt: { value: '75.00' }
+    }),
+    data({
+      tx_date: { value: '0-00-00' },
+      txn_type: { id: '25985' },
+      account_name: { value: 'Equity', id: 'equity' },
+      credit_amt: { value: '75.00' }
+    }),
+    data({
+      tx_date: { value: '0-00-00' },
+      txn_type: { id: '25985' },
+      memo: { value: 'QBO placeholder' },
+      debt_amt: { value: '0.00' }
+    }),
+    section('25985', '75.00', '75.00'),
+    section('TOTAL', '75.00', '75.00')
+  ]);
+
+  const result = context.normalizeJournalReport_(journalReport);
+
+  assert.equal(result.transactionCount, 1);
+  assert.equal(result.rows.length, 2);
+  assert.equal(result.rows.reduce((sum, row) => sum + row.debitCents, 0), 7500);
+  assert.equal(result.rows.reduce((sum, row) => sum + row.creditCents, 0), 7500);
+});
+
 test('still rejects an unresolved split followed by another account-less amount row', () => {
   const context = loadJournalContext();
   const journalReport = report([
