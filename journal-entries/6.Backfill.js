@@ -322,6 +322,60 @@ function startJournalBackfillFrom2026() {
   return queueJournalBackfill_({ startDate: JOURNAL_BACKFILL_CONFIG.startDate });
 }
 
+/*
+ * One-time repair for the incomplete weekly snapshot created on 2026-08-31.
+ * The partition represents transactions from Monday 2026-08-24 through
+ * Sunday 2026-08-30. The regular resumable deployment pipeline performs the
+ * partition replacement, verification, and Connected Sheets refresh stages.
+ */
+function startJournalSnapshotRepair20260831() {
+  return startJournalSnapshotRepair_({
+    snapshotDate: '2026-08-31',
+    snapshotWeek: '2026-08-24',
+    dateFrom: '2026-08-24',
+    dateTo: '2026-08-30',
+    periodKey: '2026-08-24|2026-08-30'
+  });
+}
+
+function startJournalSnapshotRepair_(range) {
+  assertJournalBackfillIdle_('the Journal Entries snapshot repair');
+
+  const normalizedRange = normalizeJournalDeploymentRange_(range);
+  const current = readJournalDeploymentState_();
+  const currentPeriodKey = String(
+    current && current.period && current.period.periodKey || ''
+  );
+  const isActive = current && ['pending', 'running'].includes(current.status);
+
+  if (isActive && currentPeriodKey !== normalizedRange.periodKey) {
+    throw new Error(
+      'Journal Entries snapshot repair refuses to replace an active deployment. ' +
+      'CurrentPeriod=' + currentPeriodKey
+    );
+  }
+
+  const loaded = loadJournalEntityConfiguration_();
+  const deployment = queueJournalConfigurationDeployment_(
+    {
+      request_id: Utilities.getUuid(),
+      source: 'manual_snapshot_repair',
+      sent_at: new Date().toISOString()
+    },
+    loaded.configuration,
+    {
+      source: 'manual_snapshot_repair',
+      range: normalizedRange
+    }
+  );
+
+  if (!deployment.queued && deployment.status === 'completed') {
+    return deployment;
+  }
+
+  return processJournalConfigurationDeployment();
+}
+
 function processJournalBackfill() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {

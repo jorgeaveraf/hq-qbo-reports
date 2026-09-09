@@ -112,3 +112,45 @@ test('snapshot assembly accepts a historical range override', () => {
   const result = context.buildJournalSnapshot_({}, range);
   assert.deepEqual(JSON.parse(JSON.stringify(result.range)), range);
 });
+
+test('queues the 2026-08-31 snapshot repair with the exact weekly range', () => {
+  const context = loadBackfillContext();
+  let queuedRange = null;
+
+  context.assertJournalBackfillIdle_ = () => {};
+  context.readJournalDeploymentState_ = () => null;
+  context.loadJournalEntityConfiguration_ = () => ({
+    configuration: { configuration_version: 1 }
+  });
+  context.Utilities.getUuid = () => 'repair-request-id';
+  context.queueJournalConfigurationDeployment_ = (_payload, _configuration, options) => {
+    queuedRange = options.range;
+    return { queued: true, status: 'pending' };
+  };
+  context.processJournalConfigurationDeployment = () => ({ status: 'pending' });
+
+  const result = context.startJournalSnapshotRepair20260831();
+
+  assert.equal(result.status, 'pending');
+  assert.deepEqual(JSON.parse(JSON.stringify(queuedRange)), {
+    snapshotDate: '2026-08-31',
+    snapshotWeek: '2026-08-24',
+    dateFrom: '2026-08-24',
+    dateTo: '2026-08-30',
+    periodKey: '2026-08-24|2026-08-30'
+  });
+});
+
+test('snapshot repair refuses to replace an unrelated active deployment', () => {
+  const context = loadBackfillContext();
+  context.assertJournalBackfillIdle_ = () => {};
+  context.readJournalDeploymentState_ = () => ({
+    status: 'running',
+    period: { periodKey: '2026-08-31|2026-09-06' }
+  });
+
+  assert.throws(
+    () => context.startJournalSnapshotRepair20260831(),
+    /refuses to replace an active deployment/
+  );
+});
