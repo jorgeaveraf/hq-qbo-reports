@@ -569,3 +569,184 @@ function debugResetJournalBackfill() {
   Logger.log(JSON.stringify(result, null, 2));
   return result;
 }
+
+/***********************
+ * September 2026 incident repair
+ ***********************/
+
+const JOURNAL_INCIDENT_BACKFILL = {
+  statePropertyKey: 'QBO_JOURNAL_SEPTEMBER_2026_BACKFILL_STATE',
+  workerHandler: 'processJournalSeptemberIncidentBackfill',
+  initialDelayMs: 5000,
+  continuationDelayMs: 5000,
+  childPollDelayMs: 60000,
+  failureRetryDelayMs: 60000,
+  watchdogDelayMs: 840000,
+  maxStageAttempts: 3,
+  periods: [
+    { snapshotDate: '2026-09-14', snapshotWeek: '2026-09-07', dateFrom: '2026-09-07', dateTo: '2026-09-13', periodKey: '2026-09-07|2026-09-13' },
+    { snapshotDate: '2026-09-21', snapshotWeek: '2026-09-14', dateFrom: '2026-09-14', dateTo: '2026-09-20', periodKey: '2026-09-14|2026-09-20' }
+  ]
+};
+
+function readJournalIncidentBackfillState_() {
+  const value = PropertiesService.getScriptProperties().getProperty(JOURNAL_INCIDENT_BACKFILL.statePropertyKey);
+  return value ? JSON.parse(value) : null;
+}
+
+function persistJournalIncidentBackfillState_(state) {
+  PropertiesService.getScriptProperties().setProperty(
+    JOURNAL_INCIDENT_BACKFILL.statePropertyKey,
+    JSON.stringify(state)
+  );
+}
+
+function replaceJournalIncidentBackfillSchedule_(delayMs) {
+  deleteJournalIncidentBackfillTriggers_();
+  ScriptApp.newTrigger(JOURNAL_INCIDENT_BACKFILL.workerHandler)
+    .timeBased().after(Math.max(1000, Number(delayMs) || 1000)).create();
+}
+
+function deleteJournalIncidentBackfillTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === JOURNAL_INCIDENT_BACKFILL.workerHandler)
+    .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+}
+
+function validateJournalIncidentBackfillPreflight_() {
+  assertJournalBackfillIdle_('the September 2026 incident repair');
+  const deployment = readJournalDeploymentState_();
+  if (deployment && ['pending', 'processing', 'running'].includes(deployment.status)) {
+    throw new Error('Journal Entries deployment must finish before the incident repair starts.');
+  }
+  const spreadsheet = getJournalReportSpreadsheet_();
+  getJournalConnectedSheetTargets_(spreadsheet, 'data_source_sheets');
+  getJournalConnectedSheetTargets_(spreadsheet, 'extracts');
+  return loadJournalEntityConfiguration_();
+}
+
+function startJournalSeptemberIncidentBackfill() {
+  const loaded = validateJournalIncidentBackfillPreflight_();
+  const current = readJournalIncidentBackfillState_();
+  if (current && current.status === 'completed') return current;
+  if (current && ['pending', 'running'].includes(current.status)) {
+    replaceJournalIncidentBackfillSchedule_(JOURNAL_INCIDENT_BACKFILL.continuationDelayMs);
+    return current;
+  }
+  const now = new Date().toISOString();
+  const state = current && current.status === 'failed' ? current : {
+    operationId: Utilities.getUuid(), report: 'journal_entries',
+    periods: JOURNAL_INCIDENT_BACKFILL.periods, periodIndex: 0,
+    currentStage: 'bigquery', results: [], createdAt: now
+  };
+  state.status = 'pending';
+  state.updatedAt = now;
+  state.completedAt = null;
+  state.lastError = null;
+  state.stageAttempts = 0;
+  state.configurationVersion = loaded.configuration.configuration_version;
+  state.configurationHash = loaded.configuration.configuration_hash;
+  persistJournalIncidentBackfillState_(state);
+  replaceJournalIncidentBackfillSchedule_(JOURNAL_INCIDENT_BACKFILL.initialDelayMs);
+  return state;
+}
+
+function advanceJournalIncidentBackfillPeriod_(state) {
+  const period = state.periods[state.periodIndex];
+  const loaded = loadJournalEntityConfiguration_();
+  if (loaded.configuration.configuration_hash !== state.configurationHash) {
+    throw new Error('Journal Entries entity configuration changed during the incident repair.');
+  }
+  if (!state.childOperationId) {
+    const queued = queueJournalConfigurationDeployment_(
+      { request_id: Utilities.getUuid(), source: 'september_2026_incident_backfill' },
+      loaded.configuration,
+      { source: 'september_2026_incident_backfill', range: period }
+    );
+    state.childOperationId = queued.operationId;
+    return { waiting: true };
+  }
+  const deployment = readJournalDeploymentState_();
+  if (!deployment || deployment.operation_id !== state.childOperationId) {
+    throw new Error('Journal Entries incident child deployment state is missing or was replaced.');
+  }
+  if (deployment.status === 'failed') {
+    state.childOperationId = null;
+    throw new Error('Journal Entries incident child deployment failed: ' + String(deployment.last_error || 'unknown'));
+  }
+  if (deployment.status !== 'completed') return { waiting: true };
+  state.results.push({
+    period: period,
+    operationId: deployment.operation_id,
+    status: deployment.status
+  });
+  state.periodIndex += 1;
+  state.childOperationId = null;
+  return { waiting: false };
+}
+
+function processJournalSeptemberIncidentBackfill() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    replaceJournalIncidentBackfillSchedule_(JOURNAL_INCIDENT_BACKFILL.continuationDelayMs);
+    return { status: 'deferred_lock_busy' };
+  }
+  try {
+    deleteJournalIncidentBackfillTriggers_();
+    const state = readJournalIncidentBackfillState_();
+    if (!state) return { status: 'not_started' };
+    if (state.status === 'completed') return state;
+    state.status = 'running';
+    state.stageAttempts = Number(state.stageAttempts || 0) + 1;
+    state.updatedAt = new Date().toISOString();
+    persistJournalIncidentBackfillState_(state);
+    replaceJournalIncidentBackfillSchedule_(JOURNAL_INCIDENT_BACKFILL.watchdogDelayMs);
+
+    if (state.currentStage === 'bigquery') {
+      const progress = advanceJournalIncidentBackfillPeriod_(state);
+      state.stageAttempts = 0;
+      if (progress.waiting) {
+        state.status = 'pending';
+        state.updatedAt = new Date().toISOString();
+        persistJournalIncidentBackfillState_(state);
+        replaceJournalIncidentBackfillSchedule_(JOURNAL_INCIDENT_BACKFILL.childPollDelayMs);
+        return state;
+      }
+      if (state.periodIndex >= state.periods.length) state.currentStage = 'data_source_sheets';
+    } else if (state.currentStage === 'data_source_sheets') {
+      state.dataSourceSheets = refreshJournalConnectedSheetsStage_('data_source_sheets');
+      state.currentStage = 'extracts';
+      state.stageAttempts = 0;
+    } else if (state.currentStage === 'extracts') {
+      state.extracts = refreshJournalConnectedSheetsStage_('extracts');
+      state.currentStage = 'completed';
+      state.status = 'completed';
+      state.completedAt = new Date().toISOString();
+      state.stageAttempts = 0;
+    } else {
+      throw new Error('Unsupported Journal incident repair stage: ' + state.currentStage);
+    }
+
+    if (state.status !== 'completed') state.status = 'pending';
+    state.lastError = null;
+    state.updatedAt = new Date().toISOString();
+    persistJournalIncidentBackfillState_(state);
+    if (state.status === 'completed') deleteJournalIncidentBackfillTriggers_();
+    else replaceJournalIncidentBackfillSchedule_(JOURNAL_INCIDENT_BACKFILL.continuationDelayMs);
+    return state;
+  } catch (error) {
+    const state = readJournalIncidentBackfillState_();
+    if (state) {
+      state.lastError = String(error && error.message || error);
+      state.status = Number(state.stageAttempts || 0) < JOURNAL_INCIDENT_BACKFILL.maxStageAttempts
+        ? 'pending' : 'failed';
+      state.updatedAt = new Date().toISOString();
+      persistJournalIncidentBackfillState_(state);
+      if (state.status === 'pending') replaceJournalIncidentBackfillSchedule_(JOURNAL_INCIDENT_BACKFILL.failureRetryDelayMs);
+      else deleteJournalIncidentBackfillTriggers_();
+    }
+    throw error;
+  } finally {
+    lock.releaseLock();
+  }
+}

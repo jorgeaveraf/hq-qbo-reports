@@ -19,10 +19,16 @@ function snapshotPaymentsToBigQuery() {
 function executePaymentBigQuerySnapshot_(loadedEntityConfiguration) {
   Logger.log('--- PAYMENT BIGQUERY SNAPSHOT START ---');
   const schemaValidation = validatePaymentBigQuerySchema_();
-  const result = buildPaymentSnapshot_(loadedEntityConfiguration);
-  const loadResult = replacePaymentSnapshotPartition_(result.range, result.rows);
-  const verification = verifyPaymentSnapshotPartition_(result.range.snapshotWeek, result.hierarchyValidation);
+  const result = buildPaymentSnapshot_(loadedEntityConfiguration, { continueOnClientError: true });
+  const hasClientFailures = result.clientFailures.length > 0;
+  const loadResult = hasClientFailures
+    ? replacePaymentSnapshotClients_(result.range, result.rows, result.successfulClientIds)
+    : replacePaymentSnapshotPartition_(result.range, result.rows);
+  const verification = hasClientFailures
+    ? verifyPaymentSnapshotClients_(result.range.snapshotWeek, result.successfulClientIds, result.hierarchyValidation)
+    : verifyPaymentSnapshotPartition_(result.range.snapshotWeek, result.hierarchyValidation);
   const executionResult = {
+    status: hasClientFailures ? 'completed_with_entity_errors' : 'completed',
     entityConfiguration: result.entityConfiguration,
     schemaValidation,
     period: result.range,
@@ -34,12 +40,26 @@ function executePaymentBigQuerySnapshot_(loadedEntityConfiguration) {
     hierarchyValidation: result.hierarchyValidation,
     schemaMonitoring: result.schemaMonitoring,
     baselinePersistence: result.baselinePersistence,
+    successfulClientIds: result.successfulClientIds,
+    clientFailures: result.clientFailures,
     loadResult,
     verification
   };
   Logger.log(JSON.stringify(executionResult, null, 2));
   Logger.log('--- PAYMENT BIGQUERY SNAPSHOT END ---');
+  if (hasClientFailures) {
+    throw new Error(
+      'Payments snapshot loaded successful entities but completed with entity errors: ' +
+      JSON.stringify({
+        snapshotWeek: result.range.snapshotWeek,
+        successfulClientCount: result.successfulClientIds.length,
+        failedClientCount: result.clientFailures.length,
+        failures: result.clientFailures
+      })
+    );
+  }
   return {
+    status: executionResult.status,
     entityConfiguration: result.entityConfiguration,
     period: result.range,
     clientCount: result.clientCount,
@@ -1377,6 +1397,58 @@ function validatePaymentSnapshotHierarchy_(rows) {
  * Snapshot Assembly
  ***********************/
 
+function getPaymentClientFailure_(client, error) {
+  const message = String(error && error.message || error);
+  const statusMatch = message.match(/returned HTTP\s+(\d{3})\b/i);
+  return {
+    clientId: String(client && client.id || ''),
+    clientName: String(client && client.name || ''),
+    entity: String(client && client.entityAlias || client && client.entity || ''),
+    httpStatus: statusMatch ? Number(statusMatch[1]) : null,
+    retryable: statusMatch
+      ? isTransientPaymentHttpStatus_(Number(statusMatch[1]))
+      : /network error|timed out|timeout/i.test(message),
+    error: message
+  };
+}
+
+function buildPaymentClientSnapshot_(client, range, loadedAt) {
+  Logger.log('Fetching payments for ' + client.name + ' [' + client.id + ']');
+  const response = fetchPayments_(client.id, range.updatedSince, range.updatedThroughExclusive);
+  const currentPayments = response.items.filter(payment => paymentUpdatedInRange_(payment, range));
+  const profile = buildPaymentSchemaProfile_(client, range, response.items);
+  const previous = loadPaymentSchemaProfile_(client.id);
+  const comparison = comparePaymentSchemaProfiles_(previous, profile);
+  const rows = [];
+
+  currentPayments.forEach(payment => {
+    const normalized = normalizePayment_(client, range, payment, loadedAt);
+    normalized.rows.forEach(row => rows.push(row));
+  });
+
+  return {
+    sourcePaymentCount: response.items.length,
+    paymentCount: currentPayments.length,
+    pageCount: response.pageCount,
+    rows,
+    baselineUpdate: response.items.length ? profile : null,
+    clientCheck: {
+      clientId: client.id,
+      clientName: client.name,
+      sourcePaymentCount: response.items.length,
+      includedPaymentCount: currentPayments.length,
+      pageCount: response.pageCount,
+      status: response.items.length ? comparison.status : 'skipped_no_payments',
+      newPathCount: comparison.newPaths.length,
+      missingPathCount: comparison.missingPaths.length,
+      typeChangeCount: comparison.typeChanges.length,
+      newPaths: comparison.newPaths,
+      typeChanges: comparison.typeChanges
+    },
+    schemaStatus: comparison.status
+  };
+}
+
 function buildPaymentSnapshot_(loadedEntityConfigurationOverride, options) {
   const settings = options || {};
   const range = normalizePaymentSnapshotRange_(settings.range);
@@ -1390,42 +1462,30 @@ function buildPaymentSnapshot_(loadedEntityConfigurationOverride, options) {
   const rows = [];
   const clientChecks = [];
   const baselineUpdates = [];
+  const successfulClientIds = [];
+  const clientFailures = [];
   let sourcePaymentCount = 0;
   let filteredPaymentCount = 0;
   let pageCount = 0;
 
   Logger.log('Filtered payment clients: ' + clients.length);
   clients.forEach(client => {
-    Logger.log('Fetching payments for ' + client.name + ' [' + client.id + ']');
-    const response = fetchPayments_(client.id, range.updatedSince, range.updatedThroughExclusive);
-    pageCount += response.pageCount;
-    sourcePaymentCount += response.items.length;
-    const currentPayments = response.items.filter(payment => paymentUpdatedInRange_(payment, range));
-    filteredPaymentCount += currentPayments.length;
-
-    const profile = buildPaymentSchemaProfile_(client, range, response.items);
-    const previous = loadPaymentSchemaProfile_(client.id);
-    const comparison = comparePaymentSchemaProfiles_(previous, profile);
-    clientChecks.push({
-      clientId: client.id,
-      clientName: client.name,
-      sourcePaymentCount: response.items.length,
-      includedPaymentCount: currentPayments.length,
-      pageCount: response.pageCount,
-      status: response.items.length ? comparison.status : 'skipped_no_payments',
-      newPathCount: comparison.newPaths.length,
-      missingPathCount: comparison.missingPaths.length,
-      typeChangeCount: comparison.typeChanges.length,
-      newPaths: comparison.newPaths,
-      typeChanges: comparison.typeChanges
-    });
-    if (response.items.length) baselineUpdates.push(profile);
-
-    currentPayments.forEach(payment => {
-      const normalized = normalizePayment_(client, range, payment, loadedAt);
-      normalized.rows.forEach(row => rows.push(row));
-    });
-    Logger.log(client.name + ': sourcePayments=' + response.items.length + ', includedPayments=' + currentPayments.length + ', snapshotRows=' + rows.length + ', pages=' + response.pageCount + ', schemaStatus=' + comparison.status);
+    try {
+      const clientSnapshot = buildPaymentClientSnapshot_(client, range, loadedAt);
+      pageCount += clientSnapshot.pageCount;
+      sourcePaymentCount += clientSnapshot.sourcePaymentCount;
+      filteredPaymentCount += clientSnapshot.paymentCount;
+      clientSnapshot.rows.forEach(row => rows.push(row));
+      clientChecks.push(clientSnapshot.clientCheck);
+      if (clientSnapshot.baselineUpdate) baselineUpdates.push(clientSnapshot.baselineUpdate);
+      successfulClientIds.push(client.id);
+      Logger.log(client.name + ': sourcePayments=' + clientSnapshot.sourcePaymentCount + ', includedPayments=' + clientSnapshot.paymentCount + ', snapshotRows=' + rows.length + ', pages=' + clientSnapshot.pageCount + ', schemaStatus=' + clientSnapshot.schemaStatus);
+    } catch (error) {
+      if (settings.continueOnClientError !== true) throw error;
+      const failure = getPaymentClientFailure_(client, error);
+      clientFailures.push(failure);
+      Logger.log(JSON.stringify({ event: 'payment_client_failed', ...failure }));
+    }
   });
 
   sortPaymentRows_(rows);
@@ -1449,6 +1509,8 @@ function buildPaymentSnapshot_(loadedEntityConfigurationOverride, options) {
     paymentCount: filteredPaymentCount,
     pageCount,
     rows,
+    successfulClientIds,
+    clientFailures,
     hierarchyValidation,
     schemaMonitoring: {
       clientCount: clientChecks.length,
@@ -1578,6 +1640,132 @@ function replacePaymentSnapshotPartition_(range, rows) {
   return { mode: 'partition_replace', jobId: completedJob.jobReference.jobId, destinationTable: [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, destinationTableId].join('.'), snapshotWeek, partitionId, rowCount: rows.length, outputRows, payloadBytes: blob.getBytes().length, state: completedJob.status.state };
 }
 
+function escapePaymentBigQueryString_(value) {
+  return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+function buildPaymentClientScopeSql_(clientIds) {
+  const normalized = Array.from(new Set((clientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)));
+  if (!normalized.length) throw new Error('At least one successful Payments client is required.');
+  return normalized.map(clientId => "'" + escapePaymentBigQueryString_(clientId) + "'").join(', ');
+}
+
+function removePaymentStagingTable_(tableId) {
+  if (!tableId) return;
+  try {
+    BigQuery.Tables.remove(BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, tableId);
+  } catch (error) {
+    Logger.log(JSON.stringify({
+      event: 'payment_staging_cleanup_failed',
+      tableId,
+      error: String(error && error.message || error)
+    }));
+  }
+}
+
+function replacePaymentSnapshotClients_(range, rows, successfulClientIds) {
+  const snapshotWeek = String(range && range.snapshotWeek || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotWeek)) {
+    throw new Error('Invalid SnapshotWeek for Payments client replacement: ' + snapshotWeek);
+  }
+  if (!Array.isArray(rows)) throw new Error('Payment snapshot rows must be an array.');
+
+  const normalizedClientIds = Array.from(new Set(
+    (successfulClientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
+  ));
+  if (!normalizedClientIds.length) {
+    return {
+      mode: 'client_scope_noop',
+      destinationTable: PAYMENT_BIGQUERY_TABLE,
+      snapshotWeek,
+      successfulClientCount: 0,
+      rowCount: 0,
+      state: 'SKIPPED'
+    };
+  }
+
+  const allowedClientIds = {};
+  normalizedClientIds.forEach(clientId => { allowedClientIds[clientId] = true; });
+  const preparedRows = rows.map((row, index) => {
+    if (String(row.SnapshotWeek || '') !== snapshotWeek) {
+      throw new Error('Payment row ' + index + ' belongs to a different partition.');
+    }
+    if (!allowedClientIds[String(row.ClientId || '')]) {
+      throw new Error('Payment row ' + index + ' belongs to a client outside the successful replacement scope.');
+    }
+    validatePaymentBigQueryRow_(row, index);
+    return PAYMENT_EXPORT_COLUMNS.reduce((json, column) => {
+      json[column] = row[column] === undefined ? null : row[column];
+      return json;
+    }, {});
+  });
+
+  const partitionId = snapshotWeek.replace(/-/g, '');
+  const token = Utilities.getUuid().replace(/-/g, '');
+  const stagingTableId = 'payment_snapshot_stage_' + partitionId + '_' + token;
+  const clientScopeSql = buildPaymentClientScopeSql_(normalizedClientIds);
+  let stagingLoadJob = null;
+
+  try {
+    if (preparedRows.length) {
+      const ndjson = preparedRows.map(JSON.stringify).join('\n');
+      const blob = Utilities.newBlob(ndjson, 'application/octet-stream', stagingTableId + '.ndjson');
+      const loadJobId = 'payment_stage_' + partitionId + '_' + token;
+      const insertedJob = BigQuery.Jobs.insert({
+        jobReference: { projectId: BQ_CONFIG.projectId, jobId: loadJobId },
+        configuration: { load: {
+          destinationTable: {
+            projectId: BQ_CONFIG.projectId,
+            datasetId: BQ_CONFIG.rawDatasetId,
+            tableId: stagingTableId
+          },
+          sourceFormat: 'NEWLINE_DELIMITED_JSON',
+          createDisposition: 'CREATE_IF_NEEDED',
+          writeDisposition: 'WRITE_TRUNCATE',
+          autodetect: false,
+          ignoreUnknownValues: false,
+          maxBadRecords: 0,
+          schema: { fields: PAYMENT_BIGQUERY_SCHEMA }
+        }}
+      }, BQ_CONFIG.projectId, blob);
+      if (!insertedJob || !insertedJob.jobReference) {
+        throw new Error('BigQuery did not return a job reference for the Payments staging load.');
+      }
+      stagingLoadJob = waitForBigQueryJob_(insertedJob.jobReference, 120000);
+    }
+
+    const statements = [
+      'BEGIN TRANSACTION;',
+      'DELETE FROM `' + PAYMENT_BIGQUERY_TABLE + '`',
+      "WHERE SnapshotWeek = DATE '" + snapshotWeek + "'",
+      '  AND ClientId IN (' + clientScopeSql + ');'
+    ];
+    if (preparedRows.length) {
+      const columns = PAYMENT_EXPORT_COLUMNS.map(column => '`' + column + '`').join(', ');
+      statements.push(
+        'INSERT INTO `' + PAYMENT_BIGQUERY_TABLE + '` (' + columns + ')',
+        'SELECT ' + columns,
+        'FROM `' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId].join('.') + '`;'
+      );
+    }
+    statements.push('COMMIT TRANSACTION;');
+    const queryResult = runBigQueryQuery_(statements.join('\n'));
+    return {
+      mode: 'successful_clients_replace',
+      jobId: queryResult.jobReference && queryResult.jobReference.jobId || null,
+      stagingLoadJobId: stagingLoadJob && stagingLoadJob.jobReference && stagingLoadJob.jobReference.jobId || null,
+      destinationTable: PAYMENT_BIGQUERY_TABLE,
+      snapshotWeek,
+      partitionId,
+      successfulClientCount: normalizedClientIds.length,
+      rowCount: preparedRows.length,
+      state: 'DONE'
+    };
+  } finally {
+    if (preparedRows.length) removePaymentStagingTable_(stagingTableId);
+  }
+}
+
 function waitForBigQueryJob_(jobReference, timeoutMs) {
   if (!jobReference || !jobReference.jobId) throw new Error('A valid BigQuery job reference is required.');
   const projectId = jobReference.projectId || BQ_CONFIG.projectId;
@@ -1623,6 +1811,65 @@ function verifyPaymentSnapshotPartition_(snapshotWeek, expectedHierarchy) {
   }
   if (actual.missingKeyCount !== 0 || actual.uniqueKeyCount !== actual.rowCount) throw new Error('Payments partition idempotency verification failed: ' + JSON.stringify(actual));
   return { status: 'passed', snapshotWeek: normalizedSnapshotWeek, partitionId: normalizedSnapshotWeek.replace(/-/g, ''), expectedRowCount: Number(expected.rowCount), actualRowCount: actual.rowCount, paymentCount: actual.paymentCount, headerRowCount: actual.headerCount, lineRowCount: actual.lineCount, missingKeyCount: actual.missingKeyCount, uniqueKeyCount: actual.uniqueKeyCount };
+}
+
+function verifyPaymentSnapshotClients_(snapshotWeek, successfulClientIds, expectedHierarchy) {
+  const normalizedSnapshotWeek = String(snapshotWeek || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedSnapshotWeek)) {
+    throw new Error('Invalid SnapshotWeek for Payments client verification: ' + normalizedSnapshotWeek);
+  }
+  const normalizedClientIds = Array.from(new Set(
+    (successfulClientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
+  ));
+  if (!normalizedClientIds.length) {
+    return {
+      status: 'skipped_no_successful_clients',
+      snapshotWeek: normalizedSnapshotWeek,
+      expectedRowCount: 0,
+      actualRowCount: null
+    };
+  }
+
+  const result = runBigQueryQuery_([
+    'SELECT',
+    '  COUNT(*) AS row_count,',
+    "  COUNTIF(idempotency_key IS NULL OR TRIM(idempotency_key) = '') AS missing_key_count,",
+    '  COUNT(DISTINCT idempotency_key) AS unique_key_count,',
+    "  COUNTIF(RecordType = 'HEADER') AS header_count,",
+    "  COUNTIF(RecordType = 'LINE') AS line_count,",
+    "  COUNT(DISTINCT IF(RecordType = 'HEADER', CONCAT(ClientId, '|', PaymentId), NULL)) AS payment_count",
+    'FROM `' + PAYMENT_BIGQUERY_TABLE + '`',
+    "WHERE SnapshotWeek = DATE '" + normalizedSnapshotWeek + "'",
+    '  AND ClientId IN (' + buildPaymentClientScopeSql_(normalizedClientIds) + ')'
+  ].join('\n'));
+  const values = result.rows && result.rows.length ? result.rows[0].f : [];
+  const actual = {
+    rowCount: Number(values[0] ? values[0].v : 0),
+    missingKeyCount: Number(values[1] ? values[1].v : 0),
+    uniqueKeyCount: Number(values[2] ? values[2].v : 0),
+    headerCount: Number(values[3] ? values[3].v : 0),
+    lineCount: Number(values[4] ? values[4].v : 0),
+    paymentCount: Number(values[5] ? values[5].v : 0)
+  };
+  const expected = expectedHierarchy || { rowCount: 0, headerRowCount: 0, lineRowCount: 0, paymentCount: 0 };
+  if (actual.rowCount !== Number(expected.rowCount) || actual.headerCount !== Number(expected.headerRowCount) || actual.lineCount !== Number(expected.lineRowCount) || actual.paymentCount !== Number(expected.paymentCount)) {
+    throw new Error('Payments successful-client hierarchy mismatch. Expected=' + JSON.stringify(expected) + ', actual=' + JSON.stringify(actual));
+  }
+  if (actual.missingKeyCount !== 0 || actual.uniqueKeyCount !== actual.rowCount) {
+    throw new Error('Payments successful-client idempotency verification failed: ' + JSON.stringify(actual));
+  }
+  return {
+    status: 'passed_successful_clients',
+    snapshotWeek: normalizedSnapshotWeek,
+    successfulClientCount: normalizedClientIds.length,
+    expectedRowCount: Number(expected.rowCount),
+    actualRowCount: actual.rowCount,
+    paymentCount: actual.paymentCount,
+    headerRowCount: actual.headerCount,
+    lineRowCount: actual.lineCount,
+    missingKeyCount: actual.missingKeyCount,
+    uniqueKeyCount: actual.uniqueKeyCount
+  };
 }
 
 function runBigQueryQuery_(query) {

@@ -7,6 +7,7 @@ function queueAgingConfigurationDeployment_(pushPayload, configuration, options)
   const normalizedOptions = options && typeof options === 'object' ? options : {};
   const range = normalizeAgingDeploymentRange_(normalizedOptions.range);
   const source = String(normalizedOptions.source || 'configuration_push').trim();
+  const skipOutputSheets = normalizedOptions.skipOutputSheets === true;
   const current = readAgingDeploymentState_();
 
   const sameOperation = current &&
@@ -43,7 +44,7 @@ function queueAgingConfigurationDeployment_(pushPayload, configuration, options)
     configuration: validatedConfiguration,
     range,
     status: 'pending',
-    current_stage: 'output_sheets',
+    current_stage: skipOutputSheets ? 'bigquery' : 'output_sheets',
     attempts: {
       output_sheets: 0,
       bigquery: 0,
@@ -56,9 +57,15 @@ function queueAgingConfigurationDeployment_(pushPayload, configuration, options)
     completed_at: null,
     last_error: null,
     stages: {
-      output_sheets: createAgingDeploymentStageState_(),
+      output_sheets: skipOutputSheets
+        ? { ...createAgingDeploymentStageState_(), status: 'completed', completed_at: now,
+          result: { status: 'skipped_for_historical_backfill' } }
+        : createAgingDeploymentStageState_(),
       bigquery: createAgingDeploymentStageState_(),
-      output_sheet_export: createAgingDeploymentStageState_(),
+      output_sheet_export: skipOutputSheets
+        ? { ...createAgingDeploymentStageState_(), status: 'completed', completed_at: now,
+          result: { status: 'skipped_for_historical_backfill' } }
+        : createAgingDeploymentStageState_(),
       data_source_sheets: createAgingDeploymentStageState_(),
       extracts: createAgingDeploymentStageState_()
     }
@@ -330,6 +337,9 @@ function processAgingConfigurationDeployment() {
   } catch (error) {
     const current = readAgingDeploymentState_();
     let retryScheduled = false;
+    const entityIsolationFailure = Boolean(
+      error && error.entityIsolationFailure
+    );
 
     if (
       claimedState &&
@@ -346,11 +356,11 @@ function processAgingConfigurationDeployment() {
       current.updated_at = failedAt;
       current.last_error = stageState.error;
 
-      if (claimedStage === 'bigquery') {
+      if (claimedStage === 'bigquery' && !entityIsolationFailure) {
         prepareAgingBigQueryCheckpointForRetry_(current.operation_id);
       }
 
-      if (stageState.attempt < AGING_OPERATIONAL_DEPLOYMENT.maxStageAttempts) {
+      if (!entityIsolationFailure && stageState.attempt < AGING_OPERATIONAL_DEPLOYMENT.maxStageAttempts) {
         stageState.status = 'pending';
         stageState.retry_scheduled = true;
         current.status = 'pending';
@@ -440,6 +450,25 @@ function executeAgingBigQueryContinuationStage_(state) {
     checkpoint = initializeAgingBigQueryCheckpoint_(state);
   }
 
+  if (!Array.isArray(checkpoint.successful_client_ids)) {
+    checkpoint.successful_client_ids = checkpoint.clients
+      .slice(0, Number(checkpoint.next_client_index || 0))
+      .map(client => client.id);
+  }
+  if (!Array.isArray(checkpoint.client_failures)) {
+    checkpoint.client_failures = [];
+  }
+  if (!checkpoint.stale_cleanup_job_id) {
+    checkpoint.stale_cleanup_job_id = buildAgingBigQueryJobId_(
+      checkpoint.operation_id,
+      checkpoint.range.snapshotDate,
+      'stale_client_cleanup',
+      '',
+      0
+    );
+  }
+  checkpoint.stale_cleanup_completed = checkpoint.stale_cleanup_completed === true;
+
   Logger.log(JSON.stringify({
     event: 'aging_bigquery_continuation_started',
     operationId: checkpoint.operation_id,
@@ -451,29 +480,8 @@ function executeAgingBigQueryContinuationStage_(state) {
   }));
 
   if (!checkpoint.partition_initialized) {
-    if (!checkpoint.partition_clear_job_id) {
-      checkpoint.partition_clear_job_id = buildAgingBigQueryJobId_(
-        checkpoint.operation_id,
-        checkpoint.range.snapshotDate,
-        'partition_clear',
-        '',
-        checkpoint.partition_clear_generation
-      );
-      persistAgingBigQueryCheckpoint_(checkpoint);
-    }
-
-    const clearResult = ensureAgingBigQueryQueryJob_(
-      checkpoint.partition_clear_job_id,
-      buildAgingPartitionClearQuery_(checkpoint.range.snapshotDate)
-    );
-
-    if (!clearResult.done) {
-      return yieldAgingBigQueryCheckpoint_(
-        checkpoint,
-        'partition_clear_job_pending'
-      );
-    }
-
+    // Preserve the existing partition. Each successful client replaces only
+    // its own rows; a client that cannot be fetched keeps its prior snapshot.
     checkpoint.partition_initialized = true;
     checkpoint.partition_clear_completed_at = new Date().toISOString();
     persistAgingBigQueryCheckpoint_(checkpoint);
@@ -493,10 +501,29 @@ function executeAgingBigQueryContinuationStage_(state) {
       return yieldAgingBigQueryCheckpoint_(checkpoint, 'execution_budget');
     }
 
-    const clientResult = processAgingBigQueryCheckpointClient_(
-      checkpoint,
-      executionStartedAt
-    );
+    let clientResult;
+    try {
+      clientResult = processAgingBigQueryCheckpointClient_(checkpoint, executionStartedAt);
+    } catch (error) {
+      if (checkpoint.current_client) throw error;
+      const client = checkpoint.clients[checkpoint.next_client_index];
+      const message = String(error && error.message || error);
+      const statusMatch = message.match(/returned HTTP\s+(\d{3})\b/i);
+      const failure = {
+        clientId: String(client && client.id || ''),
+        clientName: String(client && client.name || ''),
+        entity: String(client && (client.entityAlias || client.entity) || ''),
+        httpStatus: statusMatch ? Number(statusMatch[1]) : null,
+        error: message
+      };
+      checkpoint.client_failures.push(failure);
+      checkpoint.next_client_index++;
+      checkpoint.updated_at = new Date().toISOString();
+      persistAgingBigQueryCheckpoint_(checkpoint);
+      Logger.log(JSON.stringify({ event: 'aging_bigquery_client_failed', failure: failure }));
+      processedThisExecution++;
+      continue;
+    }
 
     if (clientResult.status === 'yielded') {
       return yieldAgingBigQueryCheckpoint_(
@@ -509,7 +536,35 @@ function executeAgingBigQueryContinuationStage_(state) {
     processedThisExecution++;
   }
 
+  if (!checkpoint.stale_cleanup_completed) {
+    const cleanupResult = ensureAgingBigQueryQueryJob_(
+      checkpoint.stale_cleanup_job_id,
+      buildAgingStaleClientsDeleteQuery_(
+        checkpoint.range.snapshotDate,
+        checkpoint.clients.map(client => client.id)
+      )
+    );
+    if (!cleanupResult.done) {
+      return yieldAgingBigQueryCheckpoint_(checkpoint, 'stale_client_cleanup_pending');
+    }
+    checkpoint.stale_cleanup_completed = true;
+    checkpoint.updated_at = new Date().toISOString();
+    persistAgingBigQueryCheckpoint_(checkpoint);
+  }
+
   if (checkpoint.verification) {
+    return buildAgingBigQueryCompletionResult_(checkpoint);
+  }
+
+  if (!checkpoint.successful_client_ids.length) {
+    checkpoint.verification = {
+      status: 'skipped_no_successful_clients',
+      snapshotDate: checkpoint.range.snapshotDate,
+      expectedRowCount: 0,
+      actualRowCount: null
+    };
+    checkpoint.updated_at = new Date().toISOString();
+    persistAgingBigQueryCheckpoint_(checkpoint);
     return buildAgingBigQueryCompletionResult_(checkpoint);
   }
 
@@ -526,7 +581,10 @@ function executeAgingBigQueryContinuationStage_(state) {
 
   const verificationJob = ensureAgingBigQueryQueryJob_(
     checkpoint.verification_job_id,
-    buildAgingVerificationQuery_(checkpoint.range.snapshotDate)
+    buildAgingVerificationQuery_(
+      checkpoint.range.snapshotDate,
+      checkpoint.successful_client_ids
+    )
   );
 
   if (!verificationJob.done) {
@@ -594,6 +652,10 @@ function initializeAgingBigQueryCheckpoint_(state) {
     row_count: 0,
     unique_row_count: 0,
     open_amount_cents: { AR: 0, AP: 0 },
+    successful_client_ids: [],
+    client_failures: [],
+    stale_cleanup_job_id: null,
+    stale_cleanup_completed: false,
     continuation_count: 0,
     partition_initialized: false,
     partition_clear_generation: 0,
@@ -770,6 +832,7 @@ function processAgingBigQueryCheckpointClient_(checkpoint, executionStartedAt) {
   }
 
   checkpoint.processed_client_count++;
+  checkpoint.successful_client_ids.push(client.id);
   checkpoint.next_client_index++;
   checkpoint.current_client = null;
   checkpoint.updated_at = new Date().toISOString();
@@ -877,8 +940,8 @@ function agingExecutionBudgetReached_(executionStartedAt) {
 }
 
 function buildAgingBigQueryCompletionResult_(checkpoint) {
-  return {
-    status: 'completed',
+  const result = {
+    status: checkpoint.client_failures.length ? 'completed_with_entity_errors' : 'completed',
     event: 'aging_snapshot_completed',
     entityConfiguration: checkpoint.entity_configuration,
     schemaValidation: checkpoint.schema_validation,
@@ -887,6 +950,8 @@ function buildAgingBigQueryCompletionResult_(checkpoint) {
     clientCount: checkpoint.clients.length,
     clientsWithRowsCount: checkpoint.clients_with_rows_count,
     processedClientCount: checkpoint.processed_client_count,
+    successfulClientCount: checkpoint.successful_client_ids.length,
+    failedClientCount: checkpoint.client_failures.length,
     reportRowCounts: checkpoint.report_row_counts,
     rowCount: checkpoint.row_count,
     uniqueRowCount: checkpoint.unique_row_count,
@@ -895,8 +960,25 @@ function buildAgingBigQueryCompletionResult_(checkpoint) {
       AP: checkpoint.open_amount_cents.AP / 100
     },
     continuationCount: checkpoint.continuation_count,
-    verification: checkpoint.verification
+    verification: checkpoint.verification,
+    successfulClientIds: checkpoint.successful_client_ids,
+    clientFailures: checkpoint.client_failures
   };
+  Logger.log(JSON.stringify(result, null, 2));
+  if (checkpoint.client_failures.length) {
+    const partialError = new Error(
+      'Aging snapshot loaded successful entities but completed with entity errors: ' +
+      JSON.stringify({
+        snapshotDate: checkpoint.range.snapshotDate,
+        successfulClientCount: checkpoint.successful_client_ids.length,
+        failedClientCount: checkpoint.client_failures.length,
+        failures: checkpoint.client_failures
+      })
+    );
+    partialError.entityIsolationFailure = true;
+    throw partialError;
+  }
+  return result;
 }
 
 function agingBigQueryCheckpointMatchesState_(checkpoint, state) {

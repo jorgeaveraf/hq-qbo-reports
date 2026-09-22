@@ -2168,8 +2168,21 @@ function optionalIsoDate_(value) {
  * Snapshot Assembly
  ***********************/
 
-function buildInvoiceSnapshot_(loadedEntityConfigurationOverride) {
-  const range = getPreviousCompletedWeekRange_();
+function getInvoiceClientFailure_(client, error) {
+  const message = String(error && error.message || error);
+  const statusMatch = message.match(/returned HTTP\s+(\d{3})\b/i);
+  return {
+    clientId: String(client && client.id || ''),
+    clientName: String(client && client.name || ''),
+    entity: String(client && client.entityAlias || ''),
+    httpStatus: statusMatch ? Number(statusMatch[1]) : null,
+    error: message
+  };
+}
+
+function buildInvoiceSnapshot_(loadedEntityConfigurationOverride, options) {
+  const settings = options || {};
+  const range = settings.range || getPreviousCompletedWeekRange_();
   const loadedAt = new Date().toISOString();
   const loadedEntityConfiguration = loadedEntityConfigurationOverride || loadInvoiceEntityConfiguration_();
 
@@ -2194,43 +2207,53 @@ function buildInvoiceSnapshot_(loadedEntityConfigurationOverride) {
   const mappingWarnings = [];
   const schemaChecks = [];
   const schemaBaselineUpdates = [];
+  const successfulClientIds = [];
+  const clientFailures = [];
 
   Logger.log('Filtered invoice clients: ' + clients.length);
   clients.forEach(client => {
-    Logger.log('Fetching invoices for ' + client.name + ' [' + client.id + ']');
-    const invoiceResult = fetchInvoices_(client.id, range.dateFrom, range.dateTo);
-    const normalized = normalizeInvoices_(client, range, invoiceResult, loadedAt);
-    normalized.rows.forEach(row => lineRows.push(row));
-    mergeInvoiceSourceDiagnostics_(diagnostics, normalized.diagnostics);
-    const clientDiagnostics = summarizeInvoiceSourceDiagnostics_(normalized.diagnostics);
+    try {
+      Logger.log('Fetching invoices for ' + client.name + ' [' + client.id + ']');
+      const invoiceResult = fetchInvoices_(client.id, range.dateFrom, range.dateTo);
+      const normalized = normalizeInvoices_(client, range, invoiceResult, loadedAt);
+      normalized.rows.forEach(row => lineRows.push(row));
+      mergeInvoiceSourceDiagnostics_(diagnostics, normalized.diagnostics);
+      const clientDiagnostics = summarizeInvoiceSourceDiagnostics_(normalized.diagnostics);
 
-    if (clientDiagnostics.aliasResolutionCount > 0 || clientDiagnostics.normalizedKeyMatchCount > 0) {
-      mappingWarnings.push({
-        clientId: client.id,
-        clientName: client.name,
-        aliasResolutionCount: clientDiagnostics.aliasResolutionCount,
-        normalizedKeyMatchCount: clientDiagnostics.normalizedKeyMatchCount,
-        aliasesUsed: clientDiagnostics.aliasesUsed,
-        normalizedKeyMatches: clientDiagnostics.normalizedKeyMatches
-      });
+      if (clientDiagnostics.aliasResolutionCount > 0 || clientDiagnostics.normalizedKeyMatchCount > 0) {
+        mappingWarnings.push({
+          clientId: client.id,
+          clientName: client.name,
+          aliasResolutionCount: clientDiagnostics.aliasResolutionCount,
+          normalizedKeyMatchCount: clientDiagnostics.normalizedKeyMatchCount,
+          aliasesUsed: clientDiagnostics.aliasesUsed,
+          normalizedKeyMatches: clientDiagnostics.normalizedKeyMatches
+        });
+      }
+
+      const schemaBaseline = prepareInvoiceSchemaBaseline_(
+        client,
+        range,
+        normalized.stats.invoiceCount,
+        normalized.diagnostics
+      );
+      schemaChecks.push(schemaBaseline.check);
+      if (schemaBaseline.update) schemaBaselineUpdates.push(schemaBaseline.update);
+      successfulClientIds.push(client.id);
+
+      Logger.log(
+        client.name + ': invoices=' + normalized.stats.invoiceCount +
+        ', snapshotRows=' + normalized.stats.snapshotRowCount +
+        ', aliases=' + clientDiagnostics.aliasResolutionCount +
+        ', normalizedKeys=' + clientDiagnostics.normalizedKeyMatchCount +
+        ', schemaStatus=' + schemaBaseline.check.status
+      );
+    } catch (error) {
+      if (settings.continueOnClientError !== true) throw error;
+      const failure = getInvoiceClientFailure_(client, error);
+      clientFailures.push(failure);
+      Logger.log(JSON.stringify({ event: 'invoice_client_failed', failure: failure }));
     }
-
-    const schemaBaseline = prepareInvoiceSchemaBaseline_(
-      client,
-      range,
-      normalized.stats.invoiceCount,
-      normalized.diagnostics
-    );
-    schemaChecks.push(schemaBaseline.check);
-    if (schemaBaseline.update) schemaBaselineUpdates.push(schemaBaseline.update);
-
-    Logger.log(
-      client.name + ': invoices=' + normalized.stats.invoiceCount +
-      ', snapshotRows=' + normalized.stats.snapshotRowCount +
-      ', aliases=' + clientDiagnostics.aliasResolutionCount +
-      ', normalizedKeys=' + clientDiagnostics.normalizedKeyMatchCount +
-      ', schemaStatus=' + schemaBaseline.check.status
-    );
   });
 
   sortInvoiceRows_(lineRows);
@@ -2248,6 +2271,8 @@ function buildInvoiceSnapshot_(loadedEntityConfigurationOverride) {
     loadedAt: loadedAt,
     clientCount: clients.length,
     lineRows: lineRows,
+    successfulClientIds: successfulClientIds,
+    clientFailures: clientFailures,
     entityConfiguration: entityConfigurationSummary,
     sourceDiagnostics: summarizeInvoiceSourceDiagnostics_(diagnostics),
     mappingWarnings: mappingWarnings,
@@ -2620,22 +2645,31 @@ function snapshotInvoicesToBigQuery() {
   }
 }
 
-function executeInvoiceBigQuerySnapshot_(loadedEntityConfiguration) {
+function executeInvoiceBigQuerySnapshot_(loadedEntityConfiguration, options) {
   Logger.log('--- INVOICE BIGQUERY SNAPSHOT START ---');
 
   const schemaValidation = validateInvoiceBigQuerySchema_();
-  const result = buildInvoiceSnapshot_(loadedEntityConfiguration);
+  const settings = options || {};
+  const result = buildInvoiceSnapshot_(loadedEntityConfiguration, {
+    continueOnClientError: true,
+    range: settings.range || null
+  });
+  const hasClientFailures = result.clientFailures.length > 0;
   const hierarchyValidation = validateInvoiceSnapshotHierarchy_(result.lineRows);
-  const loadResult = replaceInvoiceSnapshotPartition_(result.range, result.lineRows);
+  const loadResult = hasClientFailures
+    ? replaceInvoiceSnapshotClients_(result.range, result.lineRows, result.successfulClientIds)
+    : replaceInvoiceSnapshotPartition_(result.range, result.lineRows);
   const verification = verifyInvoiceSnapshotPartition_(
     result.range.snapshotWeek,
-    hierarchyValidation
+    hierarchyValidation,
+    hasClientFailures ? result.successfulClientIds : null
   );
   const baselinePersistence = persistInvoiceSchemaBaselineUpdates_(
     result.schemaBaselineUpdates
   );
 
   const executionResult = {
+    status: hasClientFailures ? 'completed_with_entity_errors' : 'completed',
     entityConfiguration: result.entityConfiguration,
     schemaValidation: schemaValidation,
     period: result.range,
@@ -2646,13 +2680,87 @@ function executeInvoiceBigQuerySnapshot_(loadedEntityConfiguration) {
     mappingWarnings: result.mappingWarnings,
     schemaMonitoring: result.schemaMonitoring,
     baselinePersistence: baselinePersistence,
+    successfulClientIds: result.successfulClientIds,
+    clientFailures: result.clientFailures,
     loadResult: loadResult,
     verification: verification
   };
 
   Logger.log(JSON.stringify(executionResult, null, 2));
   Logger.log('--- INVOICE BIGQUERY SNAPSHOT END ---');
+  if (hasClientFailures) {
+    throw new Error('Invoice snapshot loaded successful entities but completed with entity errors: ' +
+      JSON.stringify({
+        snapshotWeek: result.range.snapshotWeek,
+        successfulClientCount: result.successfulClientIds.length,
+        failedClientCount: result.clientFailures.length,
+        failures: result.clientFailures
+      }));
+  }
   return executionResult;
+}
+
+function escapeInvoiceBigQueryString_(value) {
+  return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+function buildInvoiceClientScopeSql_(clientIds) {
+  const ids = Array.from(new Set((clientIds || []).map(id => String(id || '').trim()).filter(Boolean)));
+  if (!ids.length) throw new Error('At least one successful Invoice client is required.');
+  return ids.map(id => "'" + escapeInvoiceBigQueryString_(id) + "'").join(', ');
+}
+
+function replaceInvoiceSnapshotClients_(range, rows, successfulClientIds) {
+  const snapshotWeek = String(range && range.snapshotWeek || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotWeek)) throw new Error('Invalid Invoice SnapshotWeek: ' + snapshotWeek);
+  const ids = Array.from(new Set((successfulClientIds || []).map(id => String(id || '').trim()).filter(Boolean)));
+  const tableReference = [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, BQ_CONFIG.snapshotsTableId].join('.');
+  if (!ids.length) return { mode: 'client_scope_noop', destinationTable: tableReference, snapshotWeek: snapshotWeek, successfulClientCount: 0, rowCount: 0, state: 'SKIPPED' };
+  const allowed = {};
+  ids.forEach(id => { allowed[id] = true; });
+  const prepared = buildInvoiceBigQueryRows_(rows).map((row, index) => {
+    if (String(row.SnapshotWeek || '') !== snapshotWeek || !allowed[String(row.ClientId || '')]) {
+      throw new Error('Invoice row ' + index + ' is outside the successful client replacement scope.');
+    }
+    return row;
+  });
+  const partitionId = snapshotWeek.replace(/-/g, '');
+  const token = Utilities.getUuid().replace(/-/g, '');
+  const stagingTableId = 'invoice_snapshot_stage_' + partitionId + '_' + token;
+  try {
+    if (prepared.length) {
+      const blob = Utilities.newBlob(prepared.map(JSON.stringify).join('\n'), 'application/octet-stream', stagingTableId + '.ndjson');
+      const inserted = BigQuery.Jobs.insert({
+        jobReference: { projectId: BQ_CONFIG.projectId, jobId: 'invoice_stage_' + partitionId + '_' + token },
+        configuration: { load: {
+          destinationTable: { projectId: BQ_CONFIG.projectId, datasetId: BQ_CONFIG.rawDatasetId, tableId: stagingTableId },
+          sourceFormat: 'NEWLINE_DELIMITED_JSON', createDisposition: 'CREATE_IF_NEEDED', writeDisposition: 'WRITE_TRUNCATE',
+          autodetect: false, ignoreUnknownValues: false, maxBadRecords: 0, schema: { fields: INVOICE_BIGQUERY_SCHEMA }
+        } }
+      }, BQ_CONFIG.projectId, blob);
+      waitForBigQueryJob_(inserted.jobReference, 120000);
+    }
+    const statements = [
+      'BEGIN TRANSACTION;',
+      'DELETE FROM `' + tableReference + '`',
+      "WHERE SnapshotWeek = DATE '" + snapshotWeek + "'",
+      '  AND ClientId IN (' + buildInvoiceClientScopeSql_(ids) + ');'
+    ];
+    if (prepared.length) {
+      const columns = INVOICE_EXPORT_COLUMNS.map(column => '`' + column + '`').join(', ');
+      statements.push('INSERT INTO `' + tableReference + '` (' + columns + ')', 'SELECT ' + columns,
+        'FROM `' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId].join('.') + '`;');
+    }
+    statements.push('COMMIT TRANSACTION;');
+    runBigQuerySingleRowQuery_(statements.join('\n'));
+    return { mode: 'successful_clients_replace', destinationTable: tableReference, snapshotWeek: snapshotWeek,
+      successfulClientCount: ids.length, rowCount: prepared.length, state: 'DONE' };
+  } finally {
+    if (prepared.length) {
+      try { BigQuery.Tables.remove(BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId); }
+      catch (error) { Logger.log('Invoice staging cleanup failed: ' + String(error && error.message || error)); }
+    }
+  }
 }
 
 function replaceInvoiceSnapshotPartition_(range, rows) {
@@ -2716,7 +2824,7 @@ function waitForBigQueryJob_(jobReference, timeoutMs) {
   return job;
 }
 
-function verifyInvoiceSnapshotPartition_(snapshotWeek, expectedHierarchy) {
+function verifyInvoiceSnapshotPartition_(snapshotWeek, expectedHierarchy, clientIds) {
   const normalizedSnapshotWeek = String(snapshotWeek || '').trim();
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedSnapshotWeek)) {
@@ -2731,12 +2839,17 @@ function verifyInvoiceSnapshotPartition_(snapshotWeek, expectedHierarchy) {
     BQ_CONFIG.rawDatasetId,
     BQ_CONFIG.snapshotsTableId
   ].join('.');
+  const scopedClientIds = Array.from(new Set((clientIds || []).map(id => String(id || '').trim()).filter(Boolean)));
+  const clientFilter = scopedClientIds.length
+    ? '    AND ClientId IN (' + buildInvoiceClientScopeSql_(scopedClientIds) + ')'
+    : null;
 
   const query = [
     'WITH partition_rows AS (',
     '  SELECT idempotency_key, RecordType, RecordOrder, ClientId, InvoiceId',
     '  FROM `' + tableReference + '`',
     "  WHERE SnapshotWeek = DATE '" + normalizedSnapshotWeek + "'",
+    clientFilter,
     '),',
     'invoice_groups AS (',
     '  SELECT ClientId, InvoiceId, COUNTIF(RecordType = "HEADER") AS header_count',
@@ -2769,7 +2882,7 @@ function verifyInvoiceSnapshotPartition_(snapshotWeek, expectedHierarchy) {
     '  (SELECT COUNT(*) FROM order_groups WHERE row_count != 1)',
     '    AS duplicate_record_order_count',
     'FROM partition_rows'
-  ].join('\n');
+  ].filter(line => line !== null).join('\n');
 
   const result = runBigQuerySingleRowQuery_(query);
   const metrics = {};
