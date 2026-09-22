@@ -64,6 +64,98 @@ test('clamps a requested future end date to the last completed day', () => {
   assert.ok(plan.periods.every(period => period.dateTo <= '2026-08-18'));
 });
 
+test('starts the September incident backfill with only the affected range', () => {
+  const context = loadBackfillContext();
+  let receivedOptions = null;
+  context.queuePaymentBackfill_ = options => {
+    receivedOptions = options;
+    return { status: 'queued' };
+  };
+
+  const result = context.startPaymentSeptemberIncidentBackfill();
+
+  assert.equal(result.status, 'queued');
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(receivedOptions)),
+    { startDate: '2026-09-07', endDate: '2026-09-20' }
+  );
+});
+
+test('uses the actual accumulated extract sheet name', () => {
+  const context = loadBackfillContext();
+  const extractSheets = vm.runInContext(
+    'JSON.stringify(PAYMENT_CONNECTED_SHEETS_CONFIG.extractSheets)',
+    context
+  );
+
+  assert.deepEqual(JSON.parse(extractSheets), ['Weekly Payments', 'Payment Latest']);
+});
+
+test('resumes a failed backfill at its current stage and resets stage attempts', () => {
+  const context = loadBackfillContext();
+  const current = {
+    status: 'failed',
+    current_stage: 'extracts',
+    start_date: '2026-09-07',
+    horizon_date: '2026-09-20',
+    current_period_attempts: 0,
+    processed_client_count: 16,
+    total_client_count: 16,
+    stages: {
+      bigquery: { status: 'completed', attempts: 16 },
+      data_source_sheets: { status: 'completed', attempts: 1 },
+      extracts: { status: 'failed', attempts: 3 }
+    }
+  };
+  let persisted = null;
+  let scheduledDelay = null;
+
+  context.assertPaymentDeploymentIdleForBackfill_ = () => {};
+  context.planPaymentBackfill_ = () => ({
+    startDate: '2026-09-07',
+    horizonDate: '2026-09-20',
+    periodCount: 2
+  });
+  context.validatePaymentBackfillConnectedSheetsPreflight_ = () => ({ status: 'passed' });
+  context.loadPaymentEntityConfiguration_ = () => ({
+    configuration: {
+      configuration_version: 26,
+      configuration_hash: 'hash'
+    }
+  });
+  context.fetchClients_ = () => ({
+    client_1: {
+      id: 'client_1',
+      name: 'Client 1',
+      entity: 'client_1',
+      entityAlias: 'client_1'
+    }
+  });
+  context.readPaymentBackfillState_ = () => current;
+  context.persistPaymentBackfillState_ = state => {
+    persisted = JSON.parse(JSON.stringify(state));
+  };
+  context.replacePaymentBackfillWorkerSchedule_ = delay => {
+    scheduledDelay = delay;
+  };
+
+  const result = context.queuePaymentBackfill_({
+    startDate: '2026-09-07',
+    endDate: '2026-09-20'
+  });
+
+  assert.equal(result.status, 'pending');
+  assert.equal(result.currentStage, 'extracts');
+  assert.equal(persisted.processed_client_count, 16);
+  assert.equal(persisted.stages.bigquery.status, 'completed');
+  assert.equal(persisted.stages.extracts.status, 'pending');
+  assert.equal(persisted.stages.extracts.attempts, 0);
+  assert.equal(
+    scheduledDelay,
+    vm.runInContext('PAYMENT_BACKFILL_CONFIG.initialDelayMs', context)
+  );
+});
+
 test('does not truncate the plan when historical weeks contain no payments', () => {
   const context = loadBackfillContext();
   const plan = context.planPaymentBackfill_({

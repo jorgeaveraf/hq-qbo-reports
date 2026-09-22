@@ -598,9 +598,27 @@ function assertPaymentBackfillIdle_(contextLabel) {
   }
 }
 
+function validatePaymentBackfillConnectedSheetsPreflight_() {
+  const spreadsheet = getPaymentReportSpreadsheet_();
+  const sourceTargets = getPaymentConnectedSheetTargets_(
+    spreadsheet,
+    'data_source_sheets'
+  );
+  const extractTargets = getPaymentConnectedSheetTargets_(
+    spreadsheet,
+    'extracts'
+  );
+  return {
+    status: 'passed',
+    dataSourceSheetCount: sourceTargets.length,
+    extractCount: extractTargets.length
+  };
+}
+
 function queuePaymentBackfill_(options) {
   assertPaymentDeploymentIdleForBackfill_();
   const plan = planPaymentBackfill_(options);
+  validatePaymentBackfillConnectedSheetsPreflight_();
   const loadedConfiguration = loadPaymentEntityConfiguration_();
   const clientsById = fetchClients_(loadedConfiguration);
   const clients = Object.keys(clientsById)
@@ -630,6 +648,7 @@ function queuePaymentBackfill_(options) {
       current.updated_at = new Date().toISOString();
       if (current.stages && current.stages[current.current_stage]) {
         current.stages[current.current_stage].status = 'pending';
+        current.stages[current.current_stage].attempts = 0;
       }
       persistPaymentBackfillState_(current);
       replacePaymentBackfillWorkerSchedule_(PAYMENT_BACKFILL_CONFIG.initialDelayMs);
@@ -692,6 +711,14 @@ function queuePaymentBackfill_(options) {
 
 function startPaymentBackfillFrom2026() {
   return queuePaymentBackfill_({ startDate: PAYMENT_BACKFILL_CONFIG.startDate });
+}
+
+function startPaymentBackfillForDateRange(startDate, endDate) {
+  return queuePaymentBackfill_({ startDate, endDate });
+}
+
+function startPaymentSeptemberIncidentBackfill() {
+  return startPaymentBackfillForDateRange('2026-09-07', '2026-09-20');
 }
 
 function processPaymentBackfillLegacy_() {

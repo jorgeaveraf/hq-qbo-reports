@@ -153,7 +153,7 @@ const PAYMENT_CONNECTED_SHEETS_CONFIG = {
   ],
 
   extractSheets: [
-    'Payment Accumulated',
+    'Weekly Payments',
     'Payment Latest'
   ],
   timeoutSeconds: 300
