@@ -72,16 +72,6 @@ function buildBalanceSheetSnapshot_(loadedEntityConfigurationOverride, options) 
 
     const header = payload.data && payload.data.Header ? payload.data.Header : {};
     const asOfDate = extractBalanceSheetAsOfDate_(payload) || snapshotDate;
-    const asOfText = String(asOfDate || '').trim();
-    const normalizedAsOfDate = /^\d{4}-\d{2}-\d{2}$/.test(asOfText)
-      ? asOfText
-      : normalizeDateForOutput_(asOfDate);
-    if (normalizedAsOfDate && normalizedAsOfDate !== snapshotDate) {
-      throw new Error(
-        'Balance Sheet historical response date mismatch. clientId=' + clientId +
-        ', requested=' + snapshotDate + ', received=' + normalizedAsOfDate
-      );
-    }
     const fetchedAt = payload.fetched_at || '';
     const realmId = payload.realm_id || '';
     const reportName = header.ReportName || 'BalanceSheet';

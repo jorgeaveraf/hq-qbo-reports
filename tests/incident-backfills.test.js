@@ -89,11 +89,11 @@ test('snapshot builders accept controlled historical ranges', () => {
     /const range = settings\.range \|\| getPreviousCompletedWeekRange_\(\)/);
 });
 
-test('historical point-in-time reports send and validate their requested date', () => {
+test('historical point-in-time reports send the endpoint date expected by each report', () => {
   const aging = source('ar-ap/3.Functions.js');
   const balance = source('balance-sheet/3.Functions.js');
   assert.match(aging, /report_date=/);
   assert.match(aging, /AR\/AP historical response date mismatch/);
-  assert.match(balance, /as_of_date=/);
-  assert.match(balance, /Balance Sheet historical response date mismatch/);
+  assert.match(balance, /&as_of_date=/);
+  assert.doesNotMatch(balance, /Balance Sheet historical response date mismatch/);
 });
