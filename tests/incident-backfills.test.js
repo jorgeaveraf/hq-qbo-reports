@@ -36,11 +36,19 @@ test('weekly incident backfills are bounded to the two affected weeks', () => {
   assert.deepEqual(journal.periods, weeklyPeriods);
 });
 
-test('point-in-time incident backfills use the affected Monday snapshots', () => {
+test('aging backfill uses the affected Monday snapshots', () => {
   const aging = loadConstant('ar-ap/6.Backfill.js', 'AGING_INCIDENT_BACKFILL');
-  const balance = loadConstant('balance-sheet/6.Backfill.js', 'BALANCE_INCIDENT_BACKFILL');
   assert.deepEqual(aging.snapshotDates, ['2026-09-14', '2026-09-21']);
-  assert.deepEqual(balance.snapshotDates, ['2026-09-14', '2026-09-21']);
+});
+
+test('balance backfill targets only the missing Nova Massachusetts daily snapshots', () => {
+  const balance = loadConstant('balance-sheet/6.Backfill.js', 'BALANCE_INCIDENT_BACKFILL');
+  assert.deepEqual(balance.jobs, [
+    { snapshotDate: '2026-09-17', clientIds: ['070b2e37-aa28-4911-b2b2-e493678d38f5'] },
+    { snapshotDate: '2026-09-18', clientIds: ['070b2e37-aa28-4911-b2b2-e493678d38f5'] },
+    { snapshotDate: '2026-09-19', clientIds: ['070b2e37-aa28-4911-b2b2-e493678d38f5'] },
+    { snapshotDate: '2026-09-20', clientIds: ['070b2e37-aa28-4911-b2b2-e493678d38f5'] }
+  ]);
 });
 
 test('P&L backfills both report variants for both affected weeks', () => {
@@ -95,5 +103,7 @@ test('historical point-in-time reports send the endpoint date expected by each r
   assert.match(aging, /report_date=/);
   assert.match(aging, /AR\/AP historical response date mismatch/);
   assert.match(balance, /&as_of_date=/);
-  assert.doesNotMatch(balance, /Balance Sheet historical response date mismatch/);
+  assert.match(balance, /Balance Sheet historical response date mismatch/);
+  assert.match(balance, /requireAsOfDateMatch/);
+  assert.match(balance, /forceClientScope/);
 });

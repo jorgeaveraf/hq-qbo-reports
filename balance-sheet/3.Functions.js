@@ -48,10 +48,29 @@ function buildBalanceSheetSnapshot_(loadedEntityConfigurationOverride, options) 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotDate)) {
     throw new Error('Invalid Balance Sheet SnapshotDate: ' + snapshotDate);
   }
+  const requestedAsOfDate = String(settings.asOfDate || snapshotDate).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedAsOfDate)) {
+    throw new Error('Invalid Balance Sheet as-of date: ' + requestedAsOfDate);
+  }
   const snapshotWeek = getWeekStartSunday_(snapshotDate);
   const loadedAt = new Date().toISOString();
   const selection = resolveBalanceEntitySelection_(null, loadedEntityConfigurationOverride);
-  const clientsById = selection.clientsById;
+  const requestedClientIds = Array.from(new Set(
+    (settings.clientIds || []).map(id => String(id || '').trim()).filter(Boolean)
+  ));
+  const clientsById = {};
+  if (requestedClientIds.length) {
+    requestedClientIds.forEach(clientId => {
+      if (!selection.clientsById[clientId]) {
+        throw new Error('Balance Sheet backfill client is not authorized: ' + clientId);
+      }
+      clientsById[clientId] = selection.clientsById[clientId];
+    });
+  } else {
+    Object.keys(selection.clientsById).forEach(clientId => {
+      clientsById[clientId] = selection.clientsById[clientId];
+    });
+  }
   const clientIds = Object.keys(clientsById);
   const rawRows = [];
   const lineRows = [];
@@ -67,11 +86,17 @@ function buildBalanceSheetSnapshot_(loadedEntityConfigurationOverride, options) 
     const lineStart = lineRows.length;
     const sheetStart = sheetRows.length;
     try {
-      const payload = fetchBalanceSheet_(clientId, snapshotDate);
+      const payload = fetchBalanceSheet_(clientId, requestedAsOfDate);
       if (!payload) throw new Error('Balance Sheet endpoint returned an empty response.');
 
     const header = payload.data && payload.data.Header ? payload.data.Header : {};
-    const asOfDate = extractBalanceSheetAsOfDate_(payload) || snapshotDate;
+    const asOfDate = extractBalanceSheetAsOfDate_(payload) || requestedAsOfDate;
+    if (settings.requireAsOfDateMatch === true && asOfDate !== requestedAsOfDate) {
+      throw new Error(
+        'Balance Sheet historical response date mismatch. Requested=' +
+          requestedAsOfDate + ', returned=' + asOfDate + ', clientId=' + clientId
+      );
+    }
     const fetchedAt = payload.fetched_at || '';
     const realmId = payload.realm_id || '';
     const reportName = header.ReportName || 'BalanceSheet';
@@ -177,6 +202,7 @@ function buildBalanceSheetSnapshot_(loadedEntityConfigurationOverride, options) 
     entityConfiguration: selection.entityConfiguration,
     snapshotDate,
     snapshotWeek,
+    requestedAsOfDate,
     clientCount: clientIds.length,
     successfulClientIds,
     clientFailures,
@@ -1315,17 +1341,31 @@ function executeBalanceSheetBigQuerySnapshot_(loadedEntityConfigurationOverride,
   const settings = options || {};
   const snapshot = buildBalanceSheetSnapshot_(loadedEntityConfigurationOverride, {
     continueOnClientError: true,
-    snapshotDate: settings.snapshotDate || null
+    snapshotDate: settings.snapshotDate || null,
+    asOfDate: settings.asOfDate || null,
+    clientIds: settings.clientIds || null,
+    requireAsOfDateMatch: settings.requireAsOfDateMatch === true
   });
   const hasClientFailures = snapshot.clientFailures.length > 0;
+  if (!snapshot.successfulClientIds.length) {
+    throw new Error(
+      'Balance Sheet snapshot did not produce any valid client rows: ' +
+        JSON.stringify({
+          snapshotDate: snapshot.snapshotDate,
+          requestedAsOfDate: snapshot.requestedAsOfDate,
+          failures: snapshot.clientFailures
+        })
+    );
+  }
+  const useClientScope = settings.forceClientScope === true || hasClientFailures;
   const schemaValidation = validateBalanceSheetBigQuerySchema_();
-  const loadResult = hasClientFailures
+  const loadResult = useClientScope
     ? replaceBalanceSheetSnapshotClients_(snapshot)
     : replaceBalanceSheetSnapshotPartition_(snapshot);
   const verification = verifyBalanceSheetSnapshotPartition_(
     snapshot.snapshotDate,
     snapshot.lineRows.length,
-    hasClientFailures ? snapshot.successfulClientIds : null
+    useClientScope ? snapshot.successfulClientIds : null
   );
   const result = {
     status: hasClientFailures ? 'completed_with_entity_errors' : 'completed',
@@ -1333,6 +1373,7 @@ function executeBalanceSheetBigQuerySnapshot_(loadedEntityConfigurationOverride,
     schemaValidation,
     snapshotDate: snapshot.snapshotDate,
     snapshotWeek: snapshot.snapshotWeek,
+    requestedAsOfDate: snapshot.requestedAsOfDate,
     clientCount: snapshot.clientCount,
     rawRowCount: snapshot.rawRows.length,
     lineRowCount: snapshot.lineRows.length,
