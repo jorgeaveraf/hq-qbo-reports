@@ -1,9 +1,9 @@
 /***********************
  * Payments historical backfill
  *
- * Processes one ISO-week segment per execution, starting on 2026-01-01.
- * The final segment ends on the last completed calendar day, so the worker
- * never labels current or future activity as historical data.
+ * Rebuilds Weekly Collections from Payment.TxnDate, starting on 2026-01-01.
+ * Only completed ISO weeks are included, so a partial current week is never
+ * published as a finished historical collection period.
  ***********************/
 
 function getPaymentBackfillToday_(todayOverride) {
@@ -31,7 +31,13 @@ function addPaymentBackfillDays_(isoDate, dayCount) {
 }
 
 function getPaymentBackfillHorizon_(todayOverride) {
-  return addPaymentBackfillDays_(getPaymentBackfillToday_(todayOverride), -1);
+  const today = safeParseDate_(getPaymentBackfillToday_(todayOverride));
+  const currentWeekMonday = new Date(today.getTime());
+  currentWeekMonday.setUTCDate(
+    currentWeekMonday.getUTCDate() - ((currentWeekMonday.getUTCDay() + 6) % 7)
+  );
+  currentWeekMonday.setUTCDate(currentWeekMonday.getUTCDate() - 1);
+  return formatUtcDate_(currentWeekMonday);
 }
 
 function buildPaymentBackfillPeriod_(cursorDate, horizonDate) {
@@ -114,9 +120,9 @@ function validatePaymentBackfillSnapshot_(snapshot, expectedRange) {
     ) {
       throw new Error('Payments backfill row ' + index + ' belongs to another period.');
     }
-    const updatedAt = Date.parse(row.UpdatedAt || '');
-    if (!Number.isFinite(updatedAt) || updatedAt < fromMs || updatedAt >= throughMs) {
-      throw new Error('Payments backfill row ' + index + ' is outside the requested update window.');
+    const txnDate = Date.parse((row.TxnDate || '') + 'T00:00:00.000Z');
+    if (!Number.isFinite(txnDate) || txnDate < fromMs || txnDate >= throughMs) {
+      throw new Error('Payments backfill row ' + index + ' is outside the requested transaction-date window.');
     }
   });
 
@@ -172,16 +178,16 @@ function executePaymentBackfillPeriod_(range, options) {
   return summary;
 }
 
-function getPaymentBackfillPeriodForTimestamp_(timestamp, plan) {
-  const updatedAt = new Date(timestamp || '');
-  if (isNaN(updatedAt.getTime())) return null;
-  const updatedDate = formatUtcDate_(updatedAt);
-  if (updatedDate < plan.startDate || updatedDate > plan.horizonDate) return null;
+function getPaymentBackfillPeriodForTxnDate_(txnDateValue, plan) {
+  const txnDate = safeParseDate_(txnDateValue);
+  if (!txnDate) return null;
+  const normalizedTxnDate = formatUtcDate_(txnDate);
+  if (normalizedTxnDate < plan.startDate || normalizedTxnDate > plan.horizonDate) return null;
 
   const weekStart = new Date(Date.UTC(
-    updatedAt.getUTCFullYear(),
-    updatedAt.getUTCMonth(),
-    updatedAt.getUTCDate()
+    txnDate.getUTCFullYear(),
+    txnDate.getUTCMonth(),
+    txnDate.getUTCDate()
   ));
   weekStart.setUTCDate(weekStart.getUTCDate() - ((weekStart.getUTCDay() + 6) % 7));
   const weekEnd = new Date(weekStart.getTime());
@@ -199,24 +205,25 @@ function buildPaymentBackfillClientSnapshot_(client, plan, loadedAt) {
   if (!client || !String(client.id || '').trim()) {
     throw new Error('A valid Payments backfill client is required.');
   }
-  const updatedSince = plan.startDate + 'T00:00:00.000Z';
-  const updatedBefore = addPaymentBackfillDays_(plan.horizonDate, 1) +
-    'T00:00:00.000Z';
-  const response = fetchPayments_(client.id, updatedSince, updatedBefore);
+  const response = fetchPayments_(client.id, {
+    dateFrom: plan.startDate,
+    dateTo: plan.horizonDate
+  });
   const rows = [];
   const periodPaymentCounts = {};
   let paymentCount = 0;
 
   response.items.forEach(payment => {
-    const metadata = payment && payment.MetaData && typeof payment.MetaData === 'object'
-      ? payment.MetaData
-      : {};
-    const updatedAt = metadata.LastUpdatedTime ||
-      metadata.UpdatedAt ||
-      metadata.last_updated_time ||
-      '';
-    const period = getPaymentBackfillPeriodForTimestamp_(updatedAt, plan);
-    if (!period) return;
+    const txnDate = normalizeDateForOutput_(payment && payment.TxnDate);
+    const period = getPaymentBackfillPeriodForTxnDate_(txnDate, plan);
+    if (!period) {
+      throw new Error(
+        'Payments gateway returned a transaction outside the requested range. ' +
+          'ClientId=' + client.id + ', PaymentId=' +
+          String(payment && (payment.Id || payment.PaymentId) || '') +
+          ', TxnDate=' + String(payment && payment.TxnDate || '')
+      );
+    }
 
     const normalized = normalizePayment_(client, period, payment, loadedAt);
     normalized.rows.forEach(row => rows.push(row));
@@ -246,18 +253,10 @@ function validatePaymentBackfillClientSnapshot_(snapshot) {
     throw new Error('Payments backfill client snapshot is invalid.');
   }
   const plan = snapshot.plan;
-  const fromMs = Date.parse(plan.startDate + 'T00:00:00.000Z');
-  const throughMs = Date.parse(
-    addPaymentBackfillDays_(plan.horizonDate, 1) + 'T00:00:00.000Z'
-  );
   const paymentKeys = {};
 
   snapshot.rows.forEach((row, index) => {
-    const updatedAt = Date.parse(row.UpdatedAt || '');
-    if (!Number.isFinite(updatedAt) || updatedAt < fromMs || updatedAt >= throughMs) {
-      throw new Error('Payments backfill client row ' + index + ' is outside the plan.');
-    }
-    const period = getPaymentBackfillPeriodForTimestamp_(row.UpdatedAt, plan);
+    const period = getPaymentBackfillPeriodForTxnDate_(row.TxnDate, plan);
     if (
       !period ||
       row.DateFrom !== period.dateFrom ||
@@ -265,7 +264,7 @@ function validatePaymentBackfillClientSnapshot_(snapshot) {
       row.SnapshotWeek !== period.snapshotWeek ||
       row.SnapshotDate !== period.snapshotDate
     ) {
-      throw new Error('Payments backfill client row ' + index + ' has an invalid period.');
+      throw new Error('Payments backfill client row ' + index + ' has an invalid transaction period.');
     }
     paymentKeys[row.ClientId + '|' + row.PaymentId] = true;
   });
@@ -325,6 +324,78 @@ function buildPaymentBackfillPoc_(options) {
   };
 }
 
+function buildPaymentEntityBackfillPoc_(entityAlias, options) {
+  const normalizedEntityAlias = String(entityAlias || '').trim();
+  if (!normalizedEntityAlias) {
+    throw new Error('Payments entity backfill PoC requires an entity alias.');
+  }
+
+  const plan = planPaymentBackfill_(options);
+  const loaded = loadPaymentEntityConfiguration_();
+  const clientsById = fetchClients_(loaded);
+  const clients = Object.keys(clientsById)
+    .map(clientId => clientsById[clientId])
+    .filter(client => String(client.entityAlias || '').trim() === normalizedEntityAlias)
+    .sort((left, right) => String(left.name || '').localeCompare(String(right.name || '')));
+  if (!clients.length) {
+    throw new Error('No Payments clients matched entity alias ' + normalizedEntityAlias + '.');
+  }
+
+  const expectedPeriods = plan.periods.map(period => period.periodKey);
+  const summaries = clients.map(client => {
+    const snapshot = buildPaymentBackfillClientSnapshot_(
+      client,
+      plan,
+      new Date().toISOString()
+    );
+    const dataPeriods = Object.keys(snapshot.periodPaymentCounts).sort();
+    const headerRows = snapshot.rows.filter(
+      row => row.RecordType === PAYMENT_RECORD_TYPES.header
+    );
+    return {
+      clientId: client.id,
+      clientName: client.name,
+      sourcePaymentCount: snapshot.sourcePaymentCount,
+      paymentCount: snapshot.paymentCount,
+      pageCount: snapshot.pageCount,
+      rowCount: snapshot.rows.length,
+      totalAmount: headerRows.reduce(
+        (sum, row) => sum + Number(row.TotalAmount || 0),
+        0
+      ),
+      periodCountWithData: dataPeriods.length,
+      dataPeriods,
+      emptyPeriods: expectedPeriods.filter(periodKey => !dataPeriods.includes(periodKey)),
+      hierarchyValidation: snapshot.hierarchyValidation,
+      rangeValidation: snapshot.rangeValidation
+    };
+  });
+
+  return {
+    status: 'validated_dry_run',
+    strategy: PAYMENT_BACKFILL_CONFIG.strategy,
+    modifiesBigQuery: false,
+    modifiesSheets: false,
+    createsTriggers: false,
+    entityAlias: normalizedEntityAlias,
+    plan: {
+      startDate: plan.startDate,
+      horizonDate: plan.horizonDate,
+      periodCount: plan.periodCount,
+      expectedPeriods
+    },
+    clientCount: summaries.length,
+    sourcePaymentCount: summaries.reduce(
+      (sum, client) => sum + client.sourcePaymentCount,
+      0
+    ),
+    paymentCount: summaries.reduce((sum, client) => sum + client.paymentCount, 0),
+    rowCount: summaries.reduce((sum, client) => sum + client.rowCount, 0),
+    totalAmount: summaries.reduce((sum, client) => sum + client.totalAmount, 0),
+    clients: summaries
+  };
+}
+
 function escapePaymentBackfillBigQueryString_(value) {
   return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
@@ -354,8 +425,8 @@ function ensurePaymentBackfillDeleteJob_(jobId, clientId, plan) {
     const query = [
       'DELETE FROM `' + PAYMENT_BIGQUERY_TABLE + '`',
       "WHERE ClientId = '" + escapePaymentBackfillBigQueryString_(clientId) + "'",
-      "  AND DateFrom >= DATE '" + plan.startDate + "'",
-      "  AND DateTo <= DATE '" + plan.horizonDate + "'"
+      "  AND TxnDate >= DATE '" + plan.startDate + "'",
+      "  AND TxnDate <= DATE '" + plan.horizonDate + "'"
     ].join('\n');
     job = BigQuery.Jobs.insert({
       jobReference: {
@@ -411,24 +482,27 @@ function verifyPaymentBackfillClient_(clientId, plan, expected) {
     'SELECT',
     '  COUNT(*) AS row_count,',
     '  COUNT(DISTINCT PaymentId) AS payment_count,',
-    "  COUNTIF(RecordType = 'HEADER') AS header_count",
+    "  COUNTIF(RecordType = 'HEADER') AS header_count,",
+    '  COUNTIF(SnapshotWeek != DATE_TRUNC(TxnDate, WEEK(MONDAY))) AS invalid_week_count',
     'FROM `' + PAYMENT_BIGQUERY_TABLE + '`',
     "WHERE ClientId = '" + escapePaymentBackfillBigQueryString_(clientId) + "'",
-    "  AND DateFrom >= DATE '" + plan.startDate + "'",
-    "  AND DateTo <= DATE '" + plan.horizonDate + "'"
+    "  AND TxnDate >= DATE '" + plan.startDate + "'",
+    "  AND TxnDate <= DATE '" + plan.horizonDate + "'"
   ].join('\n'));
   const values = result.rows && result.rows[0] && result.rows[0].f
     ? result.rows[0].f.map(cell => Number(cell.v || 0))
-    : [0, 0, 0];
+    : [0, 0, 0, 0];
   const actual = {
     rowCount: values[0],
     paymentCount: values[1],
-    headerCount: values[2]
+    headerCount: values[2],
+    invalidWeekCount: values[3]
   };
   if (
     actual.rowCount !== Number(expected.rowCount) ||
     actual.paymentCount !== Number(expected.paymentCount) ||
-    actual.headerCount !== Number(expected.paymentCount)
+    actual.headerCount !== Number(expected.paymentCount) ||
+    actual.invalidWeekCount !== 0
   ) {
     throw new Error(
       'Payments backfill client verification failed. ClientId=' +
@@ -446,7 +520,7 @@ function executePaymentBackfillClient_(state, client) {
   const plan = planPaymentBackfill_({
     startDate: state.start_date,
     endDate: state.horizon_date,
-    today: addPaymentBackfillDays_(state.horizon_date, 1)
+    today: state.planned_today || addPaymentBackfillDays_(state.horizon_date, 1)
   });
   const loadedConfiguration = loadPaymentEntityConfiguration_();
   if (
@@ -528,6 +602,7 @@ function summarizePaymentBackfillState_(state, queued) {
   return {
     queued: queued === true,
     operationId: state.operation_id,
+    strategy: state.strategy || null,
     status: state.status,
     currentStage: state.current_stage,
     startDate: state.start_date,
@@ -598,9 +673,27 @@ function assertPaymentBackfillIdle_(contextLabel) {
   }
 }
 
+function validatePaymentBackfillConnectedSheetsPreflight_() {
+  const spreadsheet = getPaymentReportSpreadsheet_();
+  const sourceTargets = getPaymentConnectedSheetTargets_(
+    spreadsheet,
+    'data_source_sheets'
+  );
+  const extractTargets = getPaymentConnectedSheetTargets_(
+    spreadsheet,
+    'extracts'
+  );
+  return {
+    status: 'passed',
+    dataSourceSheetCount: sourceTargets.length,
+    extractCount: extractTargets.length
+  };
+}
+
 function queuePaymentBackfill_(options) {
   assertPaymentDeploymentIdleForBackfill_();
   const plan = planPaymentBackfill_(options);
+  validatePaymentBackfillConnectedSheetsPreflight_();
   const loadedConfiguration = loadPaymentEntityConfiguration_();
   const clientsById = fetchClients_(loadedConfiguration);
   const clients = Object.keys(clientsById)
@@ -620,6 +713,7 @@ function queuePaymentBackfill_(options) {
   }
   const current = readPaymentBackfillState_();
   const samePlan = current &&
+    current.strategy === PAYMENT_BACKFILL_CONFIG.strategy &&
     current.start_date === plan.startDate &&
     current.horizon_date === plan.horizonDate;
   if (samePlan && ['pending', 'running', 'completed', 'failed'].includes(current.status)) {
@@ -630,6 +724,7 @@ function queuePaymentBackfill_(options) {
       current.updated_at = new Date().toISOString();
       if (current.stages && current.stages[current.current_stage]) {
         current.stages[current.current_stage].status = 'pending';
+        current.stages[current.current_stage].attempts = 0;
       }
       persistPaymentBackfillState_(current);
       replacePaymentBackfillWorkerSchedule_(PAYMENT_BACKFILL_CONFIG.initialDelayMs);
@@ -644,7 +739,8 @@ function queuePaymentBackfill_(options) {
   deletePaymentBackfillWorkerTriggers_();
   const now = new Date().toISOString();
   const state = {
-    schema_version: '1.0',
+    schema_version: '2.0',
+    strategy: PAYMENT_BACKFILL_CONFIG.strategy,
     operation_id: Utilities.getUuid(),
     configuration_version:
       loadedConfiguration.configuration.configuration_version,
@@ -654,6 +750,7 @@ function queuePaymentBackfill_(options) {
     current_stage: plan.periodCount ? 'bigquery' : 'completed',
     start_date: plan.startDate,
     horizon_date: plan.horizonDate,
+    planned_today: plan.today,
     cursor_date: plan.startDate,
     total_period_count: plan.periodCount,
     processed_period_count: 0,
@@ -692,6 +789,14 @@ function queuePaymentBackfill_(options) {
 
 function startPaymentBackfillFrom2026() {
   return queuePaymentBackfill_({ startDate: PAYMENT_BACKFILL_CONFIG.startDate });
+}
+
+function startPaymentBackfillForDateRange(startDate, endDate) {
+  return queuePaymentBackfill_({ startDate, endDate });
+}
+
+function startPaymentSeptemberIncidentBackfill() {
+  return startPaymentBackfillForDateRange('2026-09-07', '2026-09-20');
 }
 
 function processPaymentBackfillLegacy_() {

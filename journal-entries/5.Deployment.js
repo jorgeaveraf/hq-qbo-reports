@@ -19,6 +19,7 @@ function queueJournalConfigurationDeployment_(
   configuration,
   options
 ) {
+  assertJournalBackfillIdle_('the Journal Entries deployment');
   const validatedConfiguration =
     validateJournalEntityConfiguration_(configuration);
   const deploymentOptions = options || {};
@@ -586,6 +587,9 @@ function processJournalConfigurationDeployment() {
     const current =
       readJournalDeploymentState_();
     let retryScheduled = false;
+    const entityIsolationFailure = Boolean(
+      error && error.entityIsolationFailure
+    );
 
     if (
       claimedState &&
@@ -611,11 +615,12 @@ function processJournalConfigurationDeployment() {
       current.updated_at = failedAt;
       current.last_error = stageState.error;
 
-      if (claimedStage === 'bigquery') {
+      if (claimedStage === 'bigquery' && !entityIsolationFailure) {
         prepareJournalBigQueryCheckpointForRetry_();
       }
 
       if (
+        !entityIsolationFailure &&
         stageState.attempts <
         JOURNAL_OPERATIONAL_DEPLOYMENT.maxStageAttempts
       ) {
@@ -748,6 +753,24 @@ function executeJournalBigQueryContinuationStage_(
       );
   }
 
+  if (!Array.isArray(checkpoint.successful_client_ids)) {
+    checkpoint.successful_client_ids = checkpoint.clients
+      .slice(0, Number(checkpoint.next_client_index || 0))
+      .map(client => client.id);
+  }
+  if (!Array.isArray(checkpoint.client_failures)) {
+    checkpoint.client_failures = [];
+  }
+  if (!checkpoint.stale_cleanup_job_id) {
+    checkpoint.stale_cleanup_job_id = buildJournalBigQueryJobId_(
+      'journal_cleanup_stale_clients',
+      checkpoint.operation_id,
+      checkpoint.period.snapshotWeek,
+      ''
+    );
+  }
+  checkpoint.stale_cleanup_completed = checkpoint.stale_cleanup_completed === true;
+
   Logger.log(JSON.stringify({
     event:
       'journal_bigquery_continuation_started',
@@ -764,24 +787,9 @@ function executeJournalBigQueryContinuationStage_(
   }));
 
   if (!checkpoint.partition_cleared) {
-    const clearResult =
-      ensureJournalBigQueryQueryJob_(
-        checkpoint.clear_job_id,
-        buildJournalPartitionClearQuery_(
-          checkpoint.period.snapshotWeek
-        )
-      );
-
-    if (!clearResult.done) {
-      return yieldJournalBigQueryCheckpoint_(
-        checkpoint,
-        'waiting_for_partition_clear'
-      );
-    }
-
+    // Preserve the existing partition. Each successful client replaces only
+    // its own rows; a client that cannot be fetched keeps its prior snapshot.
     checkpoint.partition_cleared = true;
-    checkpoint.last_job_id =
-      checkpoint.clear_job_id;
     checkpoint.updated_at =
       new Date().toISOString();
     persistJournalBigQueryCheckpoint_(
@@ -816,10 +824,29 @@ function executeJournalBigQueryContinuationStage_(
       );
     }
 
-    const clientResult =
-      processJournalBigQueryCheckpointClient_(
-        checkpoint
-      );
+    let clientResult;
+    try {
+      clientResult = processJournalBigQueryCheckpointClient_(checkpoint);
+    } catch (error) {
+      if (checkpoint.current_client) throw error;
+      const client = checkpoint.clients[checkpoint.next_client_index];
+      const message = String(error && error.message || error);
+      const statusMatch = message.match(/returned HTTP\s+(\d{3})\b/i);
+      const failure = {
+        clientId: String(client && client.id || ''),
+        clientName: String(client && client.name || ''),
+        entity: String(client && (client.entityAlias || client.entity) || ''),
+        httpStatus: statusMatch ? Number(statusMatch[1]) : null,
+        error: message
+      };
+      checkpoint.client_failures.push(failure);
+      checkpoint.next_client_index += 1;
+      checkpoint.updated_at = new Date().toISOString();
+      persistJournalBigQueryCheckpoint_(checkpoint);
+      Logger.log(JSON.stringify({ event: 'journal_bigquery_client_failed', failure: failure }));
+      processedThisExecution++;
+      continue;
+    }
 
     checkpoint = clientResult.checkpoint;
 
@@ -834,14 +861,32 @@ function executeJournalBigQueryContinuationStage_(
     processedThisExecution++;
   }
 
+  if (!checkpoint.stale_cleanup_completed) {
+    const cleanupResult = ensureJournalBigQueryQueryJob_(
+      checkpoint.stale_cleanup_job_id,
+      buildJournalStaleClientsDeleteQuery_(
+        checkpoint.period.snapshotWeek,
+        checkpoint.clients.map(client => client.id)
+      )
+    );
+    if (!cleanupResult.done) {
+      return yieldJournalBigQueryCheckpoint_(checkpoint, 'waiting_for_stale_client_cleanup');
+    }
+    checkpoint.stale_cleanup_completed = true;
+    checkpoint.query_job_count = Number(checkpoint.query_job_count || 0) + 1;
+    checkpoint.last_job_id = checkpoint.stale_cleanup_job_id;
+    checkpoint.updated_at = new Date().toISOString();
+    persistJournalBigQueryCheckpoint_(checkpoint);
+  }
+
   assertJournalBalanced_(
     checkpoint.total_debit_cents,
     checkpoint.total_credit_cents,
     'Combined journal snapshot checkpoint'
   );
 
-  const verification =
-    verifyJournalSnapshotPartitionDetailed_(
+  const verification = checkpoint.successful_client_ids.length
+    ? verifyJournalSnapshotPartitionDetailed_(
       checkpoint.period.snapshotWeek,
       {
         rowCount:
@@ -852,11 +897,18 @@ function executeJournalBigQueryContinuationStage_(
           checkpoint.total_debit_cents,
         creditCents:
           checkpoint.total_credit_cents
-      }
-    );
+      },
+      checkpoint.successful_client_ids
+    )
+    : {
+        status: 'skipped_no_successful_clients',
+        snapshotWeek: checkpoint.period.snapshotWeek,
+        expectedRowCount: 0,
+        actualRowCount: null
+      };
 
   const result = {
-    status: 'completed',
+    status: checkpoint.client_failures.length ? 'completed_with_entity_errors' : 'completed',
     entityConfiguration:
       checkpoint.entity_configuration,
     schemaValidation:
@@ -893,6 +945,10 @@ function executeJournalBigQueryContinuationStage_(
         checkpoint.clients.length,
       processedClientCount:
         checkpoint.processed_client_count,
+      successfulClientCount:
+        checkpoint.successful_client_ids.length,
+      failedClientCount:
+        checkpoint.client_failures.length,
       loadJobCount:
         checkpoint.load_job_count,
       queryJobCount:
@@ -904,13 +960,31 @@ function executeJournalBigQueryContinuationStage_(
     jobId: checkpoint.last_job_id,
     verification,
     continuationCount:
-      checkpoint.continuation_count
+      checkpoint.continuation_count,
+    successfulClientIds:
+      checkpoint.successful_client_ids,
+    clientFailures:
+      checkpoint.client_failures
   };
 
   Logger.log(JSON.stringify(result, null, 2));
   Logger.log(
     '--- JOURNAL BIGQUERY SNAPSHOT END ---'
   );
+
+  if (checkpoint.client_failures.length) {
+    const partialError = new Error(
+      'Journal Entries snapshot loaded successful entities but completed with entity errors: ' +
+      JSON.stringify({
+        snapshotWeek: checkpoint.period.snapshotWeek,
+        successfulClientCount: checkpoint.successful_client_ids.length,
+        failedClientCount: checkpoint.client_failures.length,
+        failures: checkpoint.client_failures
+      })
+    );
+    partialError.entityIsolationFailure = true;
+    throw partialError;
+  }
 
   return result;
 }
@@ -960,6 +1034,8 @@ function initializeJournalBigQueryCheckpoint_(
     total_row_count: 0,
     total_debit_cents: 0,
     total_credit_cents: 0,
+    successful_client_ids: [],
+    client_failures: [],
     partition_cleared: false,
     clear_job_id:
       buildJournalBigQueryJobId_(
@@ -968,6 +1044,14 @@ function initializeJournalBigQueryCheckpoint_(
         range.snapshotWeek,
         ''
       ),
+    stale_cleanup_job_id:
+      buildJournalBigQueryJobId_(
+        'journal_cleanup_stale_clients',
+        state.operation_id,
+        range.snapshotWeek,
+        ''
+      ),
+    stale_cleanup_completed: false,
     current_client: null,
     load_job_count: 0,
     query_job_count: 0,
@@ -1168,6 +1252,7 @@ function processJournalBigQueryCheckpointClient_(
   checkpoint.total_credit_cents +=
     Number(current.credit_cents || 0);
   checkpoint.processed_client_count += 1;
+  checkpoint.successful_client_ids.push(client.id);
   checkpoint.next_client_index =
     clientIndex + 1;
   checkpoint.last_completed_client_id =

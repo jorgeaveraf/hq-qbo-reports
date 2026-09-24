@@ -55,6 +55,7 @@ const PAYMENT_OPERATIONAL_DEPLOYMENT = {
 };
 
 const PAYMENT_BACKFILL_CONFIG = {
+  strategy: 'transaction_date_v2',
   statePropertyKey: 'QBO_PAYMENT_BACKFILL_STATE',
   workerHandler: 'processPaymentBackfill',
   startDate: '2026-01-01',
@@ -153,7 +154,7 @@ const PAYMENT_CONNECTED_SHEETS_CONFIG = {
   ],
 
   extractSheets: [
-    'Payment Accumulated',
+    'Weekly Payments',
     'Payment Latest'
   ],
   timeoutSeconds: 300

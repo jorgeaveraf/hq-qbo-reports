@@ -33,6 +33,13 @@ const QBO_CONFIG = {
   sourceDefault: 'QBO'
 };
 
+const AGING_DIRECT_EXPORT_CONFIG = {
+  maxConcurrentRequests: 6,
+  maxFetchAttempts: 2,
+  retryDelayMs: 1500,
+  lockWaitMs: 5000
+};
+
 const AGING_ENTITY_CONTROL = {
   reportKey: 'aging',
   spreadsheetIdProperty: 'QBO_CONTROL_SPREADSHEET_ID',
@@ -69,6 +76,7 @@ const BQ_CONFIG = {
 
 
 const AGING_OPERATIONAL_DEPLOYMENT = {
+  pipelineVersion: 2,
   statePropertyKey: 'QBO_AGING_CONFIGURATION_DEPLOYMENT_STATE',
   checkpointPropertyKey: 'QBO_AGING_BIGQUERY_CHECKPOINT',
   reportSpreadsheetIdProperty: 'TARGET_SPREADSHEET_ID',

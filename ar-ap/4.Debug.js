@@ -78,21 +78,12 @@ function debugFilteredClients() {
 }
 
 function debugEnsureAgingOutputSheets() {
-  const selection = resolveAgingEntitySelection_();
-  const spreadsheet = getTargetSpreadsheet_();
-  const aliases = [...new Set(Object.keys(selection.clientsById).map(id => selection.clientsById[id].outputSheetName))];
-  const results = aliases.map(alias => {
-    const existed = Boolean(spreadsheet.getSheetByName(alias));
-    const sheet = getOrCreateAgingSheet_(spreadsheet, alias);
-    return { sheetName: sheet.getName(), status: existed ? 'existing' : 'created' };
+  const loaded = loadAgingEntityConfiguration_();
+  const result = executeAgingOutputSheetsProvisionStage_({
+    configuration: loaded.configuration,
+    configuration_version: loaded.configuration.configuration_version,
+    configuration_hash: loaded.configuration.configuration_hash
   });
-
-  const result = {
-    event: 'aging_output_sheets_ensured',
-    entityConfiguration: buildAgingEntityConfigurationSummary_(selection),
-    sheetCount: results.length,
-    sheets: results
-  };
   Logger.log(JSON.stringify(result, null, 2));
   return result;
 }
@@ -427,7 +418,16 @@ function debugRunAgingConfigurationDeploymentWorker() {
 
 function debugRunAgingDeploymentStage(stage) {
   const normalizedStage = String(stage || '').trim();
-  if (!['bigquery', 'data_source_sheets', 'extracts'].includes(normalizedStage)) throw new Error('Stage must be bigquery, data_source_sheets, or extracts.');
+  const supportedStages = [
+    'output_sheets',
+    'bigquery',
+    'output_sheet_export',
+    'data_source_sheets',
+    'extracts'
+  ];
+  if (!supportedStages.includes(normalizedStage)) {
+    throw new Error('Unsupported stage: ' + normalizedStage + '.');
+  }
   const state = readAgingDeploymentState_(); if (!state) throw new Error('No Aging deployment state exists.');
   const result = { event: 'aging_configuration_deployment_stage_debug', stage: normalizedStage, modifiesBigQuery: normalizedStage === 'bigquery', modifiesSheets: normalizedStage !== 'bigquery', createsTriggers: false, execution: executeAgingDeploymentStage_(normalizedStage, state) };
   Logger.log(JSON.stringify(result, null, 2)); return result;

@@ -680,76 +680,740 @@ function agingSecureHexEquals_(left, right) {
  ***********************/
 
 function updateAgingExport() {
+  const executionStartedAt = Date.now();
   Logger.log('--- AGING EXPORT START ---');
+  const lock = LockService.getScriptLock();
 
-  const selection = resolveAgingEntitySelection_();
-  const clientsById = selection.clientsById;
-  const clientIds = Object.keys(clientsById);
-  const rowsBySheet = {};
+  if (!lock.tryLock(AGING_DIRECT_EXPORT_CONFIG.lockWaitMs)) {
+    const deferred = {
+      status: 'deferred_lock_busy',
+      event: 'aging_sheet_export_deferred',
+      durationMs: Date.now() - executionStartedAt
+    };
+    Logger.log(JSON.stringify(deferred));
+    return deferred;
+  }
 
-  clientIds.forEach(clientId => {
-    const client = clientsById[clientId];
-    const sheetName = client.outputSheetName || QBO_CONFIG.outputSheetName;
-    if (!rowsBySheet[sheetName]) rowsBySheet[sheetName] = [];
+  try {
+    const deploymentState = readAgingDeploymentState_();
+    if (isAgingDeploymentActive_(deploymentState)) {
+      const delegated = {
+        status: 'delegated_to_configuration_deployment',
+        event: 'aging_sheet_export_delegated',
+        operationId: deploymentState.operation_id,
+        currentStage: deploymentState.current_stage,
+        durationMs: Date.now() - executionStartedAt
+      };
+      Logger.log(JSON.stringify(delegated));
+      return delegated;
+    }
 
-    ['customer', 'vendor'].forEach(reportKind => {
-      const payload = fetchReport_(clientId, reportKind);
-      if (!payload) return;
+    const selectionStartedAt = Date.now();
+    const selection = resolveAgingEntitySelection_();
+    const clientIds = Object.keys(selection.clientsById);
+    const selectionDurationMs = Date.now() - selectionStartedAt;
+    const directExport = fetchAgingDirectExport_(selection);
+    const failedSheetNames = directExport.sheets
+      .filter(sheet => sheet.status !== 'fresh_qbo')
+      .map(sheet => sheet.sheetName);
+    const fallback = failedSheetNames.length
+      ? loadAgingCompletedSnapshotFallback_(selection, deploymentState)
+      : { available: false, reason: 'not_needed', rowsBySheet: {} };
+    const spreadsheet = getTargetSpreadsheet_();
+    const sheetResults = [];
+    let writtenRowCount = 0;
+    const writeStartedAt = Date.now();
 
-      const asOfDate = extractAsOfDate_(payload);
-      const flatRows = flattenReport_(payload);
-      if (!flatRows.length) {
-        Logger.log('Sin filas para clientId=' + clientId + ', reportKind=' + reportKind);
+    directExport.sheets.forEach(sheetExport => {
+      let source = 'fresh_qbo';
+      let rows = sheetExport.rows;
+      let fallbackReason = null;
+
+      if (sheetExport.status !== 'fresh_qbo') {
+        const fallbackDecision = chooseAgingSheetFallback_(
+          spreadsheet,
+          sheetExport.sheetName,
+          fallback
+        );
+        source = fallbackDecision.source;
+        rows = fallbackDecision.rows;
+        fallbackReason = fallbackDecision.reason;
+      }
+
+      if (source === 'preserved') {
+        sheetResults.push({
+          sheetName: sheetExport.sheetName,
+          status: 'preserved',
+          source,
+          rowCount: null,
+          failedReportCount: sheetExport.failures.length,
+          reason: fallbackReason,
+          failures: sheetExport.failures
+        });
         return;
       }
 
-      const exportRows = mapToExportRows_(flatRows, client, reportKind, asOfDate);
-      rowsBySheet[sheetName].push.apply(rowsBySheet[sheetName], exportRows);
+      try {
+        sortExportRows_(rows);
+        writeOutputSheet_(rows, sheetExport.sheetName, spreadsheet);
+        writtenRowCount += rows.length;
+        sheetResults.push({
+          sheetName: sheetExport.sheetName,
+          status: source === 'fresh_qbo' ? 'updated' : 'fallback_applied',
+          source,
+          rowCount: rows.length,
+          failedReportCount: sheetExport.failures.length,
+          fallbackSnapshotDate: source === 'fallback_bigquery'
+            ? fallback.snapshotDate
+            : null,
+          failures: sheetExport.failures
+        });
+      } catch (error) {
+        sheetResults.push({
+          sheetName: sheetExport.sheetName,
+          status: 'write_failed',
+          source,
+          rowCount: null,
+          failedReportCount: sheetExport.failures.length,
+          error: String(error && error.message || error),
+          failures: sheetExport.failures
+        });
+      }
+    });
 
-      Logger.log(
-        'Filas agregadas: ' + exportRows.length +
-        ' para clientId=' + clientId +
-        ', reportKind=' + reportKind +
-        ', sheet=' + sheetName
+    const warningCount = sheetResults.filter(sheet => sheet.status !== 'updated').length;
+    const failedWriteCount = sheetResults.filter(sheet => sheet.status === 'write_failed').length;
+    const preservedSheetCount = sheetResults.filter(sheet => sheet.status === 'preserved').length;
+    const fallbackSheetCount = sheetResults.filter(sheet => sheet.source === 'fallback_bigquery').length;
+    const result = {
+      status: warningCount ? 'completed_with_warnings' : 'passed',
+      event: 'aging_sheet_export_completed',
+      entityConfiguration: buildAgingEntityConfigurationSummary_(selection),
+      clientCount: clientIds.length,
+      outputSheetCount: directExport.sheets.length,
+      freshSheetCount: sheetResults.filter(sheet => sheet.source === 'fresh_qbo' && sheet.status === 'updated').length,
+      fallbackSheetCount,
+      preservedSheetCount,
+      failedWriteCount,
+      failedReportCount: directExport.failedReportCount,
+      writtenRowCount,
+      durations: {
+        selectionMs: selectionDurationMs,
+        gatewayMs: directExport.durationMs,
+        writeMs: Date.now() - writeStartedAt,
+        totalMs: Date.now() - executionStartedAt
+      },
+      gateway: {
+        requestCount: directExport.requestCount,
+        batchCount: directExport.batchCount,
+        maxConcurrentRequests: AGING_DIRECT_EXPORT_CONFIG.maxConcurrentRequests
+      },
+      fallback: {
+        available: fallback.available,
+        reason: fallback.reason,
+        snapshotDate: fallback.snapshotDate || null
+      },
+      sheets: sheetResults
+    };
+
+    Logger.log(JSON.stringify(result));
+    Logger.log('--- AGING EXPORT END ---');
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function isAgingDeploymentActive_(state) {
+  return Boolean(state && ['pending', 'processing'].includes(String(state.status || '')));
+}
+
+function fetchAgingDirectExport_(selection) {
+  const startedAt = Date.now();
+  const requests = buildAgingReportRequests_(selection);
+  const results = [];
+  const batchSize = Math.max(1, Number(AGING_DIRECT_EXPORT_CONFIG.maxConcurrentRequests || 1));
+  let batchCount = 0;
+
+  for (let index = 0; index < requests.length; index += batchSize) {
+    const batch = requests.slice(index, index + batchSize);
+    const batchStartedAt = Date.now();
+    const batchResults = fetchAgingReportBatch_(batch);
+    results.push.apply(results, batchResults);
+    batchCount++;
+    Logger.log(JSON.stringify({
+      event: 'aging_gateway_batch_completed',
+      batchNumber: batchCount,
+      requestCount: batch.length,
+      successCount: batchResults.filter(result => result.success).length,
+      durationMs: Date.now() - batchStartedAt
+    }));
+  }
+
+  const sheetsByName = {};
+  getAgingOutputSheetNames_(selection).forEach(sheetName => {
+    sheetsByName[sheetName] = {
+      sheetName,
+      rows: [],
+      expectedReportCount: 0,
+      successfulReportCount: 0,
+      failures: []
+    };
+  });
+
+  requests.forEach(request => {
+    if (!sheetsByName[request.sheetName]) {
+      sheetsByName[request.sheetName] = {
+        sheetName: request.sheetName,
+        rows: [],
+        expectedReportCount: 0,
+        successfulReportCount: 0,
+        failures: []
+      };
+    }
+    sheetsByName[request.sheetName].expectedReportCount++;
+  });
+
+  results.forEach(reportResult => {
+    const sheet = sheetsByName[reportResult.sheetName];
+    if (!reportResult.success) {
+      sheet.failures.push(compactAgingReportFailure_(reportResult));
+      return;
+    }
+
+    try {
+      const asOfDate = extractAsOfDate_(reportResult.payload);
+      const flatRows = flattenReport_(reportResult.payload);
+      const exportRows = mapToExportRows_(
+        flatRows,
+        reportResult.client,
+        reportResult.reportKind,
+        asOfDate
       );
+      sheet.rows.push.apply(sheet.rows, exportRows);
+      sheet.successfulReportCount++;
+    } catch (error) {
+      sheet.failures.push(compactAgingReportFailure_({
+        ...reportResult,
+        success: false,
+        error: 'Report mapping failed: ' + String(error && error.message || error)
+      }));
+    }
+  });
+
+  const sheets = Object.keys(sheetsByName).sort().map(sheetName => {
+    const sheet = sheetsByName[sheetName];
+    return {
+      ...sheet,
+      status: sheet.successfulReportCount === sheet.expectedReportCount &&
+        !sheet.failures.length
+        ? 'fresh_qbo'
+        : 'incomplete_qbo'
+    };
+  });
+
+  return {
+    requestCount: requests.length,
+    batchCount,
+    failedReportCount: sheets.reduce((total, sheet) => total + sheet.failures.length, 0),
+    durationMs: Date.now() - startedAt,
+    sheets
+  };
+}
+
+function buildAgingReportRequests_(selection) {
+  const requests = [];
+  Object.keys(selection.clientsById).sort().forEach(clientId => {
+    const client = selection.clientsById[clientId];
+    const sheetName = String(client.outputSheetName || QBO_CONFIG.outputSheetName).trim();
+    ['customer', 'vendor'].forEach(reportKind => {
+      requests.push({
+        clientId,
+        client,
+        sheetName,
+        reportKind,
+        url: buildAgingReportUrl_(clientId, reportKind)
+      });
     });
   });
+  return requests;
+}
 
-  let totalRows = 0;
-  Object.keys(rowsBySheet).forEach(sheetName => {
-    const rows = rowsBySheet[sheetName];
-    sortExportRows_(rows);
-    writeOutputSheet_(rows, sheetName);
-    totalRows += rows.length;
-    Logger.log('Filas escritas en sheet=' + sheetName + ': ' + rows.length);
+function fetchAgingReportBatch_(requests) {
+  const maxAttempts = Math.max(1, Number(AGING_DIRECT_EXPORT_CONFIG.maxFetchAttempts || 1));
+  let pending = requests.slice();
+  const completed = [];
+
+  for (let attempt = 1; attempt <= maxAttempts && pending.length; attempt++) {
+    let responses;
+    try {
+      const apiKey = getAgingQboApiKey_();
+      responses = UrlFetchApp.fetchAll(pending.map(request => ({
+        url: request.url,
+        method: 'get',
+        headers: { 'X-API-Key': apiKey },
+        muteHttpExceptions: true
+      })));
+    } catch (error) {
+      if (attempt < maxAttempts) {
+        Utilities.sleep(AGING_DIRECT_EXPORT_CONFIG.retryDelayMs * attempt);
+        continue;
+      }
+      return completed.concat(fetchAgingReportsIndividually_(pending, attempt, error));
+    }
+
+    const retry = [];
+    pending.forEach((request, index) => {
+      const result = parseAgingReportHttpResponse_(request, responses[index], attempt);
+      if (!result.success && isRetryableAgingReportResult_(result) && attempt < maxAttempts) {
+        retry.push(request);
+      } else {
+        completed.push(result);
+      }
+    });
+    pending = retry;
+    if (pending.length && attempt < maxAttempts) {
+      Utilities.sleep(AGING_DIRECT_EXPORT_CONFIG.retryDelayMs * attempt);
+    }
+  }
+
+  return completed;
+}
+
+function fetchAgingReportsIndividually_(requests, attempt, batchError) {
+  return requests.map(request => {
+    const response = fetchJsonResponse_(request.url);
+    if (response.error) {
+      return {
+        ...request,
+        success: false,
+        status: response.status,
+        attempts: attempt + 1,
+        error: response.error + '; batchError=' + String(batchError)
+      };
+    }
+    return parseAgingReportPayload_(request, response, attempt + 1);
   });
+}
 
-  const result = {
-    event: 'aging_sheet_export_completed',
-    entityConfiguration: buildAgingEntityConfigurationSummary_(selection),
-    clientCount: clientIds.length,
-    outputSheetCount: Object.keys(rowsBySheet).length,
-    rowCount: totalRows
+function parseAgingReportHttpResponse_(request, response, attempt) {
+  if (!response) {
+    return {
+      ...request,
+      success: false,
+      status: 0,
+      attempts: attempt,
+      error: 'Gateway did not return a response.'
+    };
+  }
+
+  const body = response.getContentText();
+  let json = null;
+  let parseError = null;
+  try {
+    json = JSON.parse(body);
+  } catch (error) {
+    parseError = String(error);
+  }
+  return parseAgingReportPayload_(request, {
+    status: response.getResponseCode(),
+    body,
+    json,
+    parseError
+  }, attempt);
+}
+
+function parseAgingReportPayload_(request, response, attempt) {
+  const status = Number(response.status || 0);
+  const success = status >= 200 && status < 300 && !response.parseError;
+  return {
+    ...request,
+    success,
+    status,
+    attempts: attempt,
+    payload: success ? response.json : null,
+    parseError: response.parseError || null,
+    error: success
+      ? null
+      : response.error || response.parseError ||
+        ('Gateway returned HTTP ' + status + ': ' + String(response.body || '').slice(0, 300))
   };
+}
 
-  Logger.log(JSON.stringify(result, null, 2));
-  Logger.log('--- AGING EXPORT END ---');
-  return result;
+function isRetryableAgingReportResult_(result) {
+  return Boolean(
+    result && (
+      result.status === 0 ||
+      result.status === 429 ||
+      result.status >= 500 ||
+      result.parseError
+    )
+  );
+}
+
+function compactAgingReportFailure_(result) {
+  return {
+    clientId: result.clientId,
+    reportKind: result.reportKind,
+    status: result.status || 0,
+    attempts: result.attempts || 0,
+    error: String(result.error || 'Unknown Aging report failure.').slice(0, 500)
+  };
+}
+
+function loadAgingCompletedSnapshotFallback_(selection, state) {
+  try {
+    if (!isAgingCompletedSnapshotFallbackValid_(selection, state)) {
+      return {
+        available: false,
+        reason: 'no_matching_completed_snapshot',
+        rowsBySheet: {}
+      };
+    }
+
+    const snapshotDate = state.range.snapshotDate;
+    const queryResult = queryAgingSnapshotExportRows_(snapshotDate);
+    const expectedRowCount = Number(state.stages.bigquery.result.rowCount);
+    if (!Number.isFinite(expectedRowCount) || queryResult.rows.length !== expectedRowCount) {
+      throw new Error(
+        'Completed snapshot row count mismatch. Expected=' + expectedRowCount +
+        ', actual=' + queryResult.rows.length
+      );
+    }
+
+    const rowsBySheet = {};
+    getAgingOutputSheetNames_(selection).forEach(sheetName => rowsBySheet[sheetName] = []);
+    queryResult.rows.forEach(item => {
+      const client = selection.clientsById[item.clientId];
+      if (!client) {
+        throw new Error('Snapshot contains an unauthorized clientId=' + item.clientId);
+      }
+      rowsBySheet[client.outputSheetName].push(item.exportRow);
+    });
+
+    return {
+      available: true,
+      reason: 'completed_snapshot_available',
+      snapshotDate,
+      rowsBySheet
+    };
+  } catch (error) {
+    Logger.log(JSON.stringify({
+      event: 'aging_sheet_export_fallback_unavailable',
+      error: String(error && error.message || error)
+    }));
+    return {
+      available: false,
+      reason: 'snapshot_validation_failed',
+      error: String(error && error.message || error),
+      rowsBySheet: {}
+    };
+  }
+}
+
+function isAgingCompletedSnapshotFallbackValid_(selection, state) {
+  return Boolean(
+    state &&
+    state.status === 'completed' &&
+    Number(state.pipeline_version || 0) === Number(AGING_OPERATIONAL_DEPLOYMENT.pipelineVersion) &&
+    Number(state.configuration_version || 0) === Number(selection.configuration.configuration_version) &&
+    String(state.configuration_hash || '') === String(selection.configuration.configuration_hash || '') &&
+    state.range && /^\d{4}-\d{2}-\d{2}$/.test(String(state.range.snapshotDate || '')) &&
+    state.stages &&
+    state.stages.bigquery && state.stages.bigquery.status === 'completed' &&
+    state.stages.bigquery.result &&
+    state.stages.output_sheet_export && state.stages.output_sheet_export.status === 'completed'
+  );
+}
+
+function chooseAgingSheetFallback_(spreadsheet, sheetName, fallback) {
+  if (!fallback || !fallback.available || !Object.prototype.hasOwnProperty.call(fallback.rowsBySheet, sheetName)) {
+    return { source: 'preserved', rows: null, reason: fallback && fallback.reason || 'fallback_unavailable' };
+  }
+
+  const currentAsOfDate = getAgingSheetLatestAsOfDate_(spreadsheet, sheetName);
+  if (currentAsOfDate && currentAsOfDate >= fallback.snapshotDate) {
+    return {
+      source: 'preserved',
+      rows: null,
+      reason: 'existing_sheet_is_same_or_newer_than_snapshot'
+    };
+  }
+
+  return {
+    source: 'fallback_bigquery',
+    rows: fallback.rowsBySheet[sheetName],
+    reason: 'completed_snapshot_selected'
+  };
+}
+
+function getAgingSheetLatestAsOfDate_(spreadsheet, sheetName) {
+  const sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet || sheet.getLastRow() < 2) return '';
+  const values = sheet.getRange(2, 3, sheet.getLastRow() - 1, 1).getDisplayValues();
+  return values.reduce((latest, row) => {
+    const value = String(row[0] || '').trim();
+    return /^\d{4}-\d{2}-\d{2}$/.test(value) && value > latest ? value : latest;
+  }, '');
 }
 
 function getOrCreateAgingSheet_(spreadsheet, sheetName) {
   const finalName = String(sheetName || QBO_CONFIG.outputSheetName || '').trim();
   if (!finalName) throw new Error('Aging output sheet name is required.');
-  return spreadsheet.getSheetByName(finalName) || spreadsheet.insertSheet(finalName);
+  const sheet = spreadsheet.getSheetByName(finalName) || spreadsheet.insertSheet(finalName);
+  if (sheet.isSheetHidden()) sheet.showSheet();
+  return sheet;
 }
 
-function writeOutputSheet_(rows, sheetName) {
-  const sheet = getOrCreateAgingSheet_(getTargetSpreadsheet_(), sheetName);
-  sheet.clearContents();
+function writeOutputSheet_(rows, sheetName, spreadsheetOverride) {
+  const spreadsheet = spreadsheetOverride || getTargetSpreadsheet_();
+  const sheet = getOrCreateAgingSheet_(spreadsheet, sheetName);
+  const requiredRowCount = rows.length + 1;
+  if (sheet.getMaxRows() < requiredRowCount) {
+    sheet.insertRowsAfter(
+      sheet.getMaxRows(),
+      requiredRowCount - sheet.getMaxRows()
+    );
+  }
+  const clearRowCount = Math.max(requiredRowCount, sheet.getLastRow(), 1);
+  sheet.getRange(1, 1, clearRowCount, EXPORT_COLUMNS.length).clearContent();
   sheet.getRange(1, 1, 1, EXPORT_COLUMNS.length).setValues([EXPORT_COLUMNS]);
   if (!rows.length) return;
   sheet.getRange(2, 1, rows.length, EXPORT_COLUMNS.length).setValues(rows);
   sheet.getRange(2, 11, rows.length, 1).setNumberFormat('0.00');
+}
+
+function getAgingOutputSheetNames_(selection) {
+  return [...new Set(Object.keys(selection.clientsById)
+    .map(clientId => String(selection.clientsById[clientId].outputSheetName || '').trim())
+    .filter(Boolean))]
+    .sort();
+}
+
+function resolveAgingDeploymentSelection_(state, source) {
+  if (!state || typeof state !== 'object') {
+    throw new Error('Aging deployment state is required for sheet processing.');
+  }
+
+  const configuration = validateAgingEntityConfiguration_(
+    state.configuration,
+    state.configuration_version
+  );
+  if (configuration.configuration_hash !== state.configuration_hash) {
+    throw new Error(
+      'Deployment configuration hash no longer matches the sheet operation.'
+    );
+  }
+
+  return resolveAgingEntitySelection_({
+    source: String(source || 'configuration_deployment'),
+    configuration
+  });
+}
+
+function executeAgingOutputSheetsProvisionStage_(state) {
+  const selection = resolveAgingDeploymentSelection_(
+    state,
+    'configuration_deployment_output_sheets'
+  );
+  const spreadsheet = getTargetSpreadsheet_();
+  const sheetNames = getAgingOutputSheetNames_(selection);
+  const sheets = sheetNames.map(sheetName => {
+    const existing = spreadsheet.getSheetByName(sheetName);
+    const wasHidden = Boolean(existing && existing.isSheetHidden());
+    const sheet = getOrCreateAgingSheet_(spreadsheet, sheetName);
+
+    if (!existing) {
+      sheet.getRange(1, 1, 1, EXPORT_COLUMNS.length).setValues([EXPORT_COLUMNS]);
+    }
+
+    return {
+      sheetName,
+      status: existing ? (wasHidden ? 'shown' : 'existing') : 'created'
+    };
+  });
+
+  const result = {
+    status: 'passed',
+    event: 'aging_output_sheets_provisioned',
+    entityConfiguration: buildAgingEntityConfigurationSummary_(selection),
+    sheetCount: sheets.length,
+    createdSheetCount: sheets.filter(item => item.status === 'created').length,
+    shownSheetCount: sheets.filter(item => item.status === 'shown').length,
+    sheets
+  };
+  Logger.log(JSON.stringify(result));
+  return result;
+}
+
+function executeAgingOutputSheetExportStage_(state) {
+  const bigQueryStage = state && state.stages && state.stages.bigquery;
+  if (!bigQueryStage || bigQueryStage.status !== 'completed') {
+    throw new Error('Aging output sheet export requires a completed BigQuery stage.');
+  }
+
+  const selection = resolveAgingDeploymentSelection_(
+    state,
+    'configuration_deployment_output_sheet_export'
+  );
+  const sheetNames = getAgingOutputSheetNames_(selection);
+  const rowsBySheet = {};
+  sheetNames.forEach(sheetName => rowsBySheet[sheetName] = []);
+
+  const snapshotDate = state.range && state.range.snapshotDate;
+  const queryResult = queryAgingSnapshotExportRows_(snapshotDate);
+  const reportRowCounts = { AR: 0, AP: 0 };
+
+  queryResult.rows.forEach(item => {
+    const client = selection.clientsById[item.clientId];
+    if (!client) {
+      throw new Error(
+        'Aging snapshot contains an unauthorized client during sheet export. ClientId=' +
+        item.clientId
+      );
+    }
+
+    const sheetName = String(client.outputSheetName || '').trim();
+    if (!rowsBySheet[sheetName]) rowsBySheet[sheetName] = [];
+    rowsBySheet[sheetName].push(item.exportRow);
+    reportRowCounts[item.exportRow[0]] =
+      Number(reportRowCounts[item.exportRow[0]] || 0) + 1;
+  });
+
+  const expectedRowCountValue = bigQueryStage.result &&
+    bigQueryStage.result.rowCount;
+  const expectedRowCount = expectedRowCountValue === null ||
+    expectedRowCountValue === undefined
+    ? null
+    : Number(expectedRowCountValue);
+  if (
+    expectedRowCount !== null &&
+    Number.isFinite(expectedRowCount) &&
+    queryResult.rows.length !== expectedRowCount
+  ) {
+    throw new Error(
+      'Aging sheet export row count does not match the completed BigQuery stage. Expected=' +
+      expectedRowCount + ', actual=' + queryResult.rows.length
+    );
+  }
+
+  const spreadsheet = getTargetSpreadsheet_();
+  const sheets = Object.keys(rowsBySheet).sort().map(sheetName => {
+    const rows = rowsBySheet[sheetName];
+    sortExportRows_(rows);
+    writeOutputSheet_(rows, sheetName, spreadsheet);
+    return { sheetName, rowCount: rows.length };
+  });
+
+  const result = {
+    status: 'passed',
+    event: 'aging_output_sheet_export_completed',
+    entityConfiguration: buildAgingEntityConfigurationSummary_(selection),
+    snapshotDate,
+    sheetCount: sheets.length,
+    rowCount: queryResult.rows.length,
+    reportRowCounts,
+    sheets
+  };
+  Logger.log(JSON.stringify(result));
+  return result;
+}
+
+function queryAgingSnapshotExportRows_(snapshotDate) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(snapshotDate || ''))) {
+    throw new Error('Invalid Aging snapshot date for sheet export: ' + snapshotDate);
+  }
+
+  const query = `
+    SELECT
+      report_type,
+      entity,
+      as_of_date,
+      bucket,
+      counterparty,
+      document_number,
+      document_type,
+      transaction_date,
+      due_date,
+      days_overdue,
+      open_amount,
+      currency,
+      source,
+      client_id
+    FROM \`${AGING_BIGQUERY_TABLE}\`
+    WHERE snapshot_date = @snapshot_date
+  `;
+  const request = {
+    query,
+    useLegacySql: false,
+    parameterMode: 'NAMED',
+    queryParameters: [{
+      name: 'snapshot_date',
+      parameterType: { type: 'DATE' },
+      parameterValue: { value: snapshotDate }
+    }],
+    maxResults: 10000,
+    timeoutMs: 120000
+  };
+
+  let response = BigQuery.Jobs.query(request, BQ_CONFIG.projectId);
+  if (!response || !response.jobReference) {
+    throw new Error('BigQuery did not return a job reference for Aging sheet export.');
+  }
+
+  const jobId = response.jobReference.jobId;
+  while (!response.jobComplete) {
+    Utilities.sleep(500);
+    response = BigQuery.Jobs.getQueryResults(BQ_CONFIG.projectId, jobId, {
+      maxResults: 10000
+    });
+  }
+
+  const rows = [];
+  let page = response;
+  while (page) {
+    if (page.errors && page.errors.length) {
+      throw new Error('Aging sheet export query failed: ' + JSON.stringify(page.errors));
+    }
+
+    (page.rows || []).forEach(row => {
+      const values = row.f || [];
+      const valueAt = index => values[index] ? values[index].v : null;
+      const daysOverdue = valueAt(9);
+      const openAmount = Number(valueAt(10) || 0);
+      if (!Number.isFinite(openAmount)) {
+        throw new Error('Invalid open amount returned for Aging sheet export.');
+      }
+
+      rows.push({
+        clientId: String(valueAt(13) || '').trim(),
+        exportRow: [
+          String(valueAt(0) || ''),
+          String(valueAt(1) || ''),
+          String(valueAt(2) || ''),
+          String(valueAt(3) || ''),
+          String(valueAt(4) || ''),
+          valueAt(5) === null ? '' : String(valueAt(5)),
+          String(valueAt(6) || ''),
+          valueAt(7) === null ? '' : String(valueAt(7)),
+          valueAt(8) === null ? '' : String(valueAt(8)),
+          daysOverdue === null ? '' : Number(daysOverdue),
+          openAmount,
+          String(valueAt(11) || ''),
+          String(valueAt(12) || '')
+        ]
+      });
+    });
+
+    page = page.pageToken
+      ? BigQuery.Jobs.getQueryResults(BQ_CONFIG.projectId, jobId, {
+          pageToken: page.pageToken,
+          maxResults: 10000
+        })
+      : null;
+  }
+
+  return { jobId, snapshotDate, rows };
 }
 
 function fetchJsonResponse_(url) {
@@ -819,10 +1483,10 @@ function snapshotAgingToBigQuery() {
 }
 
 
-function executeAgingBigQuerySnapshot_(loadedEntityConfiguration) {
+function executeAgingBigQuerySnapshot_(loadedEntityConfiguration, snapshotDateOverride) {
   Logger.log('--- BQ AGING SNAPSHOT START ---');
   const schemaValidation = validateAgingBigQuerySchema_();
-  const assembly = buildAgingSnapshot_(loadedEntityConfiguration);
+  const assembly = buildAgingSnapshot_(loadedEntityConfiguration, snapshotDateOverride);
   const loadResult = replaceAgingSnapshotPartition_(assembly.snapshotDate, assembly.rows);
   const expectedUniqueRowCount = countUniqueAgingRows_(assembly.rows);
   const verification = verifyAgingSnapshotPartition_(assembly.snapshotDate, assembly.rows.length, expectedUniqueRowCount);
@@ -843,8 +1507,8 @@ function executeAgingBigQuerySnapshot_(loadedEntityConfiguration) {
   return result;
 }
 
-function buildAgingSnapshot_(loadedEntityConfiguration) {
-  const range = buildAgingSnapshotRange_();
+function buildAgingSnapshot_(loadedEntityConfiguration, snapshotDateOverride) {
+  const range = buildAgingSnapshotRange_(snapshotDateOverride);
   const loadedAt = new Date().toISOString();
   const snapshotClients = getAgingSnapshotClients_(loadedEntityConfiguration);
   const rows = [];
@@ -931,11 +1595,22 @@ function buildAgingClientSnapshot_(client, range, loadedAt) {
   const openAmountCents = { AR: 0, AP: 0 };
 
   ['customer', 'vendor'].forEach(reportKind => {
-    const payload = fetchReport_(clientId, reportKind);
+    const payload = fetchReport_(clientId, reportKind, range.snapshotDate);
     if (!payload) return;
 
     const reportType = reportKind === 'customer' ? 'AR' : 'AP';
     const asOfDate = extractAsOfDate_(payload);
+    const asOfText = String(asOfDate || '').trim();
+    const normalizedAsOfDate = /^\d{4}-\d{2}-\d{2}$/.test(asOfText)
+      ? asOfText
+      : normalizeDateForOutput_(asOfDate);
+    if (normalizedAsOfDate && normalizedAsOfDate !== range.snapshotDate) {
+      throw new Error(
+        'AR/AP historical response date mismatch. clientId=' + clientId +
+        ', reportKind=' + reportKind + ', requested=' + range.snapshotDate +
+        ', received=' + normalizedAsOfDate
+      );
+    }
     const flatRows = flattenReport_(payload);
 
     if (!flatRows.length) {
@@ -1117,7 +1792,10 @@ function buildAgingClientDeleteQuery_(snapshotDate, clientId) {
   );
 }
 
-function buildAgingVerificationQuery_(snapshotDate) {
+function buildAgingVerificationQuery_(snapshotDate, clientIds) {
+  const scopedClientIds = Array.from(new Set(
+    (clientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
+  ));
   return [
     'SELECT',
     '  COUNT(*) AS row_count,',
@@ -1130,8 +1808,27 @@ function buildAgingVerificationQuery_(snapshotDate) {
     "  COALESCE(SUM(IF(report_type = 'AR', open_amount, 0)), 0) AS ar_open_amount,",
     "  COALESCE(SUM(IF(report_type = 'AP', open_amount, 0)), 0) AS ap_open_amount",
     'FROM `' + AGING_BIGQUERY_TABLE + '` AS t',
-    "WHERE snapshot_date = DATE '" + escapeAgingBigQueryString_(snapshotDate) + "'"
-  ].join('\n');
+    "WHERE snapshot_date = DATE '" + escapeAgingBigQueryString_(snapshotDate) + "'",
+    scopedClientIds.length
+      ? '  AND client_id IN (' + scopedClientIds.map(clientId =>
+        "'" + escapeAgingBigQueryString_(clientId) + "'").join(', ') + ')'
+      : null
+  ].filter(line => line !== null).join('\n');
+}
+
+function buildAgingStaleClientsDeleteQuery_(snapshotDate, clientIds) {
+  const ids = Array.from(new Set(
+    (clientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
+  ));
+  if (!ids.length) {
+    throw new Error('At least one configured Aging client is required for stale-row cleanup.');
+  }
+  return (
+    'DELETE FROM `' + AGING_BIGQUERY_TABLE + '` ' +
+    "WHERE snapshot_date = DATE '" + escapeAgingBigQueryString_(snapshotDate) + "' " +
+    'AND client_id NOT IN (' + ids.map(clientId =>
+      "'" + escapeAgingBigQueryString_(clientId) + "'").join(', ') + ')'
+  );
 }
 
 function buildAgingBigQueryJobId_(operationId, snapshotDate, jobKind, clientId, generation) {
@@ -1390,28 +2087,9 @@ function clearEmptyAgingPartition_(snapshotDate) {
  * Report Extraction and Mapping
  ***********************/
 
-function fetchReport_(clientId, reportKind) {
-  const suffix =
-    reportKind === 'customer'
-      ? 'customer-balance-detailed'
-      : reportKind === 'vendor'
-        ? 'vendor-balance-detailed'
-        : '';
-
-  if (!suffix) {
-    Logger.log('reportKind inválido: ' + reportKind + ' (clientId=' + clientId + ')');
-    return null;
-  }
-
-  const url =
-    QBO_CONFIG.baseUrl +
-    '/qbo/' +
-    encodeURIComponent(clientId) +
-    '/reports/' +
-    suffix +
-    '?environment=' +
-    encodeURIComponent(QBO_CONFIG.environment);
-
+function fetchReport_(clientId, reportKind, reportDate) {
+  const url = buildAgingReportUrl_(clientId, reportKind, reportDate);
+  if (!url) return null;
   const response = fetchJsonResponse_(url);
 
   if (response.error) {
@@ -1453,6 +2131,31 @@ function fetchReport_(clientId, reportKind) {
   }
 
   return response.json;
+}
+
+function buildAgingReportUrl_(clientId, reportKind, reportDate) {
+  const suffix =
+    reportKind === 'customer'
+      ? 'customer-balance-detailed'
+      : reportKind === 'vendor'
+        ? 'vendor-balance-detailed'
+        : '';
+
+  if (!suffix) {
+    Logger.log('reportKind inválido: ' + reportKind + ' (clientId=' + clientId + ')');
+    return '';
+  }
+
+  return (
+    QBO_CONFIG.baseUrl +
+    '/qbo/' +
+    encodeURIComponent(clientId) +
+    '/reports/' +
+    suffix +
+    '?environment=' +
+    encodeURIComponent(QBO_CONFIG.environment) +
+    (reportDate ? '&report_date=' + encodeURIComponent(reportDate) : '')
+  );
 }
 function flattenReport_(payload) {
   const topRows = payload && payload.data && payload.data.Rows ? payload.data.Rows.Row : null;
