@@ -1483,10 +1483,10 @@ function snapshotAgingToBigQuery() {
 }
 
 
-function executeAgingBigQuerySnapshot_(loadedEntityConfiguration) {
+function executeAgingBigQuerySnapshot_(loadedEntityConfiguration, snapshotDateOverride) {
   Logger.log('--- BQ AGING SNAPSHOT START ---');
   const schemaValidation = validateAgingBigQuerySchema_();
-  const assembly = buildAgingSnapshot_(loadedEntityConfiguration);
+  const assembly = buildAgingSnapshot_(loadedEntityConfiguration, snapshotDateOverride);
   const loadResult = replaceAgingSnapshotPartition_(assembly.snapshotDate, assembly.rows);
   const expectedUniqueRowCount = countUniqueAgingRows_(assembly.rows);
   const verification = verifyAgingSnapshotPartition_(assembly.snapshotDate, assembly.rows.length, expectedUniqueRowCount);
@@ -1507,8 +1507,8 @@ function executeAgingBigQuerySnapshot_(loadedEntityConfiguration) {
   return result;
 }
 
-function buildAgingSnapshot_(loadedEntityConfiguration) {
-  const range = buildAgingSnapshotRange_();
+function buildAgingSnapshot_(loadedEntityConfiguration, snapshotDateOverride) {
+  const range = buildAgingSnapshotRange_(snapshotDateOverride);
   const loadedAt = new Date().toISOString();
   const snapshotClients = getAgingSnapshotClients_(loadedEntityConfiguration);
   const rows = [];
@@ -1595,11 +1595,22 @@ function buildAgingClientSnapshot_(client, range, loadedAt) {
   const openAmountCents = { AR: 0, AP: 0 };
 
   ['customer', 'vendor'].forEach(reportKind => {
-    const payload = fetchReport_(clientId, reportKind);
+    const payload = fetchReport_(clientId, reportKind, range.snapshotDate);
     if (!payload) return;
 
     const reportType = reportKind === 'customer' ? 'AR' : 'AP';
     const asOfDate = extractAsOfDate_(payload);
+    const asOfText = String(asOfDate || '').trim();
+    const normalizedAsOfDate = /^\d{4}-\d{2}-\d{2}$/.test(asOfText)
+      ? asOfText
+      : normalizeDateForOutput_(asOfDate);
+    if (normalizedAsOfDate && normalizedAsOfDate !== range.snapshotDate) {
+      throw new Error(
+        'AR/AP historical response date mismatch. clientId=' + clientId +
+        ', reportKind=' + reportKind + ', requested=' + range.snapshotDate +
+        ', received=' + normalizedAsOfDate
+      );
+    }
     const flatRows = flattenReport_(payload);
 
     if (!flatRows.length) {
@@ -1781,7 +1792,10 @@ function buildAgingClientDeleteQuery_(snapshotDate, clientId) {
   );
 }
 
-function buildAgingVerificationQuery_(snapshotDate) {
+function buildAgingVerificationQuery_(snapshotDate, clientIds) {
+  const scopedClientIds = Array.from(new Set(
+    (clientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
+  ));
   return [
     'SELECT',
     '  COUNT(*) AS row_count,',
@@ -1794,8 +1808,27 @@ function buildAgingVerificationQuery_(snapshotDate) {
     "  COALESCE(SUM(IF(report_type = 'AR', open_amount, 0)), 0) AS ar_open_amount,",
     "  COALESCE(SUM(IF(report_type = 'AP', open_amount, 0)), 0) AS ap_open_amount",
     'FROM `' + AGING_BIGQUERY_TABLE + '` AS t',
-    "WHERE snapshot_date = DATE '" + escapeAgingBigQueryString_(snapshotDate) + "'"
-  ].join('\n');
+    "WHERE snapshot_date = DATE '" + escapeAgingBigQueryString_(snapshotDate) + "'",
+    scopedClientIds.length
+      ? '  AND client_id IN (' + scopedClientIds.map(clientId =>
+        "'" + escapeAgingBigQueryString_(clientId) + "'").join(', ') + ')'
+      : null
+  ].filter(line => line !== null).join('\n');
+}
+
+function buildAgingStaleClientsDeleteQuery_(snapshotDate, clientIds) {
+  const ids = Array.from(new Set(
+    (clientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
+  ));
+  if (!ids.length) {
+    throw new Error('At least one configured Aging client is required for stale-row cleanup.');
+  }
+  return (
+    'DELETE FROM `' + AGING_BIGQUERY_TABLE + '` ' +
+    "WHERE snapshot_date = DATE '" + escapeAgingBigQueryString_(snapshotDate) + "' " +
+    'AND client_id NOT IN (' + ids.map(clientId =>
+      "'" + escapeAgingBigQueryString_(clientId) + "'").join(', ') + ')'
+  );
 }
 
 function buildAgingBigQueryJobId_(operationId, snapshotDate, jobKind, clientId, generation) {
@@ -2054,8 +2087,8 @@ function clearEmptyAgingPartition_(snapshotDate) {
  * Report Extraction and Mapping
  ***********************/
 
-function fetchReport_(clientId, reportKind) {
-  const url = buildAgingReportUrl_(clientId, reportKind);
+function fetchReport_(clientId, reportKind, reportDate) {
+  const url = buildAgingReportUrl_(clientId, reportKind, reportDate);
   if (!url) return null;
   const response = fetchJsonResponse_(url);
 
@@ -2100,7 +2133,7 @@ function fetchReport_(clientId, reportKind) {
   return response.json;
 }
 
-function buildAgingReportUrl_(clientId, reportKind) {
+function buildAgingReportUrl_(clientId, reportKind, reportDate) {
   const suffix =
     reportKind === 'customer'
       ? 'customer-balance-detailed'
@@ -2120,7 +2153,8 @@ function buildAgingReportUrl_(clientId, reportKind) {
     '/reports/' +
     suffix +
     '?environment=' +
-    encodeURIComponent(QBO_CONFIG.environment)
+    encodeURIComponent(QBO_CONFIG.environment) +
+    (reportDate ? '&report_date=' + encodeURIComponent(reportDate) : '')
   );
 }
 function flattenReport_(payload) {

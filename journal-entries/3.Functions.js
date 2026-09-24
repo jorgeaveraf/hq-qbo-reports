@@ -31,10 +31,10 @@ function snapshotJournalEntriesToBigQuery() {
   return processJournalConfigurationDeployment();
 }
 
-function executeJournalBigQuerySnapshot_(loadedEntityConfiguration) {
+function executeJournalBigQuerySnapshot_(loadedEntityConfiguration, rangeOverride) {
   Logger.log('--- JOURNAL BIGQUERY SNAPSHOT START ---');
   const schemaValidation = validateJournalBigQuerySchema_();
-  const result = buildJournalSnapshot_(loadedEntityConfiguration);
+  const result = buildJournalSnapshot_(loadedEntityConfiguration, rangeOverride);
   const loadResult = replaceJournalSnapshotPartition_(result.range, result.lineRows);
   const verification = verifyJournalSnapshotPartition_(result.range.snapshotWeek, result.lineRows.length);
 
@@ -2494,6 +2494,21 @@ function buildJournalClientDeleteQuery_(
   ].join('\n');
 }
 
+function buildJournalStaleClientsDeleteQuery_(snapshotWeek, clientIds) {
+  const ids = Array.from(new Set(
+    (clientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
+  ));
+  if (!ids.length) {
+    throw new Error('At least one configured Journal Entries client is required for stale-row cleanup.');
+  }
+  return [
+    'DELETE FROM `' + JOURNAL_BIGQUERY_TABLE + '`',
+    "WHERE SnapshotWeek = DATE '" + escapeJournalBigQueryString_(snapshotWeek) + "'",
+    '  AND ClientId NOT IN (' + ids.map(clientId =>
+      "'" + escapeJournalBigQueryString_(clientId) + "'").join(', ') + ')'
+  ].join('\n');
+}
+
 function waitForBigQueryJob_(jobReference, timeoutMs) {
   if (!jobReference || !jobReference.jobId) {
     throw new Error('A valid BigQuery job reference is required.');
@@ -2536,7 +2551,8 @@ function verifyJournalSnapshotPartition_(snapshotWeek, expectedRowCount) {
 
 function verifyJournalSnapshotPartitionDetailed_(
   snapshotWeek,
-  expected
+  expected,
+  clientIds
 ) {
   const normalizedSnapshotWeek = String(snapshotWeek || '').trim();
   const expectedValues = expected || {};
@@ -2559,6 +2575,9 @@ function verifyJournalSnapshotPartitionDetailed_(
     );
   }
 
+  const scopedClientIds = Array.from(new Set(
+    (clientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
+  ));
   const result = runBigQueryQuery_(
     [
       'SELECT',
@@ -2572,8 +2591,12 @@ function verifyJournalSnapshotPartitionDetailed_(
       '  CAST(ROUND(COALESCE(SUM(DebitAmount), 0) * 100) AS INT64) AS debit_cents,',
       '  CAST(ROUND(COALESCE(SUM(CreditAmount), 0) * 100) AS INT64) AS credit_cents',
       'FROM `' + JOURNAL_BIGQUERY_TABLE + '`',
-      "WHERE SnapshotWeek = DATE '" + normalizedSnapshotWeek + "'"
-    ].join('\n')
+      "WHERE SnapshotWeek = DATE '" + normalizedSnapshotWeek + "'",
+      scopedClientIds.length
+        ? '  AND ClientId IN (' + scopedClientIds.map(clientId =>
+          "'" + escapeJournalBigQueryString_(clientId) + "'").join(', ') + ')'
+        : null
+    ].filter(line => line !== null).join('\n')
   );
 
   const values =

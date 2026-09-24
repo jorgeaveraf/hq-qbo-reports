@@ -1,0 +1,22 @@
+# Allowlist: ignore everything, then include only Apps Script source files.
+**/*
+!**/
+!appsscript.json
+!**/*.js
+!**/*.gs
+!**/*.html
+
+# Defense in depth for local-only and generated content.
+**/node_modules/**
+**/docs/**
+**/test/**
+**/tests/**
+**/fixtures/**
+**/package.json
+**/package-lock.json
+**/client_secret_*.apps.googleusercontent.com.json
+**/.clasp.json
+**/.clasprc*.json
+**/*.log
+**/*.tmp
+**/*~

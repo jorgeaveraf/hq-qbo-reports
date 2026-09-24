@@ -95,6 +95,21 @@ function debugPaymentBackfillPoc() {
   return result;
 }
 
+function debugNovaFarmsPaymentBackfillPoc() {
+  const execution = buildPaymentEntityBackfillPoc_('nova_farms', {
+    startDate: PAYMENT_BACKFILL_CONFIG.startDate
+  });
+  const result = {
+    event: 'nova_farms_payment_backfill_poc_debug',
+    modifiesBigQuery: false,
+    modifiesSheets: false,
+    createsTriggers: false,
+    execution
+  };
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
 function debugPaymentBackfillState() {
   const state = readPaymentBackfillState_();
   const result = state
