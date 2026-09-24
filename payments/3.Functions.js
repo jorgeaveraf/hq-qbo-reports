@@ -801,27 +801,65 @@ function fetchJsonOrThrow_(url, contextLabel) {
   throw new Error('Unexpected payment gateway retry state for ' + contextLabel + '.');
 }
 
-function buildPaymentsUrl_(clientId, updatedSince, startPosition, updatedBefore) {
-  const query = [
-    'environment=' + encodeURIComponent(PAYMENT_CONFIG.environment),
-    'updated_since=' + encodeURIComponent(updatedSince),
-    'updated_before=' + encodeURIComponent(updatedBefore),
-    'startposition=' + encodeURIComponent(startPosition),
-    'maxresults=' + encodeURIComponent(PAYMENT_CONFIG.pageSize)
-  ].join('&');
-  return PAYMENT_CONFIG.baseUrl + '/qbo/' + encodeURIComponent(clientId) + '/payments?' + query;
-}
+function normalizePaymentFetchFilters_(filters) {
+  const settings = filters && typeof filters === 'object' ? filters : {};
+  const updatedSince = settings.updatedSince
+    ? normalizeTimestampForOutput_(settings.updatedSince)
+    : null;
+  const updatedBefore = settings.updatedBefore
+    ? normalizeTimestampForOutput_(settings.updatedBefore)
+    : null;
+  const dateFrom = settings.dateFrom
+    ? normalizeDateForOutput_(settings.dateFrom)
+    : null;
+  const dateTo = settings.dateTo
+    ? normalizeDateForOutput_(settings.dateTo)
+    : null;
+  const hasUpdateFilter = Boolean(settings.updatedSince || settings.updatedBefore);
+  const hasTransactionDateFilter = Boolean(settings.dateFrom || settings.dateTo);
 
-function fetchPayments_(clientId, updatedSince, updatedBefore) {
-  const normalizedClientId = String(clientId || '').trim();
-  const normalizedUpdatedSince = normalizeTimestampForOutput_(updatedSince);
-  const normalizedUpdatedBefore = normalizeTimestampForOutput_(updatedBefore);
-  if (!normalizedClientId) throw new Error('Client ID is required to fetch payments.');
-  if (!normalizedUpdatedSince) throw new Error('A valid updated_since timestamp is required to fetch payments.');
-  if (!normalizedUpdatedBefore) throw new Error('A valid updated_before timestamp is required to fetch payments.');
-  if (Date.parse(normalizedUpdatedBefore) <= Date.parse(normalizedUpdatedSince)) {
+  if (hasUpdateFilter && hasTransactionDateFilter) {
+    throw new Error('Payments fetch cannot mix update timestamps with transaction dates.');
+  }
+  if (hasUpdateFilter && (!updatedSince || !updatedBefore)) {
+    throw new Error('Payments update fetch requires valid updated_since and updated_before timestamps.');
+  }
+  if (updatedSince && Date.parse(updatedBefore) <= Date.parse(updatedSince)) {
     throw new Error('updated_before must be later than updated_since.');
   }
+  if (hasTransactionDateFilter && (!dateFrom || !dateTo)) {
+    throw new Error('Payments transaction-date fetch requires valid date_from and date_to values.');
+  }
+  if (dateFrom && dateTo && dateFrom > dateTo) {
+    throw new Error('Payments date_to cannot be earlier than date_from.');
+  }
+  if (!hasUpdateFilter && !hasTransactionDateFilter) {
+    throw new Error('Payments fetch requires an update-timestamp or transaction-date range.');
+  }
+  return { updatedSince, updatedBefore, dateFrom, dateTo };
+}
+
+function buildPaymentsUrl_(clientId, filters, startPosition) {
+  const normalizedFilters = normalizePaymentFetchFilters_(filters);
+  const query = [
+    'environment=' + encodeURIComponent(PAYMENT_CONFIG.environment),
+    'startposition=' + encodeURIComponent(startPosition),
+    'maxresults=' + encodeURIComponent(PAYMENT_CONFIG.pageSize)
+  ];
+  if (normalizedFilters.updatedSince) {
+    query.push('updated_since=' + encodeURIComponent(normalizedFilters.updatedSince));
+    query.push('updated_before=' + encodeURIComponent(normalizedFilters.updatedBefore));
+  } else {
+    query.push('date_from=' + encodeURIComponent(normalizedFilters.dateFrom));
+    query.push('date_to=' + encodeURIComponent(normalizedFilters.dateTo));
+  }
+  return PAYMENT_CONFIG.baseUrl + '/qbo/' + encodeURIComponent(clientId) + '/payments?' + query.join('&');
+}
+
+function fetchPayments_(clientId, filters) {
+  const normalizedClientId = String(clientId || '').trim();
+  const normalizedFilters = normalizePaymentFetchFilters_(filters);
+  if (!normalizedClientId) throw new Error('Client ID is required to fetch payments.');
 
   const items = [];
   const pages = [];
@@ -840,7 +878,7 @@ function fetchPayments_(clientId, updatedSince, updatedBefore) {
     seenStartPositions[startPosition] = true;
 
     const payload = fetchJsonOrThrow_(
-      buildPaymentsUrl_(normalizedClientId, normalizedUpdatedSince, startPosition, normalizedUpdatedBefore),
+      buildPaymentsUrl_(normalizedClientId, normalizedFilters, startPosition),
       '/qbo/' + normalizedClientId + '/payments page ' + pageNumber
     );
     if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !Array.isArray(payload.items)) {
@@ -864,7 +902,14 @@ function fetchPayments_(clientId, updatedSince, updatedBefore) {
     if (startPosition !== null && PAYMENT_CONFIG.pageDelayMs > 0) Utilities.sleep(PAYMENT_CONFIG.pageDelayMs);
   }
 
-  return { clientId: normalizedClientId, updatedSince: normalizedUpdatedSince, updatedBefore: normalizedUpdatedBefore, paymentCount: items.length, pageCount: pages.length, pages, items };
+  return {
+    clientId: normalizedClientId,
+    filters: normalizedFilters,
+    paymentCount: items.length,
+    pageCount: pages.length,
+    pages,
+    items
+  };
 }
 
 /***********************
@@ -1347,11 +1392,9 @@ function validatePaymentReconciliation_(header, rows) {
   return result;
 }
 
-function paymentUpdatedInRange_(payment, range) {
-  const metadata = payment && payment.MetaData && typeof payment.MetaData === 'object' ? payment.MetaData : {};
-  const updatedAt = new Date(metadata.LastUpdatedTime || metadata.UpdatedAt || metadata.last_updated_time || '');
-  if (isNaN(updatedAt.getTime())) return false;
-  return updatedAt.getTime() >= Date.parse(range.updatedSince) && updatedAt.getTime() < Date.parse(range.updatedThroughExclusive);
+function paymentTxnDateInRange_(payment, range) {
+  const txnDate = normalizeDateForOutput_(payment && payment.TxnDate);
+  return Boolean(txnDate && txnDate >= range.dateFrom && txnDate <= range.dateTo);
 }
 
 function sortPaymentRows_(rows) {
@@ -1414,8 +1457,11 @@ function getPaymentClientFailure_(client, error) {
 
 function buildPaymentClientSnapshot_(client, range, loadedAt) {
   Logger.log('Fetching payments for ' + client.name + ' [' + client.id + ']');
-  const response = fetchPayments_(client.id, range.updatedSince, range.updatedThroughExclusive);
-  const currentPayments = response.items.filter(payment => paymentUpdatedInRange_(payment, range));
+  const response = fetchPayments_(client.id, {
+    dateFrom: range.dateFrom,
+    dateTo: range.dateTo
+  });
+  const currentPayments = response.items.filter(payment => paymentTxnDateInRange_(payment, range));
   const profile = buildPaymentSchemaProfile_(client, range, response.items);
   const previous = loadPaymentSchemaProfile_(client.id);
   const comparison = comparePaymentSchemaProfiles_(previous, profile);

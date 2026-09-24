@@ -95,6 +95,45 @@ test('keeps fail-fast behavior unless entity isolation is explicitly enabled', (
   assert.deepEqual(calls, ['a', 'b']);
 });
 
+test('scheduled client snapshots fetch by TxnDate without bypassing isolation helpers', () => {
+  const context = loadPaymentsContext();
+  let receivedFilters = null;
+  context.Logger = { log: () => {} };
+  context.normalizeDateForOutput_ = value => String(value || '').slice(0, 10);
+  context.fetchPayments_ = (_clientId, filters) => {
+    receivedFilters = filters;
+    return {
+      items: [{ Id: 'payment-1', TxnDate: '2026-09-16' }],
+      pageCount: 1
+    };
+  };
+  context.buildPaymentSchemaProfile_ = () => ({ paths: {} });
+  context.loadPaymentSchemaProfile_ = () => null;
+  context.comparePaymentSchemaProfiles_ = () => ({
+    status: 'baseline_missing',
+    newPaths: [],
+    missingPaths: [],
+    typeChanges: []
+  });
+  context.normalizePayment_ = (client, range, payment) => ({
+    rows: [{ ClientId: client.id, PaymentId: payment.Id, TxnDate: payment.TxnDate,
+      SnapshotWeek: range.snapshotWeek }]
+  });
+
+  const result = context.buildPaymentClientSnapshot_(
+    { id: 'a', name: 'Alpha', entityAlias: 'alpha' },
+    { dateFrom: '2026-09-14', dateTo: '2026-09-20', snapshotWeek: '2026-09-14' },
+    '2026-09-21T00:00:00.000Z'
+  );
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(receivedFilters)),
+    { dateFrom: '2026-09-14', dateTo: '2026-09-20' }
+  );
+  assert.equal(result.paymentCount, 1);
+  assert.equal(result.rows[0].PaymentId, 'payment-1');
+});
+
 test('loads and verifies successful clients before surfacing a partial failure', () => {
   const context = loadPaymentsContext();
   const calls = [];
