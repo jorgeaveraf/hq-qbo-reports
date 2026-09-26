@@ -79,6 +79,7 @@ function snapshotBalanceSheetToBigQuery(event) {
 }
 function buildBalanceSheetSnapshot_(loadedEntityConfigurationOverride, options) {
   const settings = options || {};
+  const snapshotType = normalizeBalanceSnapshotType_(settings.snapshotType || BALANCE_SNAPSHOT_TYPE_WEEKLY);
   const snapshotDate = String(settings.snapshotDate || todayIsoDate_()).trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotDate)) {
     throw new Error('Invalid Balance Sheet SnapshotDate: ' + snapshotDate);
@@ -87,7 +88,10 @@ function buildBalanceSheetSnapshot_(loadedEntityConfigurationOverride, options) 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedAsOfDate)) {
     throw new Error('Invalid Balance Sheet as-of date: ' + requestedAsOfDate);
   }
-  const snapshotWeek = getWeekStartSunday_(snapshotDate);
+  const snapshotWeek = String(settings.snapshotWeek || getWeekStartSunday_(snapshotDate)).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotWeek)) {
+    throw new Error('Invalid Balance Sheet SnapshotWeek: ' + snapshotWeek);
+  }
   const loadedAt = new Date().toISOString();
   const selection = resolveBalanceEntitySelection_(null, loadedEntityConfigurationOverride);
   const requestedClientIds = Array.from(new Set(
@@ -142,6 +146,7 @@ function buildBalanceSheetSnapshot_(loadedEntityConfigurationOverride, options) 
     rawRows.push({
       SnapshotDate: snapshotDate,
       SnapshotWeek: snapshotWeek,
+      SnapshotType: snapshotType,
       Entity: entity,
       ClientId: clientId,
       ClientName: client.name,
@@ -158,6 +163,7 @@ function buildBalanceSheetSnapshot_(loadedEntityConfigurationOverride, options) 
     flatRows.forEach(line => {
       const bqRow = {
         ReportType: reportName,
+        SnapshotType: snapshotType,
         Entity: entity,
         ClientName: client.name,
         ClientId: clientId,
@@ -186,6 +192,7 @@ function buildBalanceSheetSnapshot_(loadedEntityConfigurationOverride, options) 
       lineRows.push(bqRow);
       sheetRows.push([
         bqRow.ReportType,
+        bqRow.SnapshotType,
         bqRow.Entity,
         bqRow.ClientName,
         bqRow.ClientId,
@@ -235,6 +242,7 @@ function buildBalanceSheetSnapshot_(loadedEntityConfigurationOverride, options) 
 
   return {
     entityConfiguration: selection.entityConfiguration,
+    snapshotType,
     snapshotDate,
     snapshotWeek,
     requestedAsOfDate,
@@ -1376,7 +1384,9 @@ function executeBalanceSheetBigQuerySnapshot_(loadedEntityConfigurationOverride,
   const settings = options || {};
   const snapshot = buildBalanceSheetSnapshot_(loadedEntityConfigurationOverride, {
     continueOnClientError: true,
+    snapshotType: settings.snapshotType || BALANCE_SNAPSHOT_TYPE_WEEKLY,
     snapshotDate: settings.snapshotDate || null,
+    snapshotWeek: settings.snapshotWeek || null,
     asOfDate: settings.asOfDate || null,
     clientIds: settings.clientIds || null,
     requireAsOfDateMatch: settings.requireAsOfDateMatch === true
@@ -1400,12 +1410,14 @@ function executeBalanceSheetBigQuerySnapshot_(loadedEntityConfigurationOverride,
   const verification = verifyBalanceSheetSnapshotPartition_(
     snapshot.snapshotDate,
     snapshot.lineRows.length,
-    useClientScope ? snapshot.successfulClientIds : null
+    useClientScope ? snapshot.successfulClientIds : null,
+    snapshot.snapshotType
   );
   const result = {
     status: hasClientFailures ? 'completed_with_entity_errors' : 'completed',
     entityConfiguration: snapshot.entityConfiguration,
     schemaValidation,
+    snapshotType: snapshot.snapshotType,
     snapshotDate: snapshot.snapshotDate,
     snapshotWeek: snapshot.snapshotWeek,
     requestedAsOfDate: snapshot.requestedAsOfDate,
@@ -1443,6 +1455,7 @@ function validateBalanceSheetBigQuerySchema_() {
   const expectedAuditColumns = [
     'SnapshotDate',
     'SnapshotWeek',
+    'SnapshotType',
     'Entity',
     'ClientId',
     'ClientName',
@@ -1536,34 +1549,7 @@ function validateBalanceSheetBigQuerySchema_() {
 }
 
 function replaceBalanceSheetSnapshotPartition_(snapshot) {
-  const snapshotDate = String(snapshot && snapshot.snapshotDate || '');
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotDate)) throw new Error('Invalid Balance Sheet SnapshotDate: ' + snapshotDate);
-  snapshot.lineRows.forEach((row, index) => {
-    if (String(row.SnapshotDate || '') !== snapshotDate) throw new Error('Balance Sheet row ' + index + ' belongs to another partition.');
-  });
-  const partitionId = snapshotDate.replace(/-/g, '');
-  const snapshotLoad = loadBalanceRowsToPartition_(
-    BQ_CONFIG.snapshotsDatasetId,
-    BQ_CONFIG.snapshotsTableId,
-    snapshot.lineRows,
-    partitionId,
-    'balance_sheet_snapshot'
-  );
-  const auditLoad = loadBalanceRowsToPartition_(
-    BQ_CONFIG.auditDatasetId,
-    BQ_CONFIG.auditTableId,
-    snapshot.rawRows,
-    partitionId,
-    'balance_sheet_audit'
-  );
-  return {
-    mode: 'partition_replace',
-    state: snapshotLoad.state === 'DONE' && auditLoad.state === 'DONE' ? 'DONE' : 'UNKNOWN',
-    snapshotDate,
-    partitionId,
-    snapshot: snapshotLoad,
-    audit: auditLoad
-  };
+  return replaceBalanceSheetSnapshotScope_(snapshot, null);
 }
 
 function escapeBalanceBigQueryString_(value) {
@@ -1596,41 +1582,53 @@ function loadBalanceRowsToStaging_(datasetId, sourceTableId, stagingTableId, row
   return waitForBalanceBigQueryJob_(inserted.jobReference, 120000, datasetId);
 }
 
-function replaceBalanceSheetSnapshotClients_(snapshot) {
+function replaceBalanceSheetSnapshotScope_(snapshot, successfulClientIds) {
   const snapshotDate = String(snapshot && snapshot.snapshotDate || '').trim();
+  const snapshotType = normalizeBalanceSnapshotType_(snapshot && snapshot.snapshotType || BALANCE_SNAPSHOT_TYPE_WEEKLY);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotDate)) throw new Error('Invalid Balance Sheet SnapshotDate: ' + snapshotDate);
-  const ids = Array.from(new Set((snapshot.successfulClientIds || []).map(id => String(id || '').trim()).filter(Boolean)));
-  if (!ids.length) return { mode: 'client_scope_noop', snapshotDate: snapshotDate,
+  const ids = successfulClientIds === null ? [] : Array.from(new Set(
+    (successfulClientIds || []).map(id => String(id || '').trim()).filter(Boolean)
+  ));
+  if (successfulClientIds !== null && !ids.length) return { mode: 'client_scope_noop', snapshotDate: snapshotDate,
+    snapshotType: snapshotType,
     successfulClientCount: 0, lineRowCount: 0, auditRowCount: 0, state: 'SKIPPED' };
   const allowed = {};
   ids.forEach(id => { allowed[id] = true; });
   snapshot.lineRows.forEach((row, index) => {
-    if (String(row.SnapshotDate || '') !== snapshotDate || !allowed[String(row.ClientId || '')]) {
-      throw new Error('Balance Sheet line row ' + index + ' is outside the successful client replacement scope.');
+    if (String(row.SnapshotDate || '') !== snapshotDate ||
+        normalizeBalanceSnapshotType_(row.SnapshotType) !== snapshotType ||
+        (ids.length && !allowed[String(row.ClientId || '')])) {
+      throw new Error('Balance Sheet line row ' + index + ' is outside the requested snapshot replacement scope.');
     }
   });
   snapshot.rawRows.forEach((row, index) => {
-    if (String(row.SnapshotDate || '') !== snapshotDate || !allowed[String(row.ClientId || '')]) {
-      throw new Error('Balance Sheet audit row ' + index + ' is outside the successful client replacement scope.');
+    if (String(row.SnapshotDate || '') !== snapshotDate ||
+        normalizeBalanceSnapshotType_(row.SnapshotType) !== snapshotType ||
+        (ids.length && !allowed[String(row.ClientId || '')])) {
+      throw new Error('Balance Sheet audit row ' + index + ' is outside the requested snapshot replacement scope.');
     }
   });
   const token = Utilities.getUuid().replace(/-/g, '');
   const snapshotStage = 'balance_sheet_snapshot_stage_' + token;
   const auditStage = 'balance_sheet_audit_stage_' + token;
-  const auditColumns = ['SnapshotDate', 'SnapshotWeek', 'Entity', 'ClientId', 'ClientName', 'RealmId',
+  const auditColumns = ['SnapshotDate', 'SnapshotWeek', 'SnapshotType', 'Entity', 'ClientId', 'ClientName', 'RealmId',
     'AsOfDate', 'FetchedAt', 'LoadedAt', 'PayloadHash', 'RawRowCount', 'LineRowCount', 'Status'];
   try {
     loadBalanceRowsToStaging_(BQ_CONFIG.snapshotsDatasetId, BQ_CONFIG.snapshotsTableId,
       snapshotStage, snapshot.lineRows, 'balance_snapshot_stage');
     loadBalanceRowsToStaging_(BQ_CONFIG.auditDatasetId, BQ_CONFIG.auditTableId,
       auditStage, snapshot.rawRows, 'balance_audit_stage');
-    const clientScope = buildBalanceClientScopeSql_(ids);
+    const clientScope = ids.length ? buildBalanceClientScopeSql_(ids) : null;
     const statements = [
       'BEGIN TRANSACTION;',
       'DELETE FROM `' + BALANCE_SNAPSHOT_TABLE + '`',
-      "WHERE SnapshotDate = DATE '" + snapshotDate + "' AND ClientId IN (" + clientScope + ');',
+      "WHERE SnapshotDate = DATE '" + snapshotDate + "'" +
+        " AND COALESCE(SnapshotType, 'WEEKLY') = '" + snapshotType + "'" +
+        (clientScope ? ' AND ClientId IN (' + clientScope + ')' : '') + ';',
       'DELETE FROM `' + BALANCE_AUDIT_TABLE + '`',
-      "WHERE SnapshotDate = DATE '" + snapshotDate + "' AND ClientId IN (" + clientScope + ');'
+      "WHERE SnapshotDate = DATE '" + snapshotDate + "'" +
+        " AND COALESCE(SnapshotType, 'WEEKLY') = '" + snapshotType + "'" +
+        (clientScope ? ' AND ClientId IN (' + clientScope + ')' : '') + ';'
     ];
     if (snapshot.lineRows.length) {
       const columns = BS_EXPORT_COLUMNS.map(column => '`' + column + '`').join(', ');
@@ -1644,8 +1642,9 @@ function replaceBalanceSheetSnapshotClients_(snapshot) {
     }
     statements.push('COMMIT TRANSACTION;');
     const queryResult = runBalanceBigQueryQuery_(statements.join('\n'), BQ_CONFIG.snapshotsDatasetId);
-    return { mode: 'successful_clients_replace', jobId: queryResult.jobReference.jobId,
-      snapshotDate: snapshotDate, successfulClientCount: ids.length,
+    return { mode: ids.length ? 'successful_clients_replace' : 'snapshot_type_replace',
+      jobId: queryResult.jobReference.jobId,
+      snapshotDate: snapshotDate, snapshotType: snapshotType, successfulClientCount: ids.length || null,
       lineRowCount: snapshot.lineRows.length, auditRowCount: snapshot.rawRows.length, state: 'DONE' };
   } finally {
     [[BQ_CONFIG.snapshotsDatasetId, snapshotStage], [BQ_CONFIG.auditDatasetId, auditStage]].forEach(pair => {
@@ -1653,6 +1652,10 @@ function replaceBalanceSheetSnapshotClients_(snapshot) {
       catch (error) { Logger.log('Balance Sheet staging cleanup failed: ' + String(error && error.message || error)); }
     });
   }
+}
+
+function replaceBalanceSheetSnapshotClients_(snapshot) {
+  return replaceBalanceSheetSnapshotScope_(snapshot, snapshot.successfulClientIds || []);
 }
 
 function loadBalanceRowsToPartition_(datasetId, tableId, rows, partitionId, jobPrefix) {
@@ -1821,8 +1824,9 @@ function waitForBalanceBigQueryJob_(jobReference, timeoutMs, datasetId) {
   return job;
 }
 
-function verifyBalanceSheetSnapshotPartition_(snapshotDate, expectedRowCount, clientIds) {
-  const keyExpression = "CONCAT(COALESCE(ClientId,''),'|',COALESCE(CAST(SnapshotDate AS STRING),''),'|',COALESCE(LineType,''),'|',COALESCE(AccountPath,''),'|',COALESCE(AccountId,''),'|',COALESCE(NormalizedCategory,''),'|',COALESCE(CAST(Amount AS STRING),''))";
+function verifyBalanceSheetSnapshotPartition_(snapshotDate, expectedRowCount, clientIds, snapshotType) {
+  const normalizedType = normalizeBalanceSnapshotType_(snapshotType || BALANCE_SNAPSHOT_TYPE_WEEKLY);
+  const keyExpression = "CONCAT(COALESCE(ClientId,''),'|',COALESCE(SnapshotType,'WEEKLY'),'|',COALESCE(CAST(SnapshotDate AS STRING),''),'|',COALESCE(LineType,''),'|',COALESCE(AccountPath,''),'|',COALESCE(AccountId,''),'|',COALESCE(NormalizedCategory,''),'|',COALESCE(CAST(Amount AS STRING),''))";
   const scopedClientIds = Array.from(new Set((clientIds || []).map(id => String(id || '').trim()).filter(Boolean)));
   const result = runBalanceBigQueryQuery_([
     'SELECT COUNT(*) AS row_count,',
@@ -1830,6 +1834,7 @@ function verifyBalanceSheetSnapshotPartition_(snapshotDate, expectedRowCount, cl
     'COUNT(DISTINCT ' + keyExpression + ') AS unique_key_count',
     'FROM `' + BALANCE_SNAPSHOT_TABLE + '`',
     "WHERE SnapshotDate = DATE '" + snapshotDate + "'",
+    "  AND COALESCE(SnapshotType, 'WEEKLY') = '" + normalizedType + "'",
     scopedClientIds.length ? '  AND ClientId IN (' + buildBalanceClientScopeSql_(scopedClientIds) + ')' : null
   ].filter(line => line !== null).join('\n'), BQ_CONFIG.snapshotsDatasetId);
   const values = result.rows && result.rows.length ? result.rows[0].f : [];
@@ -1839,7 +1844,9 @@ function verifyBalanceSheetSnapshotPartition_(snapshotDate, expectedRowCount, cl
   if (actualRowCount !== Number(expectedRowCount)) throw new Error('Balance Sheet partition row count mismatch. Expected=' + expectedRowCount + ', actual=' + actualRowCount);
   if (missingKeyCount !== 0) throw new Error('Balance Sheet partition contains missing identity fields. Missing=' + missingKeyCount);
   if (uniqueKeyCount !== actualRowCount) throw new Error('Balance Sheet partition contains duplicate row identities. Rows=' + actualRowCount + ', uniqueKeys=' + uniqueKeyCount);
-  return { status: 'passed', snapshotDate, partitionId: snapshotDate.replace(/-/g, ''), expectedRowCount: Number(expectedRowCount), actualRowCount, missingKeyCount, uniqueKeyCount };
+  return { status: 'passed', snapshotDate, snapshotType: normalizedType,
+    partitionId: snapshotDate.replace(/-/g, ''), expectedRowCount: Number(expectedRowCount),
+    actualRowCount, missingKeyCount, uniqueKeyCount };
 }
 
 function runBalanceBigQueryQuery_(query, datasetId) {

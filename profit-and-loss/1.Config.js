@@ -4,6 +4,8 @@
 
 const PNL_VARIANT_NORMAL = 'normal';
 const PNL_VARIANT_BY_CLASS = 'by_class';
+const PNL_SNAPSHOT_TYPE_WEEKLY = 'WEEKLY';
+const PNL_SNAPSHOT_TYPE_MONTHLY = 'MONTHLY';
 
 const PNL_LINE_TYPES = { header: 'Header', data: 'Data', summary: 'Summary' };
 const PNL_CLASS_COLUMN_ROLES = {
@@ -78,7 +80,8 @@ const PNL_COMMON_BIGQUERY_SCHEMA = [
 
 const PNL_NORMAL_BIGQUERY_SCHEMA = PNL_COMMON_BIGQUERY_SCHEMA.concat([
   { name: 'Amount', type: 'NUMERIC', mode: 'NULLABLE' },
-  { name: 'Source', type: 'STRING', mode: 'REQUIRED' }
+  { name: 'Source', type: 'STRING', mode: 'REQUIRED' },
+  { name: 'SnapshotType', type: 'STRING', mode: 'NULLABLE' }
 ]);
 
 const PNL_BY_CLASS_BIGQUERY_SCHEMA = PNL_COMMON_BIGQUERY_SCHEMA.concat([
@@ -89,7 +92,8 @@ const PNL_BY_CLASS_BIGQUERY_SCHEMA = PNL_COMMON_BIGQUERY_SCHEMA.concat([
   { name: 'IsClassSubtotal', type: 'BOOLEAN', mode: 'NULLABLE' },
   { name: 'IsGrandTotal', type: 'BOOLEAN', mode: 'NULLABLE' },
   { name: 'Amount', type: 'NUMERIC', mode: 'NULLABLE' },
-  { name: 'Source', type: 'STRING', mode: 'REQUIRED' }
+  { name: 'Source', type: 'STRING', mode: 'REQUIRED' },
+  { name: 'SnapshotType', type: 'STRING', mode: 'NULLABLE' }
 ]);
 
 const PNL_BIGQUERY_SCHEMAS = {
@@ -181,6 +185,7 @@ const PNL_CONNECTED_SHEETS_CONFIG = {
       reportKey: 'profit_and_loss',
       includeTokens: [
         'vw_profit_and_loss_reports',
+        'vw_monthly_profit_and_loss_reports',
         'vw_profit_and_loss_report_latest',
         'vw_latest_profit_and_loss_reports',
         'profit_and_loss_snapshots'
@@ -191,6 +196,7 @@ const PNL_CONNECTED_SHEETS_CONFIG = {
       reportKey: 'profit_and_loss_by_class',
       includeTokens: [
         'vw_profit_and_loss_by_class_reports',
+        'vw_monthly_profit_and_loss_by_class_reports',
         'vw_profit_and_loss_by_class_report_latest',
         'vw_latest_profit_and_loss_by_class_reports',
         'profit_and_loss_by_class_snapshots',

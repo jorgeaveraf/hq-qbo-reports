@@ -709,6 +709,7 @@ function getPreviousCompletedWeekRange_(referenceIsoDate) {
   const snapshotWeek = formatUtcDate_(dateFrom);
   const dateToIso = formatUtcDate_(dateTo);
   return {
+    snapshotType: PNL_SNAPSHOT_TYPE_WEEKLY,
     snapshotDate: snapshotDate, snapshotWeek: snapshotWeek, dateFrom: snapshotWeek, dateTo: dateToIso,
     periodKey: snapshotWeek + '|' + dateToIso
   };
@@ -1157,6 +1158,7 @@ function buildPnlCommonRow_(payload, client, range, variant, line, loadedAt) {
   const header = reportData.Header || {};
   return {
     idempotency_key: '', ReportType: PNL_CONFIG.reportType, ReportVariant: variant,
+    SnapshotType: normalizePnlSnapshotType_(range.snapshotType || PNL_SNAPSHOT_TYPE_WEEKLY),
     Entity: client.entityAlias, ClientName: client.name,
     ClientId: String(payload.client_id || client.id), RealmId: String(payload.realm_id || '') || null,
     Environment: String(payload.environment || PNL_CONFIG.environment),
@@ -1292,7 +1294,7 @@ function applyPnlIdempotencyKeys_(rows, variant) {
 
 function buildPnlIdempotencyKey_(row, variant) {
   const components = [
-    'qbo_pnl_snapshot', 'v2', row.Environment, row.ClientId, variant, row.SnapshotWeek,
+    'qbo_pnl_snapshot', 'v3', row.Environment, row.ClientId, variant, row.SnapshotType, row.SnapshotWeek,
     row.DateFrom, row.DateTo, row.AccountingMethod, row.RecordGroupKey,
     row.RecordGroupOrder, row.RecordType, row.RecordOrder, row.SourceRowOrder,
     row.LineType, row.RowPath, row.AccountId, row.AccountPath
@@ -1714,68 +1716,18 @@ function buildPnlBigQueryRows_(rows, variant) {
 }
 
 function replacePnlSnapshotPartition_(range, rows, variant) {
-  const contract = getPnlBigQueryContract_(variant);
-  const snapshotWeek = String(range && range.snapshotWeek || '').trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotWeek)) {
-    throw new Error('Invalid SnapshotWeek for P&L partition replacement. Variant=' +
-      contract.variant + ', SnapshotWeek=' + snapshotWeek);
-  }
-  if (!Array.isArray(rows)) throw new Error('P&L snapshot rows must be an array. Variant=' + contract.variant);
-  rows.forEach((row, index) => {
-    if (String(row.SnapshotWeek || '') !== snapshotWeek) {
-      throw new Error('P&L row belongs to another partition. Variant=' + contract.variant +
-        ', rowIndex=' + index + ', expected=' + snapshotWeek + ', actual=' + row.SnapshotWeek);
-    }
-    if (String(row.ReportVariant || '') !== contract.variant) {
-      throw new Error('Unexpected P&L ReportVariant. rowIndex=' + index + ', expected=' +
-        contract.variant + ', actual=' + row.ReportVariant);
-    }
-  });
-  if (!rows.length) return clearEmptyPnlPartition_(snapshotWeek, contract.variant);
-  const ndjson = buildPnlBigQueryRows_(rows, contract.variant).map(JSON.stringify).join('\n');
-  const partitionId = snapshotWeek.replace(/-/g, '');
-  const destinationTableId = contract.tableId + '$' + partitionId;
-  const jobId = ['pnl', contract.variant, partitionId, Date.now(),
-    Utilities.getUuid().replace(/-/g, '')].join('_');
-  const blob = Utilities.newBlob(ndjson, 'application/octet-stream',
-    'pnl_' + contract.variant + '_' + partitionId + '.ndjson');
-  const insertedJob = BigQuery.Jobs.insert({
-    jobReference: { projectId: BQ_CONFIG.projectId, jobId: jobId },
-    configuration: { load: {
-      destinationTable: {
-        projectId: BQ_CONFIG.projectId, datasetId: BQ_CONFIG.rawDatasetId, tableId: destinationTableId
-      },
-      sourceFormat: 'NEWLINE_DELIMITED_JSON', createDisposition: 'CREATE_NEVER',
-      writeDisposition: 'WRITE_TRUNCATE_DATA', autodetect: false,
-      ignoreUnknownValues: false, maxBadRecords: 0
-    } }
-  }, BQ_CONFIG.projectId, blob);
-  if (!insertedJob || !insertedJob.jobReference) {
-    throw new Error('BigQuery did not return a load job reference. Variant=' + contract.variant);
-  }
-  const completedJob = waitForPnlBigQueryJob_(insertedJob.jobReference, 120000);
-  const outputRows = completedJob.statistics && completedJob.statistics.load &&
-    completedJob.statistics.load.outputRows !== undefined
-    ? Number(completedJob.statistics.load.outputRows) : null;
-  if (outputRows !== null && outputRows !== rows.length) {
-    throw new Error('P&L load row count mismatch. Variant=' + contract.variant +
-      ', expected=' + rows.length + ', outputRows=' + outputRows);
-  }
-  return {
-    mode: 'partition_replace', variant: contract.variant, jobId: completedJob.jobReference.jobId,
-    destinationTable: [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, destinationTableId].join('.'),
-    snapshotWeek: snapshotWeek, partitionId: partitionId, rowCount: rows.length,
-    outputRows: outputRows, payloadBytes: blob.getBytes().length, state: completedJob.status.state
-  };
+  return replacePnlSnapshotScope_(range, rows, variant, null);
 }
 
-function clearEmptyPnlPartition_(snapshotWeek, variant) {
+function clearEmptyPnlPartition_(snapshotWeek, variant, snapshotType) {
   const contract = getPnlBigQueryContract_(variant);
+  const normalizedType = normalizePnlSnapshotType_(snapshotType || PNL_SNAPSHOT_TYPE_WEEKLY);
   const result = runPnlBigQueryQuery_('DELETE FROM `' + contract.tableName + '`\n' +
-    "WHERE SnapshotWeek = DATE '" + snapshotWeek + "'");
+    "WHERE SnapshotWeek = DATE '" + snapshotWeek + "'\n" +
+    "  AND COALESCE(SnapshotType, 'WEEKLY') = '" + normalizedType + "'");
   return {
     mode: 'empty_partition_clear', variant: contract.variant, jobId: result.jobReference.jobId,
-    destinationTable: contract.tableName, snapshotWeek: snapshotWeek,
+    destinationTable: contract.tableName, snapshotWeek: snapshotWeek, snapshotType: normalizedType,
     partitionId: snapshotWeek.replace(/-/g, ''), rowCount: 0, outputRows: 0, payloadBytes: 0, state: 'DONE'
   };
 }
@@ -1790,18 +1742,28 @@ function buildPnlClientScopeSql_(clientIds) {
   return ids.map(id => "'" + escapePnlBigQueryString_(id) + "'").join(', ');
 }
 
-function replacePnlSnapshotClients_(range, rows, variant, successfulClientIds) {
+function replacePnlSnapshotScope_(range, rows, variant, successfulClientIds) {
   const contract = getPnlBigQueryContract_(variant);
   const snapshotWeek = String(range && range.snapshotWeek || '').trim();
+  const snapshotType = normalizePnlSnapshotType_(range && range.snapshotType || PNL_SNAPSHOT_TYPE_WEEKLY);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotWeek)) throw new Error('Invalid P&L SnapshotWeek: ' + snapshotWeek);
-  const ids = Array.from(new Set((successfulClientIds || []).map(id => String(id || '').trim()).filter(Boolean)));
-  if (!ids.length) return { mode: 'client_scope_noop', variant: contract.variant, destinationTable: contract.tableName,
-    snapshotWeek: snapshotWeek, successfulClientCount: 0, rowCount: 0, state: 'SKIPPED' };
+  if (!Array.isArray(rows)) throw new Error('P&L snapshot rows must be an array. Variant=' + contract.variant);
+  const ids = successfulClientIds === null ? [] : Array.from(new Set(
+    (successfulClientIds || []).map(id => String(id || '').trim()).filter(Boolean)
+  ));
+  if (successfulClientIds !== null && !ids.length) return {
+    mode: 'client_scope_noop', variant: contract.variant, destinationTable: contract.tableName,
+    snapshotWeek: snapshotWeek, snapshotType: snapshotType, successfulClientCount: 0,
+    rowCount: 0, state: 'SKIPPED'
+  };
   const allowed = {};
   ids.forEach(id => { allowed[id] = true; });
   const prepared = buildPnlBigQueryRows_(rows, contract.variant).map((row, index) => {
-    if (String(row.SnapshotWeek || '') !== snapshotWeek || !allowed[String(row.ClientId || '')]) {
-      throw new Error('P&L row ' + index + ' is outside the successful client replacement scope.');
+    if (String(row.SnapshotWeek || '') !== snapshotWeek ||
+        normalizePnlSnapshotType_(row.SnapshotType) !== snapshotType ||
+        String(row.ReportVariant || '') !== contract.variant ||
+        (ids.length && !allowed[String(row.ClientId || '')])) {
+      throw new Error('P&L row ' + index + ' is outside the requested snapshot replacement scope.');
     }
     return row;
   });
@@ -1826,7 +1788,8 @@ function replacePnlSnapshotClients_(range, rows, variant, successfulClientIds) {
       'BEGIN TRANSACTION;',
       'DELETE FROM `' + contract.tableName + '`',
       "WHERE SnapshotWeek = DATE '" + snapshotWeek + "'",
-      '  AND ClientId IN (' + buildPnlClientScopeSql_(ids) + ');'
+      "  AND COALESCE(SnapshotType, 'WEEKLY') = '" + snapshotType + "'" +
+        (ids.length ? ' AND ClientId IN (' + buildPnlClientScopeSql_(ids) + ')' : '') + ';'
     ];
     if (prepared.length) {
       const columns = PNL_EXPORT_COLUMNS[contract.variant].map(column => '`' + column + '`').join(', ');
@@ -1835,10 +1798,12 @@ function replacePnlSnapshotClients_(range, rows, variant, successfulClientIds) {
     }
     statements.push('COMMIT TRANSACTION;');
     const queryResult = runPnlBigQueryQuery_(statements.join('\n'));
-    return { mode: 'successful_clients_replace', variant: contract.variant,
-      jobId: queryResult.jobReference && queryResult.jobReference.jobId || null,
-      destinationTable: contract.tableName, snapshotWeek: snapshotWeek, successfulClientCount: ids.length,
-      rowCount: prepared.length, state: 'DONE' };
+    return {
+      mode: ids.length ? 'successful_clients_replace' : 'snapshot_type_replace',
+      variant: contract.variant, jobId: queryResult.jobReference && queryResult.jobReference.jobId || null,
+      destinationTable: contract.tableName, snapshotWeek: snapshotWeek, snapshotType: snapshotType,
+      successfulClientCount: ids.length || null, rowCount: prepared.length, state: 'DONE'
+    };
   } finally {
     if (prepared.length) {
       try { BigQuery.Tables.remove(BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId); }
@@ -1847,8 +1812,13 @@ function replacePnlSnapshotClients_(range, rows, variant, successfulClientIds) {
   }
 }
 
-function verifyPnlSnapshotPartition_(snapshotWeek, expectedRowCount, variant, clientIds) {
+function replacePnlSnapshotClients_(range, rows, variant, successfulClientIds) {
+  return replacePnlSnapshotScope_(range, rows, variant, successfulClientIds);
+}
+
+function verifyPnlSnapshotPartition_(snapshotWeek, expectedRowCount, variant, clientIds, snapshotType) {
   const contract = getPnlBigQueryContract_(variant);
+  const normalizedType = normalizePnlSnapshotType_(snapshotType || PNL_SNAPSHOT_TYPE_WEEKLY);
   const expected = Number(expectedRowCount);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotWeek)) {
     throw new Error('Invalid SnapshotWeek for P&L verification: ' + snapshotWeek);
@@ -1881,6 +1851,7 @@ function verifyPnlSnapshotPartition_(snapshotWeek, expectedRowCount, variant, cl
     '  COUNTIF(RecordGroupOrder < 0 OR RecordOrder < 0 OR SourceRowOrder < 0) AS invalid_order_count,',
     '  ' + structureCheck,
     'FROM `' + contract.tableName + '`', "WHERE SnapshotWeek = DATE '" + snapshotWeek + "'",
+    "  AND COALESCE(SnapshotType, 'WEEKLY') = '" + normalizedType + "'",
     scopedClientIds.length ? '  AND ClientId IN (' + buildPnlClientScopeSql_(scopedClientIds) + ')' : null
   ].filter(line => line !== null).join('\n'));
   const values = result.rows && result.rows.length ? result.rows[0].f : [];
@@ -1894,7 +1865,7 @@ function verifyPnlSnapshotPartition_(snapshotWeek, expectedRowCount, variant, cl
   if (actual !== expected || missing || unique !== actual || invalidVariant ||
       invalidRecordType || invalidOrder || invalidStructure) {
     throw new Error('P&L partition verification failed. ' + JSON.stringify({
-      variant: contract.variant, snapshotWeek: snapshotWeek, expectedRowCount: expected,
+      variant: contract.variant, snapshotWeek: snapshotWeek, snapshotType: normalizedType, expectedRowCount: expected,
       actualRowCount: actual, missingKeyCount: missing, uniqueKeyCount: unique,
       invalidVariantCount: invalidVariant, invalidRecordTypeCount: invalidRecordType,
       invalidOrderCount: invalidOrder, invalidStructureCount: invalidStructure
@@ -1902,7 +1873,7 @@ function verifyPnlSnapshotPartition_(snapshotWeek, expectedRowCount, variant, cl
   }
   return {
     status: 'passed', variant: contract.variant, table: contract.tableName,
-    snapshotWeek: snapshotWeek, partitionId: snapshotWeek.replace(/-/g, ''),
+    snapshotWeek: snapshotWeek, snapshotType: normalizedType, partitionId: snapshotWeek.replace(/-/g, ''),
     expectedRowCount: expected, actualRowCount: actual, missingKeyCount: missing,
     uniqueKeyCount: unique, invalidVariantCount: invalidVariant,
     invalidRecordTypeCount: invalidRecordType, invalidOrderCount: invalidOrder,
@@ -1980,7 +1951,8 @@ function loadPnlVariantSnapshot_(snapshot) {
     : replacePnlSnapshotPartition_(snapshot.range, snapshot.rows, snapshot.variant);
   const verification = verifyPnlSnapshotPartition_(
     snapshot.range.snapshotWeek, snapshot.rowCount, snapshot.variant,
-    hasClientFailures ? snapshot.successfulClientIds : null
+    hasClientFailures ? snapshot.successfulClientIds : null,
+    snapshot.range.snapshotType
   );
   return {
     variant: snapshot.variant, rowCount: snapshot.rowCount, clientResults: snapshot.clientResults,
@@ -2088,7 +2060,7 @@ function snapshotProfitAndLossByClassToBigQuery() {
   return runProfitAndLossVariantSnapshot_(PNL_VARIANT_BY_CLASS);
 }
 
-function snapshotAllProfitAndLossReports() {
+function executeAllProfitAndLossReports_(range) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) throw new Error('Another P&L snapshot or deployment execution is already running.');
   const startedAt = new Date();
@@ -2098,7 +2070,7 @@ function snapshotAllProfitAndLossReports() {
       normal: validatePnlBigQuerySchema_(PNL_VARIANT_NORMAL),
       byClass: validatePnlBigQuerySchema_(PNL_VARIANT_BY_CLASS)
     };
-    const range = getPreviousCompletedWeekRange_();
+    if (!range || !range.snapshotType) throw new Error('A typed P&L snapshot range is required.');
     const loadedAt = new Date().toISOString();
     const sourceClients = fetchPnlSourceClients_();
     const normalSelection = resolvePnlEntitySelection_(PNL_VARIANT_NORMAL, sourceClients);
@@ -2153,4 +2125,16 @@ function snapshotAllProfitAndLossReports() {
   } finally {
     lock.releaseLock();
   }
+}
+
+function snapshotAllProfitAndLossReports() {
+  return executeAllProfitAndLossReports_(getPreviousCompletedWeekRange_());
+}
+
+function snapshotWeeklyProfitAndLossReports() {
+  return executeAllProfitAndLossReports_(getPreviousCompletedWeekRange_());
+}
+
+function snapshotMonthlyProfitAndLossReports() {
+  return executeAllProfitAndLossReports_(getPreviousCompletedMonthRange_());
 }

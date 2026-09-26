@@ -90,7 +90,9 @@ test('Profit and Loss continues after one client fails', () => {
 
 test('Balance Sheet rolls back only the failed client rows and continues', () => {
   const context = load('balance-sheet/3.Functions.js', {
-    BS_CONFIG: { currencyDefault: 'USD', sourceDefault: 'QBO' }
+    BS_CONFIG: { currencyDefault: 'USD', sourceDefault: 'QBO' },
+    BALANCE_SNAPSHOT_TYPE_WEEKLY: 'WEEKLY',
+    normalizeBalanceSnapshotType_: value => String(value || '').toUpperCase()
   });
   context.todayIsoDate_ = () => '2026-09-22';
   context.getWeekStartSunday_ = () => '2026-09-20';
