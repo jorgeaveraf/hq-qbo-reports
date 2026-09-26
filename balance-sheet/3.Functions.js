@@ -20,7 +20,42 @@ function updateBalanceSheetExport() {
   Logger.log('--- BALANCE SHEET EXPORT END ---');
   return summary;
 }
-function snapshotBalanceSheetToBigQuery() {
+const BS_RETIRE_INVOCING_SNAPSHOT_TRIGGER = true;
+
+function retireInvokingBalanceSheetSnapshotTrigger_(event) {
+  if (!BS_RETIRE_INVOCING_SNAPSHOT_TRIGGER || !event || event.triggerUid == null) return false;
+
+  const triggerUid = String(event.triggerUid);
+  const invokingTrigger = ScriptApp.getProjectTriggers().find(trigger => (
+    String(trigger.getUniqueId()) === triggerUid &&
+    trigger.getHandlerFunction() === 'snapshotBalanceSheetToBigQuery' &&
+    trigger.getTriggerSource() === ScriptApp.TriggerSource.CLOCK
+  ));
+
+  if (!invokingTrigger) {
+    Logger.log(JSON.stringify({
+      event: 'balance_sheet_snapshot_trigger_retirement_not_found',
+      triggerUid: triggerUid
+    }));
+    return false;
+  }
+
+  ScriptApp.deleteTrigger(invokingTrigger);
+  Logger.log(JSON.stringify({
+    event: 'balance_sheet_snapshot_trigger_retired',
+    triggerUid: triggerUid
+  }));
+  return true;
+}
+
+function snapshotBalanceSheetToBigQuery(event) {
+  if (retireInvokingBalanceSheetSnapshotTrigger_(event)) {
+    return {
+      event: 'balance_sheet_snapshot_trigger_retired',
+      triggerUid: String(event.triggerUid)
+    };
+  }
+
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) throw new Error('Another Balance Sheet snapshot or deployment is already running.');
   try {
