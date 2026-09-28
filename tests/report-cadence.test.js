@@ -67,8 +67,7 @@ function loadProject(files) {
 test('P&L weekly and monthly ranges use the agreed closed periods', () => {
   const context = loadProject([
     'profit-and-loss/1.Config.js',
-    'profit-and-loss/3.Functions.js',
-    'profit-and-loss/7.Cadence.js'
+    'profit-and-loss/3.Functions.js'
   ]);
   assert.deepEqual(JSON.parse(JSON.stringify(context.getPreviousCompletedWeekRange_('2026-09-21'))), {
     snapshotType: 'WEEKLY', snapshotDate: '2026-09-21', snapshotWeek: '2026-09-14',
@@ -87,8 +86,7 @@ test('P&L weekly and monthly ranges use the agreed closed periods', () => {
 test('Balance Sheet ranges align to the same Sunday and completed month as P&L', () => {
   const context = loadProject([
     'balance-sheet/1.Config.js',
-    'balance-sheet/3.Functions.js',
-    'balance-sheet/7.Cadence.js'
+    'balance-sheet/3.Functions.js'
   ]);
   assert.deepEqual(JSON.parse(JSON.stringify(context.getBalanceWeeklySnapshotRange_('2026-09-26'))), {
     snapshotType: 'WEEKLY', snapshotDate: '2026-09-21', snapshotWeek: '2026-09-14',
@@ -107,8 +105,7 @@ test('Balance Sheet ranges align to the same Sunday and completed month as P&L',
 test('existing snapshot handlers resolve weekly and monthly cadence from trigger UID', () => {
   const pnl = loadProject([
     'profit-and-loss/1.Config.js',
-    'profit-and-loss/3.Functions.js',
-    'profit-and-loss/7.Cadence.js'
+    'profit-and-loss/3.Functions.js'
   ]);
   pnl.__scriptProperties.QBO_PNL_CADENCE_TRIGGER_TYPES = JSON.stringify({ weeklyUid: 'WEEKLY', monthlyUid: 'MONTHLY' });
   assert.equal(pnl.resolvePnlSnapshotRange_({ triggerUid: 'weeklyUid' }, '2026-09-21').snapshotType, 'WEEKLY');
@@ -117,8 +114,7 @@ test('existing snapshot handlers resolve weekly and monthly cadence from trigger
 
   const balance = loadProject([
     'balance-sheet/1.Config.js',
-    'balance-sheet/3.Functions.js',
-    'balance-sheet/7.Cadence.js'
+    'balance-sheet/3.Functions.js'
   ]);
   balance.__scriptProperties.QBO_BALANCE_CADENCE_TRIGGER_TYPES = JSON.stringify({ weeklyUid: 'WEEKLY', monthlyUid: 'MONTHLY' });
   assert.equal(balance.resolveBalanceSnapshotRange_({ triggerUid: 'weeklyUid' }, '2026-09-21').snapshotType, 'WEEKLY');
@@ -129,8 +125,7 @@ test('existing snapshot handlers resolve weekly and monthly cadence from trigger
 test('cadence installers point both schedules to each existing snapshot handler', () => {
   const pnl = loadProject([
     'profit-and-loss/1.Config.js',
-    'profit-and-loss/3.Functions.js',
-    'profit-and-loss/7.Cadence.js'
+    'profit-and-loss/3.Functions.js'
   ]);
   const pnlInstall = JSON.parse(JSON.stringify(pnl.installPnlCadenceTriggers()));
   assert.equal(pnlInstall.handler, 'snapshotAllProfitAndLossReports');
@@ -143,8 +138,7 @@ test('cadence installers point both schedules to each existing snapshot handler'
 
   const balance = loadProject([
     'balance-sheet/1.Config.js',
-    'balance-sheet/3.Functions.js',
-    'balance-sheet/7.Cadence.js'
+    'balance-sheet/3.Functions.js'
   ]);
   const balanceInstall = JSON.parse(JSON.stringify(balance.installBalanceCadenceTriggers()));
   assert.equal(balanceInstall.handler, 'snapshotBalanceSheetToBigQuery');
@@ -159,8 +153,7 @@ test('cadence installers point both schedules to each existing snapshot handler'
 test('cadence deployments preserve weekly views and add monthly views', () => {
   const pnl = loadProject([
     'profit-and-loss/1.Config.js',
-    'profit-and-loss/3.Functions.js',
-    'profit-and-loss/7.Cadence.js'
+    'profit-and-loss/3.Functions.js'
   ]);
   const weeklyPnl = pnl.buildPnlReportViewSql_(
     'vw_profit_and_loss_reports', 'profit_and_loss_snapshots', 'WEEKLY', false, false
@@ -183,8 +176,7 @@ test('cadence deployments preserve weekly views and add monthly views', () => {
 
   const balance = loadProject([
     'balance-sheet/1.Config.js',
-    'balance-sheet/3.Functions.js',
-    'balance-sheet/7.Cadence.js'
+    'balance-sheet/3.Functions.js'
   ]);
   const weeklyBalance = balance.buildBalanceMetricsViewSql_(
     'vw_weekly_balance_sheet_metrics', 'WEEKLY', false
@@ -208,8 +200,7 @@ test('cadence deployments preserve weekly views and add monthly views', () => {
 test('Balance Sheet replacement is atomic and scoped by cadence', () => {
   const balance = loadProject([
     'balance-sheet/1.Config.js',
-    'balance-sheet/3.Functions.js',
-    'balance-sheet/7.Cadence.js'
+    'balance-sheet/3.Functions.js'
   ]);
   const sql = balance.buildBalanceAtomicReplaceSql_(
     'project.raw.balance_sheet_snapshots',
