@@ -1439,15 +1439,23 @@ function validateBalanceSheetBigQuerySchema_() {
   const auditPartitionType = String(
     auditTable.timePartitioning && auditTable.timePartitioning.type || ''
   ).toUpperCase();
+  const snapshotPartitionExpirationMs = Number(
+    snapshotTable.timePartitioning && snapshotTable.timePartitioning.expirationMs || 0
+  );
+  const auditPartitionExpirationMs = Number(
+    auditTable.timePartitioning && auditTable.timePartitioning.expirationMs || 0
+  );
 
   const snapshotMismatch =
     missingSnapshotColumns.length ||
     snapshotPartitionField !== BALANCE_BIGQUERY_PARTITION_FIELD ||
-    snapshotPartitionType !== 'DAY';
+    snapshotPartitionType !== 'DAY' ||
+    snapshotPartitionExpirationMs > 0;
   const auditMismatch =
     missingAuditColumns.length ||
     auditPartitionField !== BALANCE_BIGQUERY_PARTITION_FIELD ||
-    auditPartitionType !== 'DAY';
+    auditPartitionType !== 'DAY' ||
+    auditPartitionExpirationMs > 0;
 
   if (snapshotMismatch || auditMismatch) {
     throw new Error('Balance Sheet BigQuery schema mismatch: ' + JSON.stringify({
@@ -1458,7 +1466,9 @@ function validateBalanceSheetBigQuerySchema_() {
           expectedField: BALANCE_BIGQUERY_PARTITION_FIELD,
           expectedType: 'DAY',
           actualField: snapshotPartitionField,
-          actualType: snapshotPartitionType
+          actualType: snapshotPartitionType,
+          expectedExpirationMs: 0,
+          actualExpirationMs: snapshotPartitionExpirationMs
         }
       },
       audit: {
@@ -1468,7 +1478,9 @@ function validateBalanceSheetBigQuerySchema_() {
           expectedField: BALANCE_BIGQUERY_PARTITION_FIELD,
           expectedType: 'DAY',
           actualField: auditPartitionField,
-          actualType: auditPartitionType
+          actualType: auditPartitionType,
+          expectedExpirationMs: 0,
+          actualExpirationMs: auditPartitionExpirationMs
         }
       }
     }));
@@ -1482,13 +1494,15 @@ function validateBalanceSheetBigQuerySchema_() {
     actualColumnCount: actualSnapshotFields.length,
     partition: {
       field: snapshotPartitionField,
-      type: snapshotPartitionType
+      type: snapshotPartitionType,
+      expirationMs: snapshotPartitionExpirationMs
     },
     clustering: snapshotTable.clustering && snapshotTable.clustering.fields || [],
     auditColumnCount: actualAuditFields.length,
     auditPartition: {
       field: auditPartitionField,
-      type: auditPartitionType
+      type: auditPartitionType,
+      expirationMs: auditPartitionExpirationMs
     },
     auditClustering: auditTable.clustering && auditTable.clustering.fields || []
   };

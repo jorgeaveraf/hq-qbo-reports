@@ -127,18 +127,26 @@ function buildBalanceMetricsViewSql_(viewName, snapshotType, latestOnly) {
   ].join('\n');
 }
 
-function deployBalanceCadenceSchemaAndViews() {
+function buildBalanceCadenceSchemaStatements_() {
   const snapshotTable = BQ_CONFIG.projectId + '.' + BQ_CONFIG.snapshotsDatasetId + '.' + BQ_CONFIG.snapshotsTableId;
   const auditTable = BQ_CONFIG.projectId + '.' + BQ_CONFIG.auditDatasetId + '.' + BQ_CONFIG.auditTableId;
-  const statements = [
+  return [
     'ALTER TABLE `' + snapshotTable + '` ADD COLUMN IF NOT EXISTS SnapshotType STRING;',
     "UPDATE `" + snapshotTable + "` SET SnapshotType = 'WEEKLY' WHERE SnapshotType IS NULL;",
+    'ALTER TABLE `' + snapshotTable + '` SET OPTIONS (partition_expiration_days = NULL);',
     'ALTER TABLE `' + auditTable + '` ADD COLUMN IF NOT EXISTS SnapshotType STRING;',
     "UPDATE `" + auditTable + "` SET SnapshotType = 'WEEKLY' WHERE SnapshotType IS NULL;",
+    'ALTER TABLE `' + auditTable + '` SET OPTIONS (partition_expiration_days = NULL);',
     buildBalanceMetricsViewSql_('vw_weekly_balance_sheet_metrics', BALANCE_SNAPSHOT_TYPE_WEEKLY, false) + ';',
     buildBalanceMetricsViewSql_('vw_latest_balance_sheet_metrics', BALANCE_SNAPSHOT_TYPE_WEEKLY, true) + ';',
     buildBalanceMetricsViewSql_('vw_monthly_balance_sheet_metrics', BALANCE_SNAPSHOT_TYPE_MONTHLY, false) + ';'
   ];
+}
+
+function deployBalanceCadenceSchemaAndViews() {
+  const snapshotTable = BQ_CONFIG.projectId + '.' + BQ_CONFIG.snapshotsDatasetId + '.' + BQ_CONFIG.snapshotsTableId;
+  const auditTable = BQ_CONFIG.projectId + '.' + BQ_CONFIG.auditDatasetId + '.' + BQ_CONFIG.auditTableId;
+  const statements = buildBalanceCadenceSchemaStatements_();
   const result = runBalanceBigQueryQuery_(statements.join('\n'), BQ_CONFIG.snapshotsDatasetId);
   return { event: 'balance_cadence_schema_and_views_deployed', jobId: result.jobReference.jobId,
     snapshotTable: snapshotTable, auditTable: auditTable, viewCount: 3 };
