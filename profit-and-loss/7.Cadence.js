@@ -3,8 +3,9 @@
  ***********************/
 
 const PNL_CADENCE = {
-  weeklyHandler: 'snapshotWeeklyProfitAndLossReports',
-  monthlyHandler: 'snapshotMonthlyProfitAndLossReports',
+  snapshotHandler: 'snapshotAllProfitAndLossReports',
+  legacyHandlers: ['snapshotWeeklyProfitAndLossReports', 'snapshotMonthlyProfitAndLossReports'],
+  triggerTypesProperty: 'QBO_PNL_CADENCE_TRIGGER_TYPES',
   backfillHandler: 'processPnlMonthlyCadenceBackfill2026',
   backfillStateProperty: 'QBO_PNL_MONTHLY_CADENCE_BACKFILL_2026',
   weeklyHour: 1,
@@ -66,6 +67,17 @@ function buildPnlMonthlyBackfillRanges2026_(referenceIsoDate) {
   return ranges;
 }
 
+function resolvePnlSnapshotRange_(event, referenceIsoDate) {
+  if (!event || event.triggerUid == null) return getPreviousCompletedWeekRange_(referenceIsoDate);
+  const triggerUid = String(event.triggerUid);
+  const serialized = PropertiesService.getScriptProperties().getProperty(PNL_CADENCE.triggerTypesProperty);
+  const triggerTypes = JSON.parse(serialized || '{}');
+  const snapshotType = normalizePnlSnapshotType_(triggerTypes[triggerUid]);
+  return snapshotType === PNL_SNAPSHOT_TYPE_MONTHLY
+    ? getPreviousCompletedMonthRange_(referenceIsoDate)
+    : getPreviousCompletedWeekRange_(referenceIsoDate);
+}
+
 function buildPnlReportViewSql_(viewName, tableId, snapshotType, byClass, latestOnly) {
   // Keep the pre-cadence view contract intact for Connected Sheets. The new
   // discriminator is appended so existing column positions do not move.
@@ -120,21 +132,40 @@ function deployPnlCadenceSchemaAndViews() {
 }
 
 function deletePnlCadenceTriggers_() {
-  const handlers = [PNL_CADENCE.weeklyHandler, PNL_CADENCE.monthlyHandler, 'snapshotAllProfitAndLossReports'];
+  const handlers = [PNL_CADENCE.snapshotHandler].concat(PNL_CADENCE.legacyHandlers);
   const triggers = ScriptApp.getProjectTriggers().filter(trigger =>
     handlers.indexOf(trigger.getHandlerFunction()) !== -1
   );
   triggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));
+  PropertiesService.getScriptProperties().deleteProperty(PNL_CADENCE.triggerTypesProperty);
   return triggers.length;
 }
 
 function installPnlCadenceTriggers() {
   const deletedCount = deletePnlCadenceTriggers_();
-  const weekly = ScriptApp.newTrigger(PNL_CADENCE.weeklyHandler).timeBased()
-    .onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(PNL_CADENCE.weeklyHour).create();
-  const monthly = ScriptApp.newTrigger(PNL_CADENCE.monthlyHandler).timeBased()
-    .onMonthDay(PNL_CADENCE.monthlyDay).atHour(PNL_CADENCE.monthlyHour).create();
+  const created = [];
+  let weekly;
+  let monthly;
+  try {
+    weekly = ScriptApp.newTrigger(PNL_CADENCE.snapshotHandler).timeBased()
+      .onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(PNL_CADENCE.weeklyHour).create();
+    created.push(weekly);
+    monthly = ScriptApp.newTrigger(PNL_CADENCE.snapshotHandler).timeBased()
+      .onMonthDay(PNL_CADENCE.monthlyDay).atHour(PNL_CADENCE.monthlyHour).create();
+    created.push(monthly);
+    const triggerTypes = {};
+    triggerTypes[String(weekly.getUniqueId())] = PNL_SNAPSHOT_TYPE_WEEKLY;
+    triggerTypes[String(monthly.getUniqueId())] = PNL_SNAPSHOT_TYPE_MONTHLY;
+    PropertiesService.getScriptProperties().setProperty(
+      PNL_CADENCE.triggerTypesProperty, JSON.stringify(triggerTypes)
+    );
+  } catch (error) {
+    created.forEach(trigger => ScriptApp.deleteTrigger(trigger));
+    PropertiesService.getScriptProperties().deleteProperty(PNL_CADENCE.triggerTypesProperty);
+    throw error;
+  }
   return { event: 'pnl_cadence_triggers_installed', deletedCount: deletedCount,
+    handler: PNL_CADENCE.snapshotHandler,
     weeklyTriggerId: weekly.getUniqueId(), monthlyTriggerId: monthly.getUniqueId() };
 }
 

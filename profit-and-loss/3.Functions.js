@@ -2127,14 +2127,6 @@ function executeAllProfitAndLossReports_(range) {
   }
 }
 
-function snapshotAllProfitAndLossReports() {
-  return executeAllProfitAndLossReports_(getPreviousCompletedWeekRange_());
-}
-
-function snapshotWeeklyProfitAndLossReports() {
-  return executeAllProfitAndLossReports_(getPreviousCompletedWeekRange_());
-}
-
-function snapshotMonthlyProfitAndLossReports() {
-  return executeAllProfitAndLossReports_(getPreviousCompletedMonthRange_());
+function snapshotAllProfitAndLossReports(event) {
+  return executeAllProfitAndLossReports_(resolvePnlSnapshotRange_(event));
 }

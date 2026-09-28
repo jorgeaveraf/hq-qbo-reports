@@ -3,8 +3,9 @@
  ***********************/
 
 const BALANCE_CADENCE = {
-  weeklyHandler: 'snapshotWeeklyBalanceSheetToBigQuery',
-  monthlyHandler: 'snapshotMonthlyBalanceSheetToBigQuery',
+  snapshotHandler: 'snapshotBalanceSheetToBigQuery',
+  legacyHandlers: ['snapshotWeeklyBalanceSheetToBigQuery', 'snapshotMonthlyBalanceSheetToBigQuery'],
+  triggerTypesProperty: 'QBO_BALANCE_CADENCE_TRIGGER_TYPES',
   backfillHandler: 'processBalanceMonthlyCadenceBackfill2026',
   backfillStateProperty: 'QBO_BALANCE_MONTHLY_CADENCE_BACKFILL_2026',
   weeklyHour: 3,
@@ -81,12 +82,15 @@ function runBalanceSnapshotRange_(range) {
   }
 }
 
-function snapshotWeeklyBalanceSheetToBigQuery() {
-  return runBalanceSnapshotRange_(getBalanceWeeklySnapshotRange_());
-}
-
-function snapshotMonthlyBalanceSheetToBigQuery() {
-  return runBalanceSnapshotRange_(getBalanceMonthlySnapshotRange_());
+function resolveBalanceSnapshotRange_(event, referenceIsoDate) {
+  if (!event || event.triggerUid == null) return getBalanceWeeklySnapshotRange_(referenceIsoDate);
+  const triggerUid = String(event.triggerUid);
+  const serialized = PropertiesService.getScriptProperties().getProperty(BALANCE_CADENCE.triggerTypesProperty);
+  const triggerTypes = JSON.parse(serialized || '{}');
+  const snapshotType = normalizeBalanceSnapshotType_(triggerTypes[triggerUid]);
+  return snapshotType === BALANCE_SNAPSHOT_TYPE_MONTHLY
+    ? getBalanceMonthlySnapshotRange_(referenceIsoDate)
+    : getBalanceWeeklySnapshotRange_(referenceIsoDate);
 }
 
 function buildBalanceMetricsViewSql_(viewName, snapshotType, latestOnly) {
@@ -141,21 +145,40 @@ function deployBalanceCadenceSchemaAndViews() {
 }
 
 function deleteBalanceCadenceTriggers_() {
-  const handlers = [BALANCE_CADENCE.weeklyHandler, BALANCE_CADENCE.monthlyHandler];
+  const handlers = [BALANCE_CADENCE.snapshotHandler].concat(BALANCE_CADENCE.legacyHandlers);
   const triggers = ScriptApp.getProjectTriggers().filter(trigger =>
     handlers.indexOf(trigger.getHandlerFunction()) !== -1
   );
   triggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));
+  PropertiesService.getScriptProperties().deleteProperty(BALANCE_CADENCE.triggerTypesProperty);
   return triggers.length;
 }
 
 function installBalanceCadenceTriggers() {
   const deletedCount = deleteBalanceCadenceTriggers_();
-  const weekly = ScriptApp.newTrigger(BALANCE_CADENCE.weeklyHandler).timeBased()
-    .onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(BALANCE_CADENCE.weeklyHour).create();
-  const monthly = ScriptApp.newTrigger(BALANCE_CADENCE.monthlyHandler).timeBased()
-    .onMonthDay(BALANCE_CADENCE.monthlyDay).atHour(BALANCE_CADENCE.monthlyHour).create();
+  const created = [];
+  let weekly;
+  let monthly;
+  try {
+    weekly = ScriptApp.newTrigger(BALANCE_CADENCE.snapshotHandler).timeBased()
+      .onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(BALANCE_CADENCE.weeklyHour).create();
+    created.push(weekly);
+    monthly = ScriptApp.newTrigger(BALANCE_CADENCE.snapshotHandler).timeBased()
+      .onMonthDay(BALANCE_CADENCE.monthlyDay).atHour(BALANCE_CADENCE.monthlyHour).create();
+    created.push(monthly);
+    const triggerTypes = {};
+    triggerTypes[String(weekly.getUniqueId())] = BALANCE_SNAPSHOT_TYPE_WEEKLY;
+    triggerTypes[String(monthly.getUniqueId())] = BALANCE_SNAPSHOT_TYPE_MONTHLY;
+    PropertiesService.getScriptProperties().setProperty(
+      BALANCE_CADENCE.triggerTypesProperty, JSON.stringify(triggerTypes)
+    );
+  } catch (error) {
+    created.forEach(trigger => ScriptApp.deleteTrigger(trigger));
+    PropertiesService.getScriptProperties().deleteProperty(BALANCE_CADENCE.triggerTypesProperty);
+    throw error;
+  }
   return { event: 'balance_cadence_triggers_installed', deletedCount: deletedCount,
+    handler: BALANCE_CADENCE.snapshotHandler,
     weeklyTriggerId: weekly.getUniqueId(), monthlyTriggerId: monthly.getUniqueId() };
 }
 

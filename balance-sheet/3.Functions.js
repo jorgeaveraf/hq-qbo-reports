@@ -20,62 +20,8 @@ function updateBalanceSheetExport() {
   Logger.log('--- BALANCE SHEET EXPORT END ---');
   return summary;
 }
-const BS_RETIRE_INVOCING_SNAPSHOT_TRIGGER = true;
-
-function retireInvokingBalanceSheetSnapshotTrigger_(event) {
-  if (!BS_RETIRE_INVOCING_SNAPSHOT_TRIGGER || !event || event.triggerUid == null) return false;
-
-  const triggerUid = String(event.triggerUid);
-  const invokingTrigger = ScriptApp.getProjectTriggers().find(trigger => (
-    String(trigger.getUniqueId()) === triggerUid &&
-    trigger.getHandlerFunction() === 'snapshotBalanceSheetToBigQuery' &&
-    trigger.getTriggerSource() === ScriptApp.TriggerSource.CLOCK
-  ));
-
-  if (!invokingTrigger) {
-    Logger.log(JSON.stringify({
-      event: 'balance_sheet_snapshot_trigger_retirement_not_found',
-      triggerUid: triggerUid
-    }));
-    return false;
-  }
-
-  ScriptApp.deleteTrigger(invokingTrigger);
-  Logger.log(JSON.stringify({
-    event: 'balance_sheet_snapshot_trigger_retired',
-    triggerUid: triggerUid
-  }));
-  return true;
-}
-
 function snapshotBalanceSheetToBigQuery(event) {
-  if (retireInvokingBalanceSheetSnapshotTrigger_(event)) {
-    return {
-      event: 'balance_sheet_snapshot_trigger_retired',
-      triggerUid: String(event.triggerUid)
-    };
-  }
-
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(5000)) throw new Error('Another Balance Sheet snapshot or deployment is already running.');
-  try {
-    Logger.log('--- BALANCE SHEET BQ SNAPSHOT START ---');
-    const result = executeBalanceSheetBigQuerySnapshot_();
-    Logger.log(JSON.stringify({
-      event: 'balance_sheet_snapshot_completed',
-      entityConfiguration: result.entityConfiguration,
-      schemaValidation: result.schemaValidation,
-      clientCount: result.clientCount,
-      rawRowCount: result.rawRowCount,
-      lineRowCount: result.lineRowCount,
-      loadResult: result.loadResult,
-      verification: result.verification
-    }, null, 2));
-    Logger.log('--- BALANCE SHEET BQ SNAPSHOT END ---');
-    return result;
-  } finally {
-    lock.releaseLock();
-  }
+  return runBalanceSnapshotRange_(resolveBalanceSnapshotRange_(event));
 }
 function buildBalanceSheetSnapshot_(loadedEntityConfigurationOverride, options) {
   const settings = options || {};
@@ -1582,6 +1528,26 @@ function loadBalanceRowsToStaging_(datasetId, sourceTableId, stagingTableId, row
   return waitForBalanceBigQueryJob_(inserted.jobReference, 120000, datasetId);
 }
 
+function buildBalanceAtomicReplaceSql_(targetTable, stagingTable, columns, snapshotDate,
+    snapshotType, clientScope) {
+  const quotedColumns = columns.map(column => '`' + column + '`');
+  const deleteScope = [
+    "T.SnapshotDate = DATE '" + snapshotDate + "'",
+    "COALESCE(T.SnapshotType, 'WEEKLY') = '" + snapshotType + "'"
+  ];
+  if (clientScope) deleteScope.push('T.ClientId IN (' + clientScope + ')');
+  return [
+    'MERGE `' + targetTable + '` AS T',
+    'USING `' + stagingTable + '` AS S',
+    'ON FALSE',
+    'WHEN NOT MATCHED BY SOURCE AND ' + deleteScope.join(' AND '),
+    'THEN DELETE',
+    'WHEN NOT MATCHED THEN',
+    '  INSERT (' + quotedColumns.join(', ') + ')',
+    '  VALUES (' + quotedColumns.map(column => 'S.' + column).join(', ') + ')'
+  ].join('\n');
+}
+
 function replaceBalanceSheetSnapshotScope_(snapshot, successfulClientIds) {
   const snapshotDate = String(snapshot && snapshot.snapshotDate || '').trim();
   const snapshotType = normalizeBalanceSnapshotType_(snapshot && snapshot.snapshotType || BALANCE_SNAPSHOT_TYPE_WEEKLY);
@@ -1619,31 +1585,16 @@ function replaceBalanceSheetSnapshotScope_(snapshot, successfulClientIds) {
     loadBalanceRowsToStaging_(BQ_CONFIG.auditDatasetId, BQ_CONFIG.auditTableId,
       auditStage, snapshot.rawRows, 'balance_audit_stage');
     const clientScope = ids.length ? buildBalanceClientScopeSql_(ids) : null;
-    const statements = [
-      'BEGIN TRANSACTION;',
-      'DELETE FROM `' + BALANCE_SNAPSHOT_TABLE + '`',
-      "WHERE SnapshotDate = DATE '" + snapshotDate + "'" +
-        " AND COALESCE(SnapshotType, 'WEEKLY') = '" + snapshotType + "'" +
-        (clientScope ? ' AND ClientId IN (' + clientScope + ')' : '') + ';',
-      'DELETE FROM `' + BALANCE_AUDIT_TABLE + '`',
-      "WHERE SnapshotDate = DATE '" + snapshotDate + "'" +
-        " AND COALESCE(SnapshotType, 'WEEKLY') = '" + snapshotType + "'" +
-        (clientScope ? ' AND ClientId IN (' + clientScope + ')' : '') + ';'
-    ];
-    if (snapshot.lineRows.length) {
-      const columns = BS_EXPORT_COLUMNS.map(column => '`' + column + '`').join(', ');
-      statements.push('INSERT INTO `' + BALANCE_SNAPSHOT_TABLE + '` (' + columns + ')', 'SELECT ' + columns,
-        'FROM `' + [BQ_CONFIG.projectId, BQ_CONFIG.snapshotsDatasetId, snapshotStage].join('.') + '`;');
-    }
-    if (snapshot.rawRows.length) {
-      const columns = auditColumns.map(column => '`' + column + '`').join(', ');
-      statements.push('INSERT INTO `' + BALANCE_AUDIT_TABLE + '` (' + columns + ')', 'SELECT ' + columns,
-        'FROM `' + [BQ_CONFIG.projectId, BQ_CONFIG.auditDatasetId, auditStage].join('.') + '`;');
-    }
-    statements.push('COMMIT TRANSACTION;');
-    const queryResult = runBalanceBigQueryQuery_(statements.join('\n'), BQ_CONFIG.snapshotsDatasetId);
+    const snapshotStageTable = [BQ_CONFIG.projectId, BQ_CONFIG.snapshotsDatasetId, snapshotStage].join('.');
+    const auditStageTable = [BQ_CONFIG.projectId, BQ_CONFIG.auditDatasetId, auditStage].join('.');
+    const snapshotResult = runBalanceBigQueryQuery_(buildBalanceAtomicReplaceSql_(
+      BALANCE_SNAPSHOT_TABLE, snapshotStageTable, BS_EXPORT_COLUMNS, snapshotDate, snapshotType, clientScope
+    ), BQ_CONFIG.snapshotsDatasetId);
+    const auditResult = runBalanceBigQueryQuery_(buildBalanceAtomicReplaceSql_(
+      BALANCE_AUDIT_TABLE, auditStageTable, auditColumns, snapshotDate, snapshotType, clientScope
+    ), BQ_CONFIG.auditDatasetId);
     return { mode: ids.length ? 'successful_clients_replace' : 'snapshot_type_replace',
-      jobId: queryResult.jobReference.jobId,
+      jobId: snapshotResult.jobReference.jobId, auditJobId: auditResult.jobReference.jobId,
       snapshotDate: snapshotDate, snapshotType: snapshotType, successfulClientCount: ids.length || null,
       lineRowCount: snapshot.lineRows.length, auditRowCount: snapshot.rawRows.length, state: 'DONE' };
   } finally {
