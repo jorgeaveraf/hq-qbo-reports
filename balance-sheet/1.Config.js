@@ -4,6 +4,7 @@
 
 const BS_EXPORT_COLUMNS = [
   'ReportType',
+  'SnapshotType',
   'Entity',
   'ClientName',
   'ClientId',
@@ -28,6 +29,9 @@ const BS_EXPORT_COLUMNS = [
   'Currency',
   'Source'
 ];
+
+const BALANCE_SNAPSHOT_TYPE_WEEKLY = 'WEEKLY';
+const BALANCE_SNAPSHOT_TYPE_MONTHLY = 'MONTHLY';
 
 const BS_CONFIG = {
   baseUrl: 'https://qbo.headquarters.co',
