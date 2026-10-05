@@ -207,6 +207,8 @@ test('Balance Sheet replacement is atomic and scoped by cadence', () => {
     'project.raw.balance_sheet_snapshot_stage',
     ['SnapshotDate', 'SnapshotType', 'ClientId', 'Amount'],
     '2026-02-10',
+    '2026-02-02',
+    '2026-02-08',
     'MONTHLY',
     "'client-a', 'client-b'"
   );
@@ -214,6 +216,8 @@ test('Balance Sheet replacement is atomic and scoped by cadence', () => {
   assert.match(sql, /USING `project\.raw\.balance_sheet_snapshot_stage` AS S/);
   assert.match(sql, /ON FALSE/);
   assert.match(sql, /T\.SnapshotDate = DATE '2026-02-10'/);
+  assert.match(sql, /T\.SnapshotWeek = DATE '2026-02-02'/);
+  assert.match(sql, /T\.AsOfDate = DATE '2026-02-08'/);
   assert.match(sql, /COALESCE\(T\.SnapshotType, 'WEEKLY'\) = 'MONTHLY'/);
   assert.match(sql, /T\.ClientId IN \('client-a', 'client-b'\)/);
   assert.match(sql, /THEN DELETE/);

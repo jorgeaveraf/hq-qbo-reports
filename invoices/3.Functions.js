@@ -2198,7 +2198,11 @@ function buildInvoiceSnapshot_(loadedEntityConfigurationOverride, options) {
     configuration: validatedConfiguration
   };
   const clientsById = fetchClients_(effectiveConfiguration);
-  const clients = Object.keys(clientsById).map(clientId => clientsById[clientId]).sort((a, b) => {
+  const requestedClientIds = Array.from(new Set((settings.clientIds || []).map(String)));
+  const requested = {}; requestedClientIds.forEach(id => { requested[id] = true; });
+  const clients = Object.keys(clientsById)
+    .filter(clientId => !requestedClientIds.length || requested[clientId])
+    .map(clientId => clientsById[clientId]).sort((a, b) => {
     const entityDiff = String(a.entityAlias).localeCompare(String(b.entityAlias));
     return entityDiff || String(a.name).localeCompare(String(b.name));
   });
@@ -2652,17 +2656,19 @@ function executeInvoiceBigQuerySnapshot_(loadedEntityConfiguration, options) {
   const settings = options || {};
   const result = buildInvoiceSnapshot_(loadedEntityConfiguration, {
     continueOnClientError: true,
-    range: settings.range || null
+    range: settings.range || null,
+    clientIds: settings.clientIds || null
   });
   const hasClientFailures = result.clientFailures.length > 0;
+  const useClientScope = (settings.clientIds || []).length > 0 || hasClientFailures;
   const hierarchyValidation = validateInvoiceSnapshotHierarchy_(result.lineRows);
-  const loadResult = hasClientFailures
+  const loadResult = useClientScope
     ? replaceInvoiceSnapshotClients_(result.range, result.lineRows, result.successfulClientIds)
     : replaceInvoiceSnapshotPartition_(result.range, result.lineRows);
   const verification = verifyInvoiceSnapshotPartition_(
     result.range.snapshotWeek,
     hierarchyValidation,
-    hasClientFailures ? result.successfulClientIds : null
+    useClientScope ? result.successfulClientIds : null
   );
   const baselinePersistence = persistInvoiceSchemaBaselineUpdates_(
     result.schemaBaselineUpdates
@@ -2688,7 +2694,7 @@ function executeInvoiceBigQuerySnapshot_(loadedEntityConfiguration, options) {
 
   Logger.log(JSON.stringify(executionResult, null, 2));
   Logger.log('--- INVOICE BIGQUERY SNAPSHOT END ---');
-  if (hasClientFailures) {
+  if (hasClientFailures && settings.returnPartialResult !== true) {
     throw new Error('Invoice snapshot loaded successful entities but completed with entity errors: ' +
       JSON.stringify({
         snapshotWeek: result.range.snapshotWeek,

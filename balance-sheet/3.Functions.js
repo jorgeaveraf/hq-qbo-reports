@@ -1543,10 +1543,12 @@ function loadBalanceRowsToStaging_(datasetId, sourceTableId, stagingTableId, row
 }
 
 function buildBalanceAtomicReplaceSql_(targetTable, stagingTable, columns, snapshotDate,
-    snapshotType, clientScope) {
+    snapshotWeek, asOfDate, snapshotType, clientScope) {
   const quotedColumns = columns.map(column => '`' + column + '`');
   const deleteScope = [
     "T.SnapshotDate = DATE '" + snapshotDate + "'",
+    "T.SnapshotWeek = DATE '" + snapshotWeek + "'",
+    "T.AsOfDate = DATE '" + asOfDate + "'",
     "COALESCE(T.SnapshotType, 'WEEKLY') = '" + snapshotType + "'"
   ];
   if (clientScope) deleteScope.push('T.ClientId IN (' + clientScope + ')');
@@ -1564,8 +1566,12 @@ function buildBalanceAtomicReplaceSql_(targetTable, stagingTable, columns, snaps
 
 function replaceBalanceSheetSnapshotScope_(snapshot, successfulClientIds) {
   const snapshotDate = String(snapshot && snapshot.snapshotDate || '').trim();
+  const snapshotWeek = String(snapshot && snapshot.snapshotWeek || '').trim();
+  const asOfDate = String(snapshot && snapshot.requestedAsOfDate || '').trim();
   const snapshotType = normalizeBalanceSnapshotType_(snapshot && snapshot.snapshotType || BALANCE_SNAPSHOT_TYPE_WEEKLY);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotDate)) throw new Error('Invalid Balance Sheet SnapshotDate: ' + snapshotDate);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotWeek)) throw new Error('Invalid Balance Sheet SnapshotWeek: ' + snapshotWeek);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(asOfDate)) throw new Error('Invalid Balance Sheet AsOfDate: ' + asOfDate);
   const ids = successfulClientIds === null ? [] : Array.from(new Set(
     (successfulClientIds || []).map(id => String(id || '').trim()).filter(Boolean)
   ));
@@ -1576,6 +1582,8 @@ function replaceBalanceSheetSnapshotScope_(snapshot, successfulClientIds) {
   ids.forEach(id => { allowed[id] = true; });
   snapshot.lineRows.forEach((row, index) => {
     if (String(row.SnapshotDate || '') !== snapshotDate ||
+        String(row.SnapshotWeek || '') !== snapshotWeek ||
+        String(row.AsOfDate || '') !== asOfDate ||
         normalizeBalanceSnapshotType_(row.SnapshotType) !== snapshotType ||
         (ids.length && !allowed[String(row.ClientId || '')])) {
       throw new Error('Balance Sheet line row ' + index + ' is outside the requested snapshot replacement scope.');
@@ -1583,6 +1591,8 @@ function replaceBalanceSheetSnapshotScope_(snapshot, successfulClientIds) {
   });
   snapshot.rawRows.forEach((row, index) => {
     if (String(row.SnapshotDate || '') !== snapshotDate ||
+        String(row.SnapshotWeek || '') !== snapshotWeek ||
+        String(row.AsOfDate || '') !== asOfDate ||
         normalizeBalanceSnapshotType_(row.SnapshotType) !== snapshotType ||
         (ids.length && !allowed[String(row.ClientId || '')])) {
       throw new Error('Balance Sheet audit row ' + index + ' is outside the requested snapshot replacement scope.');
@@ -1602,10 +1612,12 @@ function replaceBalanceSheetSnapshotScope_(snapshot, successfulClientIds) {
     const snapshotStageTable = [BQ_CONFIG.projectId, BQ_CONFIG.snapshotsDatasetId, snapshotStage].join('.');
     const auditStageTable = [BQ_CONFIG.projectId, BQ_CONFIG.auditDatasetId, auditStage].join('.');
     const snapshotResult = runBalanceBigQueryQuery_(buildBalanceAtomicReplaceSql_(
-      BALANCE_SNAPSHOT_TABLE, snapshotStageTable, BS_EXPORT_COLUMNS, snapshotDate, snapshotType, clientScope
+      BALANCE_SNAPSHOT_TABLE, snapshotStageTable, BS_EXPORT_COLUMNS, snapshotDate,
+      snapshotWeek, asOfDate, snapshotType, clientScope
     ), BQ_CONFIG.snapshotsDatasetId);
     const auditResult = runBalanceBigQueryQuery_(buildBalanceAtomicReplaceSql_(
-      BALANCE_AUDIT_TABLE, auditStageTable, auditColumns, snapshotDate, snapshotType, clientScope
+      BALANCE_AUDIT_TABLE, auditStageTable, auditColumns, snapshotDate,
+      snapshotWeek, asOfDate, snapshotType, clientScope
     ), BQ_CONFIG.auditDatasetId);
     return { mode: ids.length ? 'successful_clients_replace' : 'snapshot_type_replace',
       jobId: snapshotResult.jobReference.jobId, auditJobId: auditResult.jobReference.jobId,
@@ -1941,6 +1953,11 @@ function resolveBalanceSnapshotRange_(event, referenceIsoDate) {
 
 function buildBalanceMetricsViewSql_(viewName, snapshotType, latestOnly) {
   const source = BQ_CONFIG.projectId + '.' + BQ_CONFIG.snapshotsDatasetId + '.' + BQ_CONFIG.snapshotsTableId;
+  const canonicalWeeklyPredicates = snapshotType === BALANCE_SNAPSHOT_TYPE_WEEKLY ? [
+    '    AND EXTRACT(DAYOFWEEK FROM SnapshotWeek) = 2',
+    '    AND SnapshotDate = DATE_ADD(SnapshotWeek, INTERVAL 7 DAY)',
+    '    AND AsOfDate = DATE_ADD(SnapshotWeek, INTERVAL 6 DAY)'
+  ] : [];
   if (latestOnly) {
     return [
       'CREATE OR REPLACE VIEW `' + BQ_CONFIG.projectId + '.views.' + viewName + '` AS',
@@ -1952,6 +1969,7 @@ function buildBalanceMetricsViewSql_(viewName, snapshotType, latestOnly) {
       '  FROM `' + source + '`',
       '  WHERE IsKeyMetric = TRUE',
       "    AND COALESCE(SnapshotType, 'WEEKLY') = '" + snapshotType + "'",
+      ...canonicalWeeklyPredicates,
       ')',
       'SELECT SnapshotWeek, SnapshotDate, Entity, ClientName, ClientId, AsOfDate,',
       '  MetricName, NormalizedCategory, AccountName, AccountPath, Amount, Currency, Source, LoadedAt,',
@@ -1969,6 +1987,7 @@ function buildBalanceMetricsViewSql_(viewName, snapshotType, latestOnly) {
     'FROM `' + source + '`',
     'WHERE IsKeyMetric = TRUE',
     "  AND COALESCE(SnapshotType, 'WEEKLY') = '" + snapshotType + "'",
+    ...canonicalWeeklyPredicates.map(predicate => predicate.replace(/^    /, '  ')),
     'ORDER BY SnapshotDate DESC, Entity ASC, ClientName ASC, NormalizedCategory ASC'
   ].join('\n');
 }

@@ -1944,14 +1944,16 @@ function updateProfitAndLossSheetExport() {
   }
 }
 
-function loadPnlVariantSnapshot_(snapshot) {
+function loadPnlVariantSnapshot_(snapshot, options) {
+  const settings = options || {};
   const hasClientFailures = Array.isArray(snapshot.clientFailures) && snapshot.clientFailures.length > 0;
-  const loadResult = hasClientFailures
+  const useClientScope = settings.forceClientScope === true || hasClientFailures;
+  const loadResult = useClientScope
     ? replacePnlSnapshotClients_(snapshot.range, snapshot.rows, snapshot.variant, snapshot.successfulClientIds)
     : replacePnlSnapshotPartition_(snapshot.range, snapshot.rows, snapshot.variant);
   const verification = verifyPnlSnapshotPartition_(
     snapshot.range.snapshotWeek, snapshot.rowCount, snapshot.variant,
-    hasClientFailures ? snapshot.successfulClientIds : null,
+    useClientScope ? snapshot.successfulClientIds : null,
     snapshot.range.snapshotType
   );
   return {
@@ -1991,13 +1993,18 @@ function executeProfitAndLossVariantSnapshot_(variant, loadedEntityConfiguration
   const range = settings.range || getPreviousCompletedWeekRange_();
   const loadedAt = new Date().toISOString();
   const selection = resolvePnlEntitySelection_(variantKey, null, loadedEntityConfiguration || null);
+  const requestedClientIds = Array.from(new Set((settings.clientIds || []).map(String)));
+  if (requestedClientIds.length) {
+    const allowed = {}; requestedClientIds.forEach(id => { allowed[id] = true; });
+    selection.clients = selection.clients.filter(client => allowed[String(client.id)]);
+  }
   if (!selection.clients.length) throw new Error('No filtered clients were found for P&L variant: ' + variantKey);
   const snapshot = buildProfitAndLossVariantSnapshot_(variantKey, {
     range, loadedAt, clients: selection.clients,
     entityConfiguration: selection.entityConfiguration,
     continueOnClientError: true
   });
-  const loaded = loadPnlVariantSnapshot_(snapshot);
+  const loaded = loadPnlVariantSnapshot_(snapshot, { forceClientScope: requestedClientIds.length > 0 });
 
   if (!schemaValidation || schemaValidation.status !== 'passed') {
     throw new Error('P&L schema validation did not pass for variant: ' + variantKey);
