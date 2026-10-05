@@ -222,7 +222,10 @@ function readInvoiceCanonicalWeeklyHistory_(startWeek, endWeek) {
     'GROUP BY SnapshotWeek)'
   ].join('\n'));
   const coverage = {};
-  JSON.parse(String(result.coverage || '[]')).forEach(item => { coverage[item.week] = item.client_ids || []; });
+  const parsedCoverage = JSON.parse(String(result.coverage || '[]'));
+  (Array.isArray(parsedCoverage) ? parsedCoverage : []).forEach(item => {
+    coverage[item.week] = item.client_ids || [];
+  });
   return coverage;
 }
 

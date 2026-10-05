@@ -90,6 +90,15 @@ test('planners include only missing canonical weeks and P&L plans both variants 
   ]);
 });
 
+test('Invoice canonical history treats an empty BigQuery ARRAY_AGG result as no coverage', () => {
+  const invoices = loadProject(['invoices/1.Config.js', 'invoices/3.Functions.js', 'invoices/6.Backfill.js']);
+  invoices.runBigQuerySingleRowQuery_ = () => ({ coverage: 'null' });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(invoices.readInvoiceCanonicalWeeklyHistory_('2026-01-05', '2026-01-05'))),
+    {}
+  );
+});
+
 test('retry processes only entities still missing from a partially loaded week', () => {
   const balance = loadProject(['balance-sheet/1.Config.js', 'balance-sheet/3.Functions.js', 'balance-sheet/6.Backfill.js']);
   balance.readBalanceCanonicalWeeklyHistory_ = () => ({ '2026-01-05': ['already-loaded'] });
