@@ -263,7 +263,16 @@ function getPnlWeeklyHistoryBackfillPlan2026(referenceIsoDate) {
     const loaded = loadPnlEntityConfiguration_(variant);
     expected[variant] = resolvePnlEntitySelection_(variant, null, loaded).clients.map(client => client.id);
   });
-  return planPnlWeeklyHistoryBackfill2026_(referenceIsoDate, expected);
+  const plan = planPnlWeeklyHistoryBackfill2026_(referenceIsoDate, expected);
+  Logger.log(JSON.stringify({
+    event: 'pnl_weekly_history_plan', expectedWeekCount: plan.expectedWeeks.length,
+    expectedClientCount: Object.keys(plan.expectedClientIds).reduce((out, variant) => {
+      out[variant] = plan.expectedClientIds[variant].length; return out;
+    }, {}), missingWeeks: plan.missingWeeks,
+    jobs: plan.jobs.map(job => ({ variant: job.variant, snapshotWeek: job.snapshotWeek,
+      missingClientCount: job.missingClientIds.length }))
+  }));
+  return plan;
 }
 
 function capturePnlWeeklyHistoryBaseline_(variant, cutoffIso) {

@@ -249,7 +249,13 @@ function planInvoiceWeeklyHistoryBackfill2026_(referenceIsoDate, expectedClientI
 
 function getInvoiceWeeklyHistoryBackfillPlan2026(referenceIsoDate) {
   const loaded = loadInvoiceEntityConfiguration_();
-  return planInvoiceWeeklyHistoryBackfill2026_(referenceIsoDate, Object.keys(fetchClients_(loaded)));
+  const plan = planInvoiceWeeklyHistoryBackfill2026_(referenceIsoDate, Object.keys(fetchClients_(loaded)));
+  Logger.log(JSON.stringify({
+    event: 'invoice_weekly_history_plan', expectedWeekCount: plan.expectedWeeks.length,
+    expectedClientCount: plan.expectedClientIds.length, missingWeeks: plan.missingWeeks,
+    jobs: plan.jobs.map(job => ({ snapshotWeek: job.snapshotWeek, missingClientCount: job.missingClientIds.length }))
+  }));
+  return plan;
 }
 
 function captureInvoiceWeeklyHistoryBaseline_(cutoffIso) {

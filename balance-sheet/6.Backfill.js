@@ -277,7 +277,13 @@ function planBalanceWeeklyHistoryBackfill2026_(referenceIsoDate, expectedClientI
 function getBalanceWeeklyHistoryBackfillPlan2026(referenceIsoDate) {
   const loaded = loadBalanceEntityConfiguration_();
   const selection = resolveBalanceEntitySelection_(null, loaded);
-  return planBalanceWeeklyHistoryBackfill2026_(referenceIsoDate, Object.keys(selection.clientsById));
+  const plan = planBalanceWeeklyHistoryBackfill2026_(referenceIsoDate, Object.keys(selection.clientsById));
+  Logger.log(JSON.stringify({
+    event: 'balance_weekly_history_plan', expectedWeekCount: plan.expectedWeeks.length,
+    expectedClientCount: plan.expectedClientIds.length, missingWeeks: plan.missingWeeks,
+    jobs: plan.jobs.map(job => ({ snapshotWeek: job.snapshotWeek, missingClientCount: job.missingClientIds.length }))
+  }));
+  return plan;
 }
 
 function captureBalanceWeeklyHistoryBaseline_(cutoffIso) {
