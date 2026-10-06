@@ -177,7 +177,8 @@ const PNL_WEEKLY_HISTORY_BACKFILL = {
   failureRetryDelayMs: 60000,
   watchdogDelayMs: 840000,
   maxStageAttempts: 3,
-  maxStateBytes: 8500
+  maxStateBytes: 8500,
+  emptyEvidencePrefix: 'QBO_PNL_WEEKLY_HISTORY_EMPTY_2026_'
 };
 
 function buildPnlWeeklyHistoryRange_(snapshotWeek) {
@@ -232,7 +233,8 @@ function readPnlCanonicalWeeklyHistory_(variant, startWeek, endWeek) {
   ].join('\n')));
 }
 
-function planPnlWeeklyHistoryBackfill2026_(referenceIsoDate, expectedClientIdsByVariant) {
+function planPnlWeeklyHistoryBackfill2026_(referenceIsoDate, expectedClientIdsByVariant,
+    completedEmptyClientsByVariant) {
   const expectedWeeks = buildPnlWeeklyHistoryExpectedWeeks_(referenceIsoDate);
   const expectedByVariant = expectedClientIdsByVariant || {};
   const plan = { expectedWeeks: expectedWeeks, expectedClientIds: {}, coverage: {}, missingWeeks: {}, jobs: [] };
@@ -245,7 +247,10 @@ function planPnlWeeklyHistoryBackfill2026_(referenceIsoDate, expectedClientIdsBy
     );
     const jobs = expectedWeeks.map(week => {
       const present = {};
-      (coverage[week] || []).forEach(id => { present[id] = true; });
+      (coverage[week] || []).concat(
+        completedEmptyClientsByVariant && completedEmptyClientsByVariant[variant] &&
+        completedEmptyClientsByVariant[variant][week] || []
+      ).forEach(id => { present[id] = true; });
       return { variant: variant, snapshotWeek: week, missingClientIds: expectedIds.filter(id => !present[id]) };
     }).filter(job => job.missingClientIds.length);
     plan.expectedClientIds[variant] = expectedIds;
@@ -286,7 +291,9 @@ function capturePnlWeeklyHistoryBaseline_(variant, cutoffIso) {
 }
 
 function validatePnlWeeklyHistoryBackfill2026_(state) {
-  const plan = planPnlWeeklyHistoryBackfill2026_(null, state.expectedClientIds);
+  const plan = planPnlWeeklyHistoryBackfill2026_(
+    null, state.expectedClientIds, readAllPnlWeeklyHistoryEmptyEvidence_(state)
+  );
   if (plan.jobs.length) throw new Error('P&L final coverage validation failed: ' + JSON.stringify(plan.jobs));
   [PNL_VARIANT_NORMAL, PNL_VARIANT_BY_CLASS].forEach(variant => {
     if (capturePnlWeeklyHistoryBaseline_(variant, state.createdAt) !== state.preexistingBaseline[variant]) {
@@ -320,6 +327,43 @@ function persistPnlWeeklyHistoryState_(state) {
   PropertiesService.getScriptProperties().setProperty(
     PNL_WEEKLY_HISTORY_BACKFILL.statePropertyKey, serialized
   );
+}
+
+function pnlWeeklyHistoryEmptyEvidenceKey_(operationId, variant, snapshotWeek) {
+  return PNL_WEEKLY_HISTORY_BACKFILL.emptyEvidencePrefix +
+    String(operationId).replace(/[^A-Za-z0-9]/g, '') + '_' +
+    String(variant).replace(/[^A-Za-z0-9]/g, '') + '_' +
+    String(snapshotWeek).replace(/-/g, '');
+}
+
+function readPnlWeeklyHistoryEmptyEvidence_(state, variant, snapshotWeek) {
+  const value = PropertiesService.getScriptProperties().getProperty(
+    pnlWeeklyHistoryEmptyEvidenceKey_(state.operationId, variant, snapshotWeek)
+  );
+  return value ? JSON.parse(value) : [];
+}
+
+function persistPnlWeeklyHistoryEmptyEvidence_(state, variant, snapshotWeek, clientIds) {
+  const value = JSON.stringify(Array.from(new Set(clientIds || [])).sort());
+  const byteCount = unescape(encodeURIComponent(value)).length;
+  if (byteCount > PNL_WEEKLY_HISTORY_BACKFILL.maxStateBytes) {
+    throw new Error('P&L empty-entity evidence exceeds safe Script Properties size. bytes=' + byteCount);
+  }
+  PropertiesService.getScriptProperties().setProperty(
+    pnlWeeklyHistoryEmptyEvidenceKey_(state.operationId, variant, snapshotWeek), value
+  );
+}
+
+function readAllPnlWeeklyHistoryEmptyEvidence_(state) {
+  const evidence = {};
+  [PNL_VARIANT_NORMAL, PNL_VARIANT_BY_CLASS].forEach(variant => {
+    evidence[variant] = {};
+    (state.jobs || []).filter(job => job.variant === variant).forEach(job => {
+      const ids = readPnlWeeklyHistoryEmptyEvidence_(state, variant, job.snapshotWeek);
+      if (ids.length) evidence[variant][job.snapshotWeek] = ids;
+    });
+  });
+  return evidence;
 }
 
 function deletePnlWeeklyHistoryTriggers_() {
@@ -385,6 +429,8 @@ function executePnlWeeklyHistoryJob_(job, state) {
   const variant = getPnlVariantConfig_(job.variant).variantKey;
   const coverage = readPnlCanonicalWeeklyHistory_(variant, job.snapshotWeek, job.snapshotWeek);
   const present = {}; (coverage[job.snapshotWeek] || []).forEach(id => { present[id] = true; });
+  readPnlWeeklyHistoryEmptyEvidence_(state, variant, job.snapshotWeek)
+    .forEach(id => { present[id] = true; });
   const missingClientIds = state.expectedClientIds[variant].filter(id => !present[id]);
   if (!missingClientIds.length) {
     return { status: 'skipped_existing', variant: variant, snapshotWeek: job.snapshotWeek };
@@ -396,10 +442,24 @@ function executePnlWeeklyHistoryJob_(job, state) {
     throw new Error('P&L entity configuration changed during the weekly history backfill. Variant=' + variant);
   }
   const range = buildPnlWeeklyHistoryRange_(job.snapshotWeek);
-  const result = executeProfitAndLossVariantSnapshot_(variant, loaded, { range: range, clientIds: missingClientIds });
+  const result = executeProfitAndLossVariantSnapshot_(variant, loaded, {
+    range: range, clientIds: missingClientIds, returnPartialResult: true
+  });
+  const afterCoverage = readPnlCanonicalWeeklyHistory_(variant, job.snapshotWeek, job.snapshotWeek);
+  const withRows = {}; (afterCoverage[job.snapshotWeek] || []).forEach(id => { withRows[id] = true; });
+  const emptyIds = (result.successfulClientIds || []).filter(id => !withRows[id]);
+  persistPnlWeeklyHistoryEmptyEvidence_(state, variant, job.snapshotWeek,
+    readPnlWeeklyHistoryEmptyEvidence_(state, variant, job.snapshotWeek).concat(emptyIds));
+  if ((result.clientFailures || []).length) {
+    state.updatedAt = new Date().toISOString();
+    persistPnlWeeklyHistoryState_(state);
+    throw new Error('P&L weekly history still has entity failures: ' + JSON.stringify(result.clientFailures));
+  }
   return {
     status: 'completed', variant: variant, range: range, rowCount: result.rowCount,
-    clientCount: result.clientCount, verification: result.verification && result.verification.status
+    clientCount: result.clientCount,
+    successfulClientCount: (result.successfulClientIds || []).length,
+    verification: result.verification && result.verification.status
   };
 }
 

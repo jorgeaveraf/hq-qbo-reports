@@ -2037,10 +2037,12 @@ function executeProfitAndLossVariantSnapshot_(variant, loadedEntityConfiguration
     loadResult: loaded.loadResult,
     reconciliation: loaded.reconciliation,
     verification: loaded.verification,
-    clientResults: loaded.clientResults
+    clientResults: loaded.clientResults,
+    successfulClientIds: loaded.successfulClientIds,
+    clientFailures: loaded.clientFailures
   };
   Logger.log(JSON.stringify(result, null, 2));
-  if (loaded.clientFailures.length) {
+  if (loaded.clientFailures.length && settings.returnPartialResult !== true) {
     throw new Error('P&L snapshot loaded successful entities but completed with entity errors: ' +
       JSON.stringify({ variant: variantKey, snapshotWeek: range.snapshotWeek,
         successfulClientCount: loaded.successfulClientIds.length,

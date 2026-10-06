@@ -115,6 +115,63 @@ test('retry processes only entities still missing from a partially loaded week',
   assert.equal(result.status, 'completed');
 });
 
+test('P&L planner treats confirmed empty clients as completed coverage', () => {
+  const pnl = loadProject(['profit-and-loss/1.Config.js', 'profit-and-loss/3.Functions.js', 'profit-and-loss/6.Backfill.js']);
+  pnl.readPnlCanonicalWeeklyHistory_ = variant => variant === 'normal'
+    ? { '2026-01-05': ['with-rows'] }
+    : { '2026-01-05': ['with-rows', 'empty-client'] };
+  const plan = pnl.planPnlWeeklyHistoryBackfill2026_(
+    '2026-01-12',
+    { normal: ['with-rows', 'empty-client'], by_class: ['with-rows', 'empty-client'] },
+    { normal: { '2026-01-05': ['empty-client'] }, by_class: {} }
+  );
+  assert.equal(plan.jobs.length, 0);
+});
+
+test('P&L weekly job records successful zero-row clients and preserves failed clients for retry', () => {
+  const pnl = loadProject(['profit-and-loss/1.Config.js', 'profit-and-loss/3.Functions.js', 'profit-and-loss/6.Backfill.js']);
+  const properties = {};
+  pnl.PropertiesService = { getScriptProperties: () => ({
+    getProperty: key => properties[key] || null,
+    setProperty: (key, value) => { properties[key] = value; }
+  }) };
+  pnl.loadPnlEntityConfiguration_ = () => ({ configuration: { configuration_hash: 'hash' } });
+  pnl.readPnlCanonicalWeeklyHistory_ = () => ({});
+  let requestedClientIds = null;
+  pnl.executeProfitAndLossVariantSnapshot_ = (_variant, _loaded, options) => {
+    requestedClientIds = options.clientIds;
+    assert.equal(options.returnPartialResult, true);
+    return {
+      rowCount: 0, clientCount: 2, successfulClientIds: ['empty-client'],
+      clientFailures: [{ clientId: 'failed-client', error: 'timeout' }],
+      verification: { status: 'passed' }
+    };
+  };
+  const state = {
+    operationId: 'operation-1', jobs: [{ variant: 'normal', snapshotWeek: '2026-01-05' }],
+    expectedClientIds: { normal: ['empty-client', 'failed-client'], by_class: ['class-client'] },
+    configuration: { normal: 'hash', byClass: 'other' }
+  };
+  assert.throws(
+    () => pnl.executePnlWeeklyHistoryJob_(state.jobs[0], state),
+    /still has entity failures/
+  );
+  assert.deepEqual(Array.from(requestedClientIds), ['empty-client', 'failed-client']);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(pnl.readPnlWeeklyHistoryEmptyEvidence_(state, 'normal', '2026-01-05'))),
+    ['empty-client']
+  );
+  const plan = pnl.planPnlWeeklyHistoryBackfill2026_(
+    '2026-01-12', state.expectedClientIds,
+    {
+      normal: { '2026-01-05': ['empty-client'] },
+      by_class: { '2026-01-05': ['class-client'] }
+    }
+  );
+  const normalJob = plan.jobs.find(job => job.variant === 'normal');
+  assert.deepEqual(Array.from(normalJob.missingClientIds), ['failed-client']);
+});
+
 test('failed final validation blocks Connected Sheets refresh', () => {
   const balance = loadProject(['balance-sheet/1.Config.js', 'balance-sheet/3.Functions.js', 'balance-sheet/6.Backfill.js']);
   const state = { status: 'pending', currentStage: 'validation', stageAttempts: 0 };
@@ -251,9 +308,12 @@ test('worst-case production state remains below the Script Properties limit', ()
     [name, Buffer.byteLength(JSON.stringify(state), 'utf8')]));
   Object.values(sizes).forEach(size => assert.ok(size < 8500));
   const invoiceEvidenceSize = Buffer.byteLength(JSON.stringify(ids(12)), 'utf8');
+  const pnlEvidenceSize = Buffer.byteLength(JSON.stringify(ids(15)), 'utf8');
   assert.ok(invoiceEvidenceSize < 8500);
+  assert.ok(pnlEvidenceSize < 8500);
   assert.deepEqual(sizes, { balance_sheet: 3377, profit_and_loss: 7349, invoices: 3216 });
   assert.equal(invoiceEvidenceSize, 469);
+  assert.equal(pnlEvidenceSize, 586);
 });
 
 test('Balance Sheet starter requires the canonical weekly view first', () => {
