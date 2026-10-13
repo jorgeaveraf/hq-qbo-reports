@@ -71,6 +71,25 @@ const PAYMENT_BACKFILL_CONFIG = {
   maxStateBytes: 9000
 };
 
+const PAYMENT_HISTORY_REPAIR_CONFIG = {
+  strategy: 'transaction_date_history_repair_v1',
+  statePropertyKey: 'QBO_PAYMENT_HISTORY_REPAIR_2026_STATE',
+  workerHandler: 'processPaymentHistoryRepair2026',
+  startDate: '2026-01-05',
+  endDate: '2026-07-19',
+  protectedStartDate: '2026-07-20',
+  stagingTableId: 'payment_snapshots_history_repair_2026_stage',
+  backupTableId: 'payment_snapshots_history_repair_2026_backup',
+  initialDelayMs: 5000,
+  continuationDelayMs: 60000,
+  busyRetryDelayMs: 60000,
+  failureRetryDelayMs: 60000,
+  watchdogDelayMs: 13 * 60 * 1000,
+  staleRunningSeconds: 15 * 60,
+  maxAttemptsPerStage: 3,
+  maxStateBytes: 9000
+};
+
 const BQ_CONFIG = {
   projectId: 'qbo-gateway-reporting',
   rawDatasetId: 'raw',
