@@ -139,11 +139,16 @@ test('loads and verifies successful clients before surfacing a partial failure',
   const calls = [];
   context.Logger = { log: () => {} };
   context.validatePaymentBigQuerySchema_ = () => ({ status: 'passed' });
-  context.buildPaymentSnapshot_ = (_configuration, options) => {
+  context.buildPaymentRollingSnapshot_ = (_configuration, options) => {
     calls.push(['build', options.continueOnClientError]);
     return {
       entityConfiguration: {},
-      range: { snapshotWeek: '2026-09-14' },
+      plan: {
+        startDate: '2026-06-29',
+        horizonDate: '2026-09-20',
+        lastPeriod: { snapshotWeek: '2026-09-14' },
+        periods: [{ snapshotWeek: '2026-09-14' }]
+      },
       clientCount: 3,
       sourcePaymentCount: 2,
       paymentCount: 2,
@@ -156,13 +161,11 @@ test('loads and verifies successful clients before surfacing a partial failure',
       clientFailures: [{ clientId: 'b', httpStatus: 401, error: 'unauthorized' }]
     };
   };
-  context.replacePaymentSnapshotPartition_ = () => assert.fail('must not truncate a partial partition');
-  context.replacePaymentSnapshotClients_ = (_range, rows, clientIds) => {
+  context.replacePaymentSnapshotRangeClients_ = (_plan, rows, clientIds) => {
     calls.push(['replace', rows.length, clientIds.join(',')]);
     return { jobId: 'partial-job' };
   };
-  context.verifyPaymentSnapshotPartition_ = () => assert.fail('must verify only successful clients');
-  context.verifyPaymentSnapshotClients_ = (_week, clientIds) => {
+  context.verifyPaymentRollingSnapshot_ = (_plan, _rows, clientIds) => {
     calls.push(['verify', clientIds.join(',')]);
     return { status: 'passed_successful_clients' };
   };

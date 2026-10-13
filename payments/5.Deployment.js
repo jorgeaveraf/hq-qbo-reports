@@ -237,6 +237,140 @@ function refreshPaymentConnectedSheetsPipeline_(spreadsheet) {
   };
 }
 
+/**
+ * Returns the production Payments consumption-view change without mutating
+ * BigQuery. This is intentionally public so the exact DDL can be reviewed
+ * before it is applied.
+ */
+function getPaymentConsumptionViewPlan() {
+  return {
+    status: 'planned',
+    modifiesBigQuery: false,
+    views: [{
+      name: 'vw_payment_report_latest',
+      purpose: 'Latest canonical weekly Payments snapshot, excluding voided payments from operational consumption.',
+      preservesRawVoidedRows: true,
+      sql: buildPaymentLatestViewSql_()
+    }]
+  };
+}
+
+/**
+ * Applies the reviewed consumption-view definition. Raw rows are not changed.
+ * This function is deliberately separate from the weekly snapshot worker so a
+ * view deployment is never an implicit side effect of a scheduled run.
+ */
+function deployPaymentConsumptionViews() {
+  const plan = getPaymentConsumptionViewPlan();
+  const jobs = plan.views.map(view => {
+    const result = runBigQueryQuery_(view.sql);
+    return {
+      name: view.name,
+      jobId: result.jobReference && result.jobReference.jobId || null,
+      state: 'DONE'
+    };
+  });
+  const verification = verifyPaymentConsumptionViews_();
+  const result = { status: 'completed', jobs, verification };
+  Logger.log(JSON.stringify({ event: 'payment_consumption_views_deployed', ...result }));
+  return result;
+}
+
+function buildPaymentLatestViewSql_() {
+  return [
+    'CREATE OR REPLACE VIEW `qbo-gateway-reporting.views.vw_payment_report_latest` AS',
+    'SELECT',
+    '  SnapshotWeek,',
+    '  SnapshotDate,',
+    '  RecordType,',
+    '  RecordOrder,',
+    '  Entity,',
+    '  ClientName,',
+    '  PaymentId,',
+    '  TxnDate,',
+    '  CustomerName,',
+    '  PaymentRefNum,',
+    '  PrivateNote,',
+    '  TotalAmount,',
+    '  UnappliedAmount,',
+    '  ProcessPayment,',
+    '  IsVoided,',
+    '  PaymentLinkedTxnIds,',
+    '  PaymentLinkedTxnTypes,',
+    '  LineAmountSigned,',
+    '  LinkedTxnType,',
+    '  LinkedTxnOpenBalance,',
+    '  idempotency_key,',
+    '  ClientId,',
+    '  LoadedAt',
+    'FROM `qbo-gateway-reporting.raw.payment_snapshots`',
+    'WHERE SnapshotWeek = (',
+    '  SELECT MAX(SnapshotWeek)',
+    '  FROM `qbo-gateway-reporting.raw.payment_snapshots`',
+    ')',
+    '  AND COALESCE(IsVoided, FALSE) = FALSE',
+    'ORDER BY',
+    '  Entity ASC,',
+    '  ClientName ASC,',
+    '  ClientId ASC,',
+    '  TxnDate DESC,',
+    '  SAFE_CAST(PaymentId AS INT64) DESC,',
+    '  PaymentId DESC,',
+    '  RecordOrder ASC'
+  ].join('\n');
+}
+
+/**
+ * Blocks a Connected Sheets refresh unless the production view is the
+ * versioned, non-voided projection of the latest raw weekly partition.
+ */
+function verifyPaymentConsumptionViews_() {
+  const result = runBigQueryQuery_([
+    'WITH metadata AS (',
+    '  SELECT view_definition',
+    '  FROM `qbo-gateway-reporting.views.INFORMATION_SCHEMA.VIEWS`',
+    "  WHERE table_name = 'vw_payment_report_latest'",
+    '), expected AS (',
+    '  SELECT MAX(SnapshotWeek) AS snapshot_week',
+    '  FROM `qbo-gateway-reporting.raw.payment_snapshots`',
+    ')',
+    'SELECT',
+    "  (SELECT COUNT(*) FROM metadata) = 1 AS view_exists,",
+    "  COALESCE((SELECT REGEXP_CONTAINS(REGEXP_REPLACE(LOWER(view_definition), r'\\s+', ''), r'coalesce\\(isvoided,false\\)=false') FROM metadata), FALSE) AS excludes_voided,",
+    '  (SELECT COUNT(*) FROM `qbo-gateway-reporting.views.vw_payment_report_latest`) AS actual_row_count,',
+    '  (SELECT COUNT(*)',
+    '   FROM `qbo-gateway-reporting.raw.payment_snapshots`, expected',
+    '   WHERE SnapshotWeek = expected.snapshot_week',
+    '     AND COALESCE(IsVoided, FALSE) = FALSE) AS expected_row_count,',
+    '  (SELECT COUNTIF(COALESCE(IsVoided, FALSE)) FROM `qbo-gateway-reporting.views.vw_payment_report_latest`) AS voided_row_count,',
+    '  CAST((SELECT MAX(SnapshotWeek) FROM `qbo-gateway-reporting.views.vw_payment_report_latest`) AS STRING) AS actual_snapshot_week,',
+    '  CAST((SELECT snapshot_week FROM expected) AS STRING) AS expected_snapshot_week'
+  ].join('\n'));
+
+  const values = result.rows && result.rows.length ? result.rows[0].f : [];
+  const verification = {
+    viewExists: String(values[0] && values[0].v) === 'true',
+    excludesVoided: String(values[1] && values[1].v) === 'true',
+    actualRowCount: Number(values[2] ? values[2].v : 0),
+    expectedRowCount: Number(values[3] ? values[3].v : 0),
+    voidedRowCount: Number(values[4] ? values[4].v : 0),
+    actualSnapshotWeek: values[5] && values[5].v || null,
+    expectedSnapshotWeek: values[6] && values[6].v || null
+  };
+
+  if (
+    !verification.viewExists ||
+    !verification.excludesVoided ||
+    verification.actualRowCount !== verification.expectedRowCount ||
+    verification.voidedRowCount !== 0 ||
+    verification.actualSnapshotWeek !== verification.expectedSnapshotWeek
+  ) {
+    throw new Error('Payments consumption view validation failed: ' + JSON.stringify(verification));
+  }
+
+  return { status: 'passed', ...verification };
+}
+
 function refreshPaymentConnectedSheetsStage_(stage, spreadsheetOverride) {
   const spreadsheet = spreadsheetOverride || getPaymentReportSpreadsheet_();
   SpreadsheetApp.enableBigQueryExecution();

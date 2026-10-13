@@ -16,7 +16,8 @@ const PAYMENT_CONFIG = {
   pageDelayMs: 100,
   requestMaxAttempts: 4,
   requestRetryBaseDelayMs: 1000,
-  requestRetryMaxDelayMs: 8000
+  requestRetryMaxDelayMs: 8000,
+  weeklyLookbackWeeks: 12
 };
 
 const PAYMENT_ENTITY_CONTROL = {
