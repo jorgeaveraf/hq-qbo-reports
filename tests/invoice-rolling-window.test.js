@@ -63,14 +63,31 @@ test('paginates a 12-week invoice fetch without truncating a full entity result'
   assert.match(urls[1], /startposition=1001/);
 });
 
-test('fails closed when the gateway returns a full invoice page without pagination metadata', () => {
+test('infers the next invoice page when a full gateway page omits pagination metadata', () => {
   const context = loadInvoicesContext();
-  context.fetchJsonOrThrow_ = () => ({
-    items: Array.from({ length: 1000 }, (_, index) => ({ Id: String(index) }))
-  });
+  const urls = [];
+  context.fetchJsonOrThrow_ = url => {
+    urls.push(url);
+    if (urls.length === 1) {
+      return { items: Array.from({ length: 1000 }, (_, index) => ({ Id: String(index + 1) })) };
+    }
+    return { items: [{ Id: '1001' }] };
+  };
+  const result = context.fetchInvoices_('client-1', '2026-07-27', '2026-10-18');
+  assert.equal(result.invoiceCount, 1001);
+  assert.equal(result.pageCount, 2);
+  assert.match(urls[1], /startposition=1001/);
+  assert.equal(result.pages[0].nextStartPositionSource, 'inferred_full_page');
+  assert.equal(result.pages[1].nextStartPositionSource, 'short_page');
+});
+
+test('fails closed when the gateway repeats a full invoice page while ignoring startposition', () => {
+  const context = loadInvoicesContext();
+  const repeatedPage = Array.from({ length: 1000 }, (_, index) => ({ Id: String(index + 1), SyncToken: '0' }));
+  context.fetchJsonOrThrow_ = () => ({ items: repeatedPage });
   assert.throws(
     () => context.fetchInvoices_('client-1', '2026-07-27', '2026-10-18'),
-    /full page without next_startposition/
+    /repeated the same page/
   );
 });
 

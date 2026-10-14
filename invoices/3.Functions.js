@@ -1781,6 +1781,7 @@ function fetchInvoices_(clientId, dateFrom, dateTo) {
   const items = [];
   const pages = [];
   const seenStartPositions = {};
+  const seenPageSignatures = {};
   let startPosition = INVOICE_CONFIG.firstStartPosition;
   let pageNumber = 0;
   while (startPosition !== null) {
@@ -1799,21 +1800,32 @@ function fetchInvoices_(clientId, dateFrom, dateTo) {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !Array.isArray(payload.items)) {
       throw new Error('Invalid invoice response for client ' + normalizedClientId + ' at page ' + pageNumber + '.');
     }
+    const pageSignature = buildInvoicePageSignature_(payload.items);
+    if (payload.items.length > 0 && seenPageSignatures[pageSignature]) {
+      throw new Error('Invoice pagination repeated the same page for client ' + normalizedClientId +
+        ' at startposition=' + startPosition + '.');
+    }
+    if (payload.items.length > 0) seenPageSignatures[pageSignature] = true;
     payload.items.forEach(item => items.push(item));
     const next = payload.next_startposition;
-    const nextStartPosition = next === null || next === undefined || String(next).trim() === '' ? null : Number(next);
+    const hasExplicitNext = !(next === null || next === undefined || String(next).trim() === '');
+    const nextStartPosition = hasExplicitNext
+      ? Number(next)
+      : (payload.items.length >= INVOICE_CONFIG.maxResults ? startPosition + payload.items.length : null);
     if (nextStartPosition !== null && (!Number.isInteger(nextStartPosition) || nextStartPosition < 1)) {
       throw new Error('Invalid next_startposition for client ' + normalizedClientId + ': ' + next);
     }
-    if (nextStartPosition === null && payload.items.length >= INVOICE_CONFIG.maxResults) {
-      throw new Error('Invoice query returned a full page without next_startposition for client ' +
-        normalizedClientId + ' at page ' + pageNumber + '.');
+    if (nextStartPosition !== null && nextStartPosition <= startPosition) {
+      throw new Error('Invoice pagination did not advance for client ' + normalizedClientId +
+        ': current=' + startPosition + ', next=' + nextStartPosition + '.');
     }
     pages.push({
       pageNumber: pageNumber,
       startPosition: startPosition,
       itemCount: payload.items.length,
       nextStartPosition: nextStartPosition,
+      nextStartPositionSource: hasExplicitNext ? 'gateway' :
+        (nextStartPosition === null ? 'short_page' : 'inferred_full_page'),
       latencyMs: numberOrNull_(payload.latency_ms),
       refreshed: payload.refreshed === true
     });
@@ -1824,6 +1836,18 @@ function fetchInvoices_(clientId, dateFrom, dateTo) {
     clientId: normalizedClientId, dateFrom: normalizedDateFrom, dateTo: normalizedDateTo, invoiceCount: items.length,
     pageCount: pages.length, pages: pages, items: items
   };
+}
+
+function buildInvoicePageSignature_(pageItems) {
+  let hash = 2166136261;
+  (pageItems || []).forEach((item, index) => {
+    const token = [index, item && item.Id, item && item.SyncToken, item && item.TxnDate].join('|');
+    for (let i = 0; i < token.length; i++) {
+      hash ^= token.charCodeAt(i);
+      hash = Math.imul(hash, 16777619) >>> 0;
+    }
+  });
+  return String((pageItems || []).length) + ':' + hash.toString(16);
 }
 
 function buildInvoicesUrl_(clientId, dateFrom, dateTo, startPosition) {
