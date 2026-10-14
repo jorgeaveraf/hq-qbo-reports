@@ -1445,6 +1445,90 @@ function getPreviousCompletedWeekRange_(referenceIsoDate) {
   };
 }
 
+function normalizeInvoiceSnapshotRange_(rangeOverride) {
+  if (!rangeOverride || typeof rangeOverride !== 'object' || Array.isArray(rangeOverride)) {
+    throw new Error('Invoice snapshot range must be an object.');
+  }
+  const dateFrom = normalizeDateForOutput_(rangeOverride.dateFrom);
+  const dateTo = normalizeDateForOutput_(rangeOverride.dateTo);
+  const fromDate = safeParseDate_(dateFrom);
+  const toDate = safeParseDate_(dateTo);
+  if (!fromDate || !toDate || fromDate.getTime() > toDate.getTime()) {
+    throw new Error('Invoice snapshot range requires a valid Monday-to-Sunday date range.');
+  }
+  if (fromDate.getUTCDay() !== 1 || toDate.getUTCDay() !== 0) {
+    throw new Error('Invoice snapshot range must begin on Monday and end on Sunday.');
+  }
+  const expectedEnd = new Date(fromDate.getTime());
+  expectedEnd.setUTCDate(expectedEnd.getUTCDate() + 6);
+  if (expectedEnd.getTime() !== toDate.getTime()) {
+    throw new Error('Invoice snapshot range must contain exactly one canonical week.');
+  }
+  const snapshotDate = new Date(toDate.getTime());
+  snapshotDate.setUTCDate(snapshotDate.getUTCDate() + 1);
+  return {
+    snapshotDate: formatUtcDate_(snapshotDate),
+    snapshotWeek: dateFrom,
+    dateFrom: dateFrom,
+    dateTo: dateTo,
+    periodKey: dateFrom + '|' + dateTo
+  };
+}
+
+function getInvoiceRollingSnapshotPlan_(referenceIsoDate, weekCountOverride) {
+  const weekCount = Number(
+    weekCountOverride === undefined || weekCountOverride === null
+      ? INVOICE_CONFIG.weeklyLookbackWeeks
+      : weekCountOverride
+  );
+  if (!Number.isInteger(weekCount) || weekCount < 1 || weekCount > 52) {
+    throw new Error('Invoice rolling snapshot week count must be an integer between 1 and 52.');
+  }
+  const latest = getPreviousCompletedWeekRange_(referenceIsoDate);
+  const latestWeekStart = safeParseDate_(latest.snapshotWeek);
+  const periods = [];
+  for (let offset = weekCount - 1; offset >= 0; offset--) {
+    const dateFrom = new Date(latestWeekStart.getTime());
+    dateFrom.setUTCDate(dateFrom.getUTCDate() - offset * 7);
+    const dateTo = new Date(dateFrom.getTime());
+    dateTo.setUTCDate(dateTo.getUTCDate() + 6);
+    periods.push(normalizeInvoiceSnapshotRange_({
+      dateFrom: formatUtcDate_(dateFrom),
+      dateTo: formatUtcDate_(dateTo)
+    }));
+  }
+  return {
+    strategy: 'rolling_transaction_date',
+    weekCount: weekCount,
+    startDate: periods[0].dateFrom,
+    horizonDate: periods[periods.length - 1].dateTo,
+    firstPeriod: periods[0],
+    lastPeriod: periods[periods.length - 1],
+    snapshotWeeks: periods.map(period => period.snapshotWeek),
+    periods: periods
+  };
+}
+
+function getInvoiceRollingPeriodForTxnDate_(txnDateValue, plan) {
+  const txnDate = normalizeDateForOutput_(txnDateValue);
+  if (!txnDate || !plan || txnDate < plan.startDate || txnDate > plan.horizonDate) return null;
+  for (let index = 0; index < plan.periods.length; index++) {
+    const period = plan.periods[index];
+    if (txnDate >= period.dateFrom && txnDate <= period.dateTo) return period;
+  }
+  return null;
+}
+
+function getInvoiceSourceTxnDate_(invoice) {
+  const paths = INVOICE_SOURCE_FIELDS.invoice.txnDate.paths || [];
+  for (let index = 0; index < paths.length; index++) {
+    const value = invoice && invoice[paths[index]];
+    const normalized = normalizeDateForOutput_(value);
+    if (normalized) return normalized;
+  }
+  return '';
+}
+
 function formatUtcDate_(date) {
   return Utilities.formatDate(date, 'Etc/UTC', 'yyyy-MM-dd');
 }
@@ -1694,33 +1778,58 @@ function fetchInvoices_(clientId, dateFrom, dateTo) {
   if (parsedDateFrom.getTime() > parsedDateTo.getTime()) {
     throw new Error('Invoice dateFrom cannot be later than dateTo. ' + normalizedDateFrom + ' > ' + normalizedDateTo);
   }
-  const url = buildInvoicesUrl_(normalizedClientId, normalizedDateFrom, normalizedDateTo);
-  const payload = fetchJsonOrThrow_(url, '/qbo/' + normalizedClientId + '/invoices');
-  if (!payload || typeof payload !== 'object') {
-    throw new Error('Invalid invoice response for client ' + normalizedClientId + '. Expected a JSON object.');
-  }
-  if (!Array.isArray(payload.items)) {
-    throw new Error('Invalid invoice response for client ' + normalizedClientId + '. Expected payload.items to be an array.');
-  }
-  const items = payload.items;
-  const nextStartPosition =
-    payload.next_startposition === undefined || payload.next_startposition === null || payload.next_startposition === ''
-      ? null : payload.next_startposition;
-  if (items.length >= INVOICE_CONFIG.maxResults || nextStartPosition !== null) {
-    throw new Error('Invoice query may be incomplete for client ' + normalizedClientId + '. items=' + items.length +
-        ', maxResults=' + INVOICE_CONFIG.maxResults + ', nextStartPosition=' + nextStartPosition + ', dateFrom=' +
-        normalizedDateFrom + ', dateTo=' + normalizedDateTo);
+  const items = [];
+  const pages = [];
+  const seenStartPositions = {};
+  let startPosition = INVOICE_CONFIG.firstStartPosition;
+  let pageNumber = 0;
+  while (startPosition !== null) {
+    pageNumber++;
+    if (pageNumber > INVOICE_CONFIG.maxPages) {
+      throw new Error('Invoice pagination exceeded maxPages for client ' + normalizedClientId + '.');
+    }
+    if (seenStartPositions[startPosition]) {
+      throw new Error('Invoice pagination repeated startposition=' + startPosition + ' for client ' + normalizedClientId + '.');
+    }
+    seenStartPositions[startPosition] = true;
+    const payload = fetchJsonOrThrow_(
+      buildInvoicesUrl_(normalizedClientId, normalizedDateFrom, normalizedDateTo, startPosition),
+      '/qbo/' + normalizedClientId + '/invoices page ' + pageNumber
+    );
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !Array.isArray(payload.items)) {
+      throw new Error('Invalid invoice response for client ' + normalizedClientId + ' at page ' + pageNumber + '.');
+    }
+    payload.items.forEach(item => items.push(item));
+    const next = payload.next_startposition;
+    const nextStartPosition = next === null || next === undefined || String(next).trim() === '' ? null : Number(next);
+    if (nextStartPosition !== null && (!Number.isInteger(nextStartPosition) || nextStartPosition < 1)) {
+      throw new Error('Invalid next_startposition for client ' + normalizedClientId + ': ' + next);
+    }
+    if (nextStartPosition === null && payload.items.length >= INVOICE_CONFIG.maxResults) {
+      throw new Error('Invoice query returned a full page without next_startposition for client ' +
+        normalizedClientId + ' at page ' + pageNumber + '.');
+    }
+    pages.push({
+      pageNumber: pageNumber,
+      startPosition: startPosition,
+      itemCount: payload.items.length,
+      nextStartPosition: nextStartPosition,
+      latencyMs: numberOrNull_(payload.latency_ms),
+      refreshed: payload.refreshed === true
+    });
+    startPosition = nextStartPosition;
+    if (startPosition !== null && INVOICE_CONFIG.pageDelayMs > 0) Utilities.sleep(INVOICE_CONFIG.pageDelayMs);
   }
   return {
     clientId: normalizedClientId, dateFrom: normalizedDateFrom, dateTo: normalizedDateTo, invoiceCount: items.length,
-    nextStartPosition: nextStartPosition, latencyMs: numberOrNull_(payload.latency_ms),
-    refreshed: payload.refreshed === true, items: items
+    pageCount: pages.length, pages: pages, items: items
   };
 }
 
-function buildInvoicesUrl_(clientId, dateFrom, dateTo) {
+function buildInvoicesUrl_(clientId, dateFrom, dateTo, startPosition) {
   const query = ['environment=' + encodeURIComponent(INVOICE_CONFIG.environment),
     'date_from=' + encodeURIComponent(dateFrom), 'date_to=' + encodeURIComponent(dateTo),
+    'startposition=' + encodeURIComponent(startPosition || INVOICE_CONFIG.firstStartPosition),
     'maxresults=' + encodeURIComponent(INVOICE_CONFIG.maxResults)].join('&');
   return INVOICE_CONFIG.baseUrl + '/qbo/' + encodeURIComponent(clientId) + '/invoices?' + query;
 }
@@ -1895,6 +2004,7 @@ function buildInvoiceHeaderContext_(client, range, invoice, loadedAt, diagnostic
   const printStatus = resolveInvoiceField('printStatus');
   const emailStatus = resolveInvoiceField('emailStatus');
   const eInvoiceStatus = resolveInvoiceField('eInvoiceStatus');
+  const privateNote = resolveInvoiceField('privateNote');
   const totalAmount = resolveInvoiceField('totalAmount');
   const balance = resolveInvoiceField('balance');
   const billAddress = resolveInvoiceField('billAddress');
@@ -1911,7 +2021,8 @@ function buildInvoiceHeaderContext_(client, range, invoice, loadedAt, diagnostic
     SalesTermId: refValue_(salesTermRef), SalesTermName: refName_(salesTermRef), DepartmentId: refValue_(departmentRef),
     DepartmentName: refName_(departmentRef), BillEmail: extractEmailAddress_(billEmail),
     PrintStatus: stringOrNull_(printStatus), EmailStatus: stringOrNull_(emailStatus),
-    EInvoiceStatus: stringOrNull_(eInvoiceStatus), TotalAmount: numberOrZero_(totalAmount),
+    EInvoiceStatus: stringOrNull_(eInvoiceStatus), PrivateNote: stringOrNull_(privateNote),
+    IsVoided: invoiceIsVoided_(privateNote), TotalAmount: numberOrZero_(totalAmount),
     Balance: numberOrZero_(balance), PaymentStatus: getInvoicePaymentStatus_(totalAmount, balance),
     LinkedTxnIds: linkedTxnIds, LinkedTxnTypes: linkedTxnTypes, BillAddress: formatInvoiceAddress_(billAddress),
     ShipAddress: formatInvoiceAddress_(shipAddress), ShipFromAddress: formatInvoiceAddress_(shipFromAddress),
@@ -1969,6 +2080,8 @@ function buildInvoiceHeaderRow_(header) {
     PrintStatus: header.PrintStatus,
     EmailStatus: header.EmailStatus,
     EInvoiceStatus: header.EInvoiceStatus,
+    PrivateNote: header.PrivateNote,
+    IsVoided: header.IsVoided,
 
     TotalAmount: header.TotalAmount,
     Balance: header.Balance,
@@ -2112,6 +2225,10 @@ function getInvoicePaymentStatus_(totalAmount, balance) {
     return 'partially_paid';
   }
   return 'open';
+}
+
+function invoiceIsVoided_(privateNote) {
+  return /^voided\b/i.test(String(privateNote || '').trim());
 }
 
 function formatInvoiceAddress_(address) {
@@ -2278,6 +2395,151 @@ function buildInvoiceSnapshot_(loadedEntityConfigurationOverride, options) {
     successfulClientIds: successfulClientIds,
     clientFailures: clientFailures,
     entityConfiguration: entityConfigurationSummary,
+    sourceDiagnostics: summarizeInvoiceSourceDiagnostics_(diagnostics),
+    mappingWarnings: mappingWarnings,
+    schemaMonitoring: summarizeInvoiceSchemaMonitoring_(schemaChecks),
+    schemaBaselineUpdates: schemaBaselineUpdates
+  };
+}
+
+function buildInvoiceRollingClientSnapshot_(client, plan, loadedAt) {
+  if (!client || !String(client.id || '').trim()) {
+    throw new Error('A valid Invoice client is required for the rolling snapshot.');
+  }
+  const response = fetchInvoices_(client.id, plan.startDate, plan.horizonDate);
+  const rows = [];
+  const diagnostics = createInvoiceSourceDiagnostics_();
+  const periodInvoiceCounts = {};
+
+  response.items.forEach((invoice, index) => {
+    const txnDate = getInvoiceSourceTxnDate_(invoice);
+    const period = getInvoiceRollingPeriodForTxnDate_(txnDate, plan);
+    if (!period) {
+      throw new Error(
+        'Invoice gateway returned a transaction outside the rolling window. ' +
+        'ClientId=' + client.id + ', InvoiceIndex=' + index +
+        ', InvoiceId=' + String(invoice && (invoice.Id || invoice.InvoiceId || invoice.invoice_id) || '') +
+        ', TxnDate=' + String(txnDate || '')
+      );
+    }
+    const normalized = normalizeInvoices_(client, period, { items: [invoice] }, loadedAt);
+    normalized.rows.forEach(row => rows.push(row));
+    mergeInvoiceSourceDiagnostics_(diagnostics, normalized.diagnostics);
+    periodInvoiceCounts[period.snapshotWeek] = Number(periodInvoiceCounts[period.snapshotWeek] || 0) + 1;
+  });
+
+  sortInvoiceRows_(rows);
+  const hierarchyValidation = validateInvoiceSnapshotHierarchy_(rows);
+  const clientDiagnostics = summarizeInvoiceSourceDiagnostics_(diagnostics);
+  const schemaBaseline = prepareInvoiceSchemaBaseline_(
+    client,
+    plan.lastPeriod,
+    response.items.length,
+    diagnostics
+  );
+  return {
+    rows: rows,
+    sourceInvoiceCount: response.items.length,
+    invoiceCount: hierarchyValidation.invoiceCount,
+    periodInvoiceCounts: periodInvoiceCounts,
+    hierarchyValidation: hierarchyValidation,
+    diagnostics: diagnostics,
+    clientDiagnostics: clientDiagnostics,
+    schemaCheck: schemaBaseline.check,
+    schemaBaselineUpdate: schemaBaseline.update
+  };
+}
+
+function buildInvoiceRollingSnapshot_(loadedEntityConfigurationOverride, options) {
+  const settings = options || {};
+  const plan = getInvoiceRollingSnapshotPlan_(settings.referenceIsoDate, settings.weekCount);
+  const loadedAt = new Date().toISOString();
+  const loadedEntityConfiguration = loadedEntityConfigurationOverride || loadInvoiceEntityConfiguration_();
+  if (!loadedEntityConfiguration || !loadedEntityConfiguration.configuration) {
+    throw new Error('A valid loaded Invoice entity configuration is required.');
+  }
+  const validatedConfiguration = validateInvoiceEntityConfiguration_(loadedEntityConfiguration.configuration);
+  const effectiveConfiguration = {
+    source: String(loadedEntityConfiguration.source || 'configuration_override'),
+    configuration: validatedConfiguration
+  };
+  const clientsById = fetchClients_(effectiveConfiguration);
+  const requestedClientIds = Array.from(new Set((settings.clientIds || []).map(String)));
+  const requested = {};
+  requestedClientIds.forEach(id => { requested[id] = true; });
+  const clients = Object.keys(clientsById)
+    .filter(clientId => !requestedClientIds.length || requested[clientId])
+    .map(clientId => clientsById[clientId])
+    .sort((a, b) => String(a.entityAlias || '').localeCompare(String(b.entityAlias || '')) ||
+      String(a.name || '').localeCompare(String(b.name || '')));
+
+  const rows = [];
+  const diagnostics = createInvoiceSourceDiagnostics_();
+  const mappingWarnings = [];
+  const schemaChecks = [];
+  const schemaBaselineUpdates = [];
+  const successfulClientIds = [];
+  const clientFailures = [];
+  let sourceInvoiceCount = 0;
+  let invoiceCount = 0;
+
+  Logger.log(JSON.stringify({
+    event: 'invoice_rolling_snapshot_plan',
+    weekCount: plan.weekCount,
+    startDate: plan.startDate,
+    horizonDate: plan.horizonDate,
+    clientCount: clients.length
+  }));
+
+  clients.forEach(client => {
+    try {
+      const clientSnapshot = buildInvoiceRollingClientSnapshot_(client, plan, loadedAt);
+      clientSnapshot.rows.forEach(row => rows.push(row));
+      sourceInvoiceCount += clientSnapshot.sourceInvoiceCount;
+      invoiceCount += clientSnapshot.invoiceCount;
+      mergeInvoiceSourceDiagnostics_(diagnostics, clientSnapshot.diagnostics);
+      schemaChecks.push(clientSnapshot.schemaCheck);
+      if (clientSnapshot.schemaBaselineUpdate) schemaBaselineUpdates.push(clientSnapshot.schemaBaselineUpdate);
+      if (clientSnapshot.clientDiagnostics.aliasResolutionCount > 0 ||
+          clientSnapshot.clientDiagnostics.normalizedKeyMatchCount > 0) {
+        mappingWarnings.push({
+          clientId: client.id,
+          clientName: client.name,
+          aliasResolutionCount: clientSnapshot.clientDiagnostics.aliasResolutionCount,
+          normalizedKeyMatchCount: clientSnapshot.clientDiagnostics.normalizedKeyMatchCount,
+          aliasesUsed: clientSnapshot.clientDiagnostics.aliasesUsed,
+          normalizedKeyMatches: clientSnapshot.clientDiagnostics.normalizedKeyMatches
+        });
+      }
+      successfulClientIds.push(client.id);
+    } catch (error) {
+      if (settings.continueOnClientError !== true) throw error;
+      const failure = getInvoiceClientFailure_(client, error);
+      clientFailures.push(failure);
+      Logger.log(JSON.stringify({ event: 'invoice_rolling_client_failed', failure: failure }));
+    }
+  });
+
+  sortInvoiceRows_(rows);
+  const hierarchyValidation = validateInvoiceSnapshotHierarchy_(rows);
+  return {
+    plan: plan,
+    loadedAt: loadedAt,
+    clientCount: clients.length,
+    sourceInvoiceCount: sourceInvoiceCount,
+    invoiceCount: invoiceCount,
+    lineRows: rows,
+    successfulClientIds: successfulClientIds,
+    clientFailures: clientFailures,
+    hierarchyValidation: hierarchyValidation,
+    entityConfiguration: {
+      source: effectiveConfiguration.source,
+      reportKey: validatedConfiguration.report_key,
+      configurationVersion: validatedConfiguration.configuration_version,
+      configurationHash: validatedConfiguration.configuration_hash,
+      publishedAt: validatedConfiguration.published_at,
+      authorizedEntityCount: validatedConfiguration.entities.length
+    },
     sourceDiagnostics: summarizeInvoiceSourceDiagnostics_(diagnostics),
     mappingWarnings: mappingWarnings,
     schemaMonitoring: summarizeInvoiceSchemaMonitoring_(schemaChecks),
@@ -2467,7 +2729,7 @@ function validateInvoiceBigQueryRow_(row, index) {
       'CustomerId', 'CustomerName', 'CurrencyCode', 'CurrencyName',
       'SalesTermId', 'SalesTermName', 'DepartmentId', 'DepartmentName',
       'BillEmail', 'PrintStatus', 'EmailStatus', 'EInvoiceStatus',
-      'TotalAmount', 'Balance', 'PaymentStatus', 'LinkedTxnIds',
+      'PrivateNote', 'IsVoided', 'TotalAmount', 'Balance', 'PaymentStatus', 'LinkedTxnIds',
       'LinkedTxnTypes', 'BillAddress', 'ShipAddress', 'ShipFromAddress',
       'CreatedAt', 'UpdatedAt', 'LastModifiedBy'
     ];
@@ -2535,6 +2797,13 @@ function validateInvoiceBigQueryRow_(row, index) {
       );
     }
   });
+
+  if (
+    row.IsVoided !== null && row.IsVoided !== undefined && row.IsVoided !== '' &&
+    row.IsVoided !== true && row.IsVoided !== false
+  ) {
+    throw new Error('Invoice row ' + index + ' contains an invalid IsVoided value: ' + row.IsVoided);
+  }
 
   if (
     row.LineNumber !== null && row.LineNumber !== undefined &&
@@ -2643,10 +2912,80 @@ function snapshotInvoicesToBigQuery() {
   }
 
   try {
-    return executeInvoiceBigQuerySnapshot_();
+    const snapshotResult = executeInvoiceRollingBigQuerySnapshot_();
+    const consumptionViews = verifyInvoiceConsumptionViews_();
+    const connectedSheets = refreshInvoiceConnectedSheetsPipeline_();
+    return {
+      ...snapshotResult,
+      consumptionViews: consumptionViews,
+      connectedSheets: connectedSheets
+    };
   } finally {
     lock.releaseLock();
   }
+}
+
+function getInvoiceRollingSnapshotPlan(referenceIsoDate) {
+  return getInvoiceRollingSnapshotPlan_(referenceIsoDate);
+}
+
+function executeInvoiceRollingBigQuerySnapshot_(loadedEntityConfiguration, options) {
+  Logger.log('--- INVOICE ROLLING BIGQUERY SNAPSHOT START ---');
+  const settings = options || {};
+  const schemaValidation = validateInvoiceBigQuerySchema_();
+  const plan = getInvoiceRollingSnapshotPlan_(settings.referenceIsoDate, settings.weekCount);
+  const outsideWindowBefore = readInvoiceOutsideWindowFingerprint_(plan);
+  const result = buildInvoiceRollingSnapshot_(loadedEntityConfiguration, {
+    continueOnClientError: true,
+    referenceIsoDate: settings.referenceIsoDate,
+    weekCount: settings.weekCount,
+    clientIds: settings.clientIds || null
+  });
+  const hasClientFailures = result.clientFailures.length > 0;
+  const loadResult = replaceInvoiceSnapshotRangeClients_(
+    result.plan,
+    result.lineRows,
+    result.successfulClientIds
+  );
+  const verification = verifyInvoiceRollingSnapshot_(
+    result.plan,
+    result.lineRows,
+    result.successfulClientIds,
+    outsideWindowBefore
+  );
+  const baselinePersistence = persistInvoiceSchemaBaselineUpdates_(result.schemaBaselineUpdates);
+  const executionResult = {
+    status: hasClientFailures ? 'completed_with_entity_errors' : 'completed',
+    entityConfiguration: result.entityConfiguration,
+    schemaValidation: schemaValidation,
+    plan: result.plan,
+    clientCount: result.clientCount,
+    sourceInvoiceCount: result.sourceInvoiceCount,
+    invoiceCount: result.invoiceCount,
+    sourceRowCount: result.lineRows.length,
+    hierarchyValidation: result.hierarchyValidation,
+    sourceDiagnostics: result.sourceDiagnostics,
+    mappingWarnings: result.mappingWarnings,
+    schemaMonitoring: result.schemaMonitoring,
+    baselinePersistence: baselinePersistence,
+    successfulClientIds: result.successfulClientIds,
+    clientFailures: result.clientFailures,
+    loadResult: loadResult,
+    verification: verification
+  };
+  Logger.log(JSON.stringify(executionResult, null, 2));
+  Logger.log('--- INVOICE ROLLING BIGQUERY SNAPSHOT END ---');
+  if (hasClientFailures && settings.returnPartialResult !== true) {
+    throw new Error('Invoice rolling snapshot loaded successful entities but completed with entity errors: ' +
+      JSON.stringify({
+        startDate: result.plan.startDate,
+        horizonDate: result.plan.horizonDate,
+        successfulClientCount: result.successfulClientIds.length,
+        failedClientCount: result.clientFailures.length,
+        failures: result.clientFailures
+      }));
+  }
+  return executionResult;
 }
 
 function executeInvoiceBigQuerySnapshot_(loadedEntityConfiguration, options) {
@@ -2767,6 +3106,212 @@ function replaceInvoiceSnapshotClients_(range, rows, successfulClientIds) {
       catch (error) { Logger.log('Invoice staging cleanup failed: ' + String(error && error.message || error)); }
     }
   }
+}
+
+function validateInvoiceRollingSnapshotRows_(plan, rows, successfulClientIds) {
+  if (!plan || !Array.isArray(plan.periods) || !plan.periods.length) {
+    throw new Error('Invoice rolling snapshot requires a non-empty period plan.');
+  }
+  if (!Array.isArray(rows)) throw new Error('Invoice rolling snapshot rows must be an array.');
+  const clientIds = Array.from(new Set(
+    (successfulClientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
+  ));
+  const allowedClients = {};
+  clientIds.forEach(clientId => { allowedClients[clientId] = true; });
+  const periodsByWeek = {};
+  plan.periods.forEach(period => { periodsByWeek[period.snapshotWeek] = period; });
+
+  rows.forEach((row, index) => {
+    const clientId = String(row && row.ClientId || '').trim();
+    const period = periodsByWeek[String(row && row.SnapshotWeek || '').trim()];
+    const txnDate = normalizeDateForOutput_(row && row.TxnDate);
+    if (!allowedClients[clientId]) {
+      throw new Error('Invoice rolling row ' + index + ' belongs to a client outside the successful scope.');
+    }
+    if (!period) {
+      throw new Error('Invoice rolling row ' + index + ' belongs to a week outside the rolling plan.');
+    }
+    if (
+      row.DateFrom !== period.dateFrom ||
+      row.DateTo !== period.dateTo ||
+      row.SnapshotDate !== period.snapshotDate ||
+      !txnDate || txnDate < period.dateFrom || txnDate > period.dateTo
+    ) {
+      throw new Error('Invoice rolling row ' + index + ' has non-canonical period dates.');
+    }
+    validateInvoiceBigQueryRow_(row, index);
+  });
+  const hierarchy = validateInvoiceSnapshotHierarchy_(rows);
+  return {
+    status: 'passed',
+    weekCount: plan.periods.length,
+    successfulClientCount: clientIds.length,
+    ...hierarchy
+  };
+}
+
+function replaceInvoiceSnapshotRangeClients_(plan, rows, successfulClientIds) {
+  const validation = validateInvoiceRollingSnapshotRows_(plan, rows, successfulClientIds);
+  const ids = Array.from(new Set(
+    (successfulClientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
+  ));
+  const tableReference = [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, BQ_CONFIG.snapshotsTableId].join('.');
+  if (!ids.length) {
+    return {
+      mode: 'rolling_client_scope_noop', destinationTable: tableReference,
+      weekCount: plan.periods.length, successfulClientCount: 0, rowCount: 0, state: 'SKIPPED'
+    };
+  }
+  const prepared = buildInvoiceBigQueryRows_(rows);
+  const token = Utilities.getUuid().replace(/-/g, '');
+  const stagingTableId = 'invoice_rolling_stage_' + token;
+  const weekScopeSql = plan.periods.map(period => "DATE '" + period.snapshotWeek + "'").join(', ');
+  let stagingLoadJob = null;
+  try {
+    if (prepared.length) {
+      const blob = Utilities.newBlob(
+        prepared.map(JSON.stringify).join('\n'),
+        'application/octet-stream',
+        stagingTableId + '.ndjson'
+      );
+      const inserted = BigQuery.Jobs.insert({
+        jobReference: { projectId: BQ_CONFIG.projectId, jobId: 'invoice_rolling_stage_' + token },
+        configuration: { load: {
+          destinationTable: {
+            projectId: BQ_CONFIG.projectId,
+            datasetId: BQ_CONFIG.rawDatasetId,
+            tableId: stagingTableId
+          },
+          sourceFormat: 'NEWLINE_DELIMITED_JSON',
+          createDisposition: 'CREATE_IF_NEEDED',
+          writeDisposition: 'WRITE_TRUNCATE',
+          autodetect: false,
+          ignoreUnknownValues: false,
+          maxBadRecords: 0,
+          schema: { fields: INVOICE_BIGQUERY_SCHEMA }
+        }}
+      }, BQ_CONFIG.projectId, blob);
+      if (!inserted || !inserted.jobReference) {
+        throw new Error('BigQuery did not return a job reference for the Invoice rolling staging load.');
+      }
+      stagingLoadJob = waitForBigQueryJob_(inserted.jobReference, 120000);
+    }
+    const statements = [
+      'BEGIN TRANSACTION;',
+      'DELETE FROM `' + tableReference + '`',
+      'WHERE SnapshotWeek IN (' + weekScopeSql + ')',
+      '  AND ClientId IN (' + buildInvoiceClientScopeSql_(ids) + ');'
+    ];
+    if (prepared.length) {
+      const columns = INVOICE_EXPORT_COLUMNS.map(column => '`' + column + '`').join(', ');
+      statements.push(
+        'INSERT INTO `' + tableReference + '` (' + columns + ')',
+        'SELECT ' + columns,
+        'FROM `' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId].join('.') + '`;'
+      );
+    }
+    statements.push('COMMIT TRANSACTION;');
+    const queryResult = runBigQuerySingleRowQuery_(statements.join('\n'));
+    return {
+      mode: 'rolling_successful_clients_replace',
+      jobId: queryResult && queryResult.jobReference && queryResult.jobReference.jobId || null,
+      stagingLoadJobId: stagingLoadJob && stagingLoadJob.jobReference && stagingLoadJob.jobReference.jobId || null,
+      destinationTable: tableReference,
+      startDate: plan.startDate,
+      horizonDate: plan.horizonDate,
+      weekCount: plan.periods.length,
+      successfulClientCount: ids.length,
+      rowCount: prepared.length,
+      validation: validation,
+      state: 'DONE'
+    };
+  } finally {
+    if (prepared.length) {
+      try { BigQuery.Tables.remove(BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId); }
+      catch (error) { Logger.log('Invoice rolling staging cleanup failed: ' + String(error && error.message || error)); }
+    }
+  }
+}
+
+function readInvoiceOutsideWindowFingerprint_(plan) {
+  const tableReference = [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, BQ_CONFIG.snapshotsTableId].join('.');
+  const weekScopeSql = plan.periods.map(period => "DATE '" + period.snapshotWeek + "'").join(', ');
+  const result = runBigQuerySingleRowQuery_([
+    'SELECT',
+    '  COUNT(*) AS row_count,',
+    '  COUNT(DISTINCT idempotency_key) AS distinct_key_count,',
+    '  COALESCE(BIT_XOR(FARM_FINGERPRINT(TO_JSON_STRING(t))), 0) AS row_fingerprint',
+    'FROM `' + tableReference + '` AS t',
+    'WHERE SnapshotWeek NOT IN (' + weekScopeSql + ')'
+  ].join('\n'));
+  return {
+    rowCount: Number(result.row_count || 0),
+    distinctKeyCount: Number(result.distinct_key_count || 0),
+    rowFingerprint: String(result.row_fingerprint || '0')
+  };
+}
+
+function verifyInvoiceRollingSnapshot_(plan, rows, successfulClientIds, outsideWindowBefore) {
+  const inputValidation = validateInvoiceRollingSnapshotRows_(plan, rows, successfulClientIds);
+  const periodVerifications = plan.periods.map(period => {
+    const periodRows = rows.filter(row => row.SnapshotWeek === period.snapshotWeek);
+    return verifyInvoiceSnapshotPartition_(
+      period.snapshotWeek,
+      validateInvoiceSnapshotHierarchy_(periodRows),
+      successfulClientIds
+    );
+  });
+  const ids = Array.from(new Set(
+    (successfulClientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
+  ));
+  const tableReference = [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, BQ_CONFIG.snapshotsTableId].join('.');
+  const crossWindow = ids.length ? runBigQuerySingleRowQuery_([
+    'WITH scoped AS (',
+    '  SELECT * FROM `' + tableReference + '`',
+    "  WHERE SnapshotWeek BETWEEN DATE '" + plan.firstPeriod.snapshotWeek + "' AND DATE '" + plan.lastPeriod.snapshotWeek + "'",
+    '    AND ClientId IN (' + buildInvoiceClientScopeSql_(ids) + ')',
+    '), duplicate_invoices AS (',
+    '  SELECT ClientId, InvoiceId',
+    '  FROM scoped',
+    "  WHERE RecordType = 'HEADER'",
+    '  GROUP BY ClientId, InvoiceId',
+    '  HAVING COUNT(DISTINCT SnapshotWeek) > 1',
+    ')',
+    'SELECT',
+    '  COUNTIF(SnapshotDate != DATE_ADD(SnapshotWeek, INTERVAL 7 DAY)',
+    '    OR DateFrom != SnapshotWeek OR DateTo != DATE_ADD(SnapshotWeek, INTERVAL 6 DAY)',
+    '    OR TxnDate < DateFrom OR TxnDate > DateTo) AS noncanonical_row_count,',
+    '  (SELECT COUNT(*) FROM duplicate_invoices) AS duplicate_invoice_week_count',
+    'FROM scoped'
+  ].join('\n')) : { noncanonical_row_count: 0, duplicate_invoice_week_count: 0 };
+  const noncanonicalRowCount = Number(crossWindow.noncanonical_row_count || 0);
+  const duplicateInvoiceWeekCount = Number(crossWindow.duplicate_invoice_week_count || 0);
+  if (noncanonicalRowCount !== 0 || duplicateInvoiceWeekCount !== 0) {
+    throw new Error('Invoice rolling final validation failed: ' + JSON.stringify({
+      noncanonicalRowCount: noncanonicalRowCount,
+      duplicateInvoiceWeekCount: duplicateInvoiceWeekCount
+    }));
+  }
+  const outsideWindowAfter = readInvoiceOutsideWindowFingerprint_(plan);
+  if (JSON.stringify(outsideWindowBefore) !== JSON.stringify(outsideWindowAfter)) {
+    throw new Error('Invoice rolling snapshot modified data outside the planned window: ' + JSON.stringify({
+      before: outsideWindowBefore,
+      after: outsideWindowAfter
+    }));
+  }
+  return {
+    status: 'passed',
+    startDate: plan.startDate,
+    horizonDate: plan.horizonDate,
+    weekCount: plan.periods.length,
+    successfulClientCount: inputValidation.successfulClientCount,
+    rowCount: inputValidation.rowCount,
+    invoiceCount: inputValidation.invoiceCount,
+    noncanonicalRowCount: noncanonicalRowCount,
+    duplicateInvoiceWeekCount: duplicateInvoiceWeekCount,
+    outsideWindowFingerprint: outsideWindowAfter,
+    periodVerifications: periodVerifications
+  };
 }
 
 function replaceInvoiceSnapshotPartition_(range, rows) {

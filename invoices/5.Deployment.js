@@ -334,7 +334,7 @@ function executeInvoiceDeploymentStage_(stage, state) {
       throw new Error('Deployment configuration hash no longer matches the queued operation.');
     }
 
-    const result = executeInvoiceBigQuerySnapshot_({
+    const result = executeInvoiceRollingBigQuerySnapshot_({
       source: 'configuration_push_operation',
       configuration: configuration
     });
@@ -359,7 +359,11 @@ function validateInvoiceBigQueryDeploymentResult_(result) {
       ? result.verification.missingKeyCount
       : result.verification.invalidKeyCount
   ) || 0);
-  const distinctKeyCount = Number(result && result.verification && result.verification.distinctIdempotencyKeyCount || 0);
+  const distinctKeyCount = Number(result && result.verification && (
+    result.verification.distinctIdempotencyKeyCount !== undefined
+      ? result.verification.distinctIdempotencyKeyCount
+      : result.hierarchyValidation && result.hierarchyValidation.uniqueIdempotencyKeyCount
+  ) || 0);
 
   const failures = [];
   if (!result || !result.schemaValidation || result.schemaValidation.status !== 'passed') {
@@ -396,6 +400,191 @@ function validateInvoiceBigQueryDeploymentResult_(result) {
     missingKeyCount: missingKeyCount,
     distinctKeyCount: distinctKeyCount
   };
+}
+
+/**
+ * Returns the reviewed Invoice schema and consumption-view changes without
+ * mutating BigQuery. Production deployment remains an explicit, separate step.
+ */
+function getInvoiceConsumptionDeploymentPlan() {
+  return {
+    status: 'planned',
+    modifiesBigQuery: false,
+    schemaChanges: [
+      'ALTER TABLE `qbo-gateway-reporting.raw.invoice_snapshots` ADD COLUMN IF NOT EXISTS PrivateNote STRING',
+      'ALTER TABLE `qbo-gateway-reporting.raw.invoice_snapshots` ADD COLUMN IF NOT EXISTS IsVoided BOOL'
+    ],
+    views: [
+      {
+        name: 'vw_invoice_reports',
+        purpose: 'Canonical Invoice history excluding complete voided invoice hierarchies.',
+        preservesRawVoidedRows: true,
+        sql: buildInvoiceHistoryViewSql_()
+      },
+      {
+        name: 'vw_latest_invoice_reports',
+        purpose: 'Latest canonical Invoice week excluding complete voided invoice hierarchies.',
+        preservesRawVoidedRows: true,
+        sql: buildInvoiceLatestViewSql_()
+      }
+    ]
+  };
+}
+
+function deployInvoiceConsumptionSchemaAndViews() {
+  const plan = getInvoiceConsumptionDeploymentPlan();
+  plan.schemaChanges.forEach(sql => runBigQuerySingleRowQuery_(sql));
+  plan.views.forEach(view => runBigQuerySingleRowQuery_(view.sql));
+  const verification = verifyInvoiceConsumptionViews_();
+  const result = { status: 'completed', verification: verification };
+  Logger.log(JSON.stringify({ event: 'invoice_consumption_schema_and_views_deployed', ...result }));
+  return result;
+}
+
+function buildInvoiceViewColumns_(alias) {
+  const prefix = alias ? alias + '.' : '';
+  return [
+    '  ' + prefix + 'SnapshotWeek,',
+    '  ' + prefix + 'SnapshotDate,',
+    '  ' + prefix + 'RecordType,',
+    '  ' + prefix + 'RecordOrder,',
+    '  ' + prefix + 'Entity,',
+    '  ' + prefix + 'ClientName,',
+    '  ' + prefix + 'InvoiceId,',
+    '  ' + prefix + 'DocNumber,',
+    '  ' + prefix + 'TxnDate,',
+    '  ' + prefix + 'DueDate,',
+    '  ' + prefix + 'CustomerName,',
+    '  ' + prefix + 'CurrencyCode,',
+    '  ' + prefix + 'SalesTermName,',
+    '  ' + prefix + 'DepartmentName,',
+    '  ' + prefix + 'BillEmail,',
+    '  ' + prefix + 'TotalAmount,',
+    '  ' + prefix + 'Balance,',
+    '  ' + prefix + 'PaymentStatus,',
+    '  ' + prefix + 'LineNumber,',
+    '  ' + prefix + 'Description,',
+    '  ' + prefix + 'ItemName,',
+    '  ' + prefix + 'Quantity,',
+    '  ' + prefix + 'UnitPrice,',
+    '  ' + prefix + 'LineAmountSigned,',
+    '  ' + prefix + 'AccountName,',
+    '  ' + prefix + 'ClassName,',
+    '  ' + prefix + 'DiscountPercent,',
+    '  ' + prefix + 'DiscountAccountName,',
+    '  ' + prefix + 'LinkedTxnTypes,',
+    '  ' + prefix + 'BillAddress,',
+    '  ' + prefix + 'ShipAddress,',
+    '  ' + prefix + 'ShipFromAddress,',
+    '  ' + prefix + 'idempotency_key,',
+    '  ' + prefix + 'ClientId,',
+    '  ' + prefix + 'LoadedAt'
+  ];
+}
+
+function buildInvoiceActiveHierarchyPredicate_(rowAlias) {
+  return [
+    'NOT EXISTS (',
+    '  SELECT 1',
+    '  FROM `qbo-gateway-reporting.raw.invoice_snapshots` AS voided_headers',
+    '  WHERE voided_headers.SnapshotWeek = ' + rowAlias + '.SnapshotWeek',
+    '    AND voided_headers.ClientId = ' + rowAlias + '.ClientId',
+    '    AND voided_headers.InvoiceId = ' + rowAlias + '.InvoiceId',
+    "    AND voided_headers.RecordType = 'HEADER'",
+    '    AND COALESCE(voided_headers.IsVoided, FALSE)',
+    ')'
+  ];
+}
+
+function buildInvoiceHistoryViewSql_() {
+  return [
+    'CREATE OR REPLACE VIEW `qbo-gateway-reporting.views.vw_invoice_reports` AS',
+    'SELECT',
+    ...buildInvoiceViewColumns_('invoices'),
+    'FROM `qbo-gateway-reporting.raw.invoice_snapshots` AS invoices',
+    'WHERE ' + buildInvoiceActiveHierarchyPredicate_('invoices').join('\n'),
+    'ORDER BY',
+    '  invoices.SnapshotWeek DESC,',
+    '  invoices.SnapshotDate DESC,',
+    '  invoices.Entity,',
+    '  invoices.ClientName,',
+    '  invoices.InvoiceId,',
+    '  invoices.RecordOrder'
+  ].join('\n');
+}
+
+function buildInvoiceLatestViewSql_() {
+  return [
+    'CREATE OR REPLACE VIEW `qbo-gateway-reporting.views.vw_latest_invoice_reports` AS',
+    'WITH latest_snapshot AS (',
+    '  SELECT MAX(SnapshotWeek) AS SnapshotWeek',
+    '  FROM `qbo-gateway-reporting.raw.invoice_snapshots`',
+    ')',
+    'SELECT',
+    ...buildInvoiceViewColumns_('invoices'),
+    'FROM `qbo-gateway-reporting.raw.invoice_snapshots` AS invoices',
+    'INNER JOIN latest_snapshot',
+    '  ON invoices.SnapshotWeek = latest_snapshot.SnapshotWeek',
+    'WHERE ' + buildInvoiceActiveHierarchyPredicate_('invoices').join('\n'),
+    'ORDER BY',
+    '  invoices.SnapshotWeek DESC,',
+    '  invoices.SnapshotDate DESC,',
+    '  invoices.Entity,',
+    '  invoices.ClientName,',
+    '  invoices.InvoiceId,',
+    '  invoices.RecordOrder'
+  ].join('\n');
+}
+
+function verifyInvoiceConsumptionViews_() {
+  const result = runBigQuerySingleRowQuery_([
+    'WITH metadata AS (',
+    '  SELECT table_name, view_definition',
+    '  FROM `qbo-gateway-reporting.views.INFORMATION_SCHEMA.VIEWS`',
+    "  WHERE table_name IN ('vw_invoice_reports', 'vw_latest_invoice_reports')",
+    '), active_raw AS (',
+    '  SELECT invoices.*',
+    '  FROM `qbo-gateway-reporting.raw.invoice_snapshots` AS invoices',
+    '  WHERE ' + buildInvoiceActiveHierarchyPredicate_('invoices').join('\n'),
+    '), latest_snapshot AS (',
+    '  SELECT MAX(SnapshotWeek) AS SnapshotWeek',
+    '  FROM `qbo-gateway-reporting.raw.invoice_snapshots`',
+    '), voided_invoice_keys AS (',
+    '  SELECT DISTINCT SnapshotWeek, ClientId, InvoiceId',
+    '  FROM `qbo-gateway-reporting.raw.invoice_snapshots`',
+    "  WHERE RecordType = 'HEADER' AND COALESCE(IsVoided, FALSE)",
+    ')',
+    'SELECT',
+    '  (SELECT COUNT(*) FROM metadata) = 2 AS views_exist,',
+    "  (SELECT COUNTIF(REGEXP_CONTAINS(REGEXP_REPLACE(LOWER(view_definition), r'\\s+', ''), r'coalesce\\(voided_headers.isvoided,false\\)')) FROM metadata) = 2 AS exclude_voided,",
+    '  (SELECT COUNT(*) FROM `qbo-gateway-reporting.views.vw_invoice_reports`) AS history_actual_rows,',
+    '  (SELECT COUNT(*) FROM active_raw) AS history_expected_rows,',
+    '  (SELECT COUNT(*) FROM `qbo-gateway-reporting.views.vw_latest_invoice_reports`) AS latest_actual_rows,',
+    '  (SELECT COUNT(*) FROM active_raw, latest_snapshot WHERE active_raw.SnapshotWeek = latest_snapshot.SnapshotWeek) AS latest_expected_rows,',
+    '  (SELECT COUNT(*)',
+    '   FROM `qbo-gateway-reporting.views.vw_invoice_reports` AS visible',
+    '   INNER JOIN voided_invoice_keys USING (SnapshotWeek, ClientId, InvoiceId)) AS visible_voided_rows',
+    'FROM metadata LIMIT 1'
+  ].join('\n'));
+  const verification = {
+    viewsExist: String(result.views_exist) === 'true',
+    excludeVoided: String(result.exclude_voided) === 'true',
+    historyActualRows: Number(result.history_actual_rows || 0),
+    historyExpectedRows: Number(result.history_expected_rows || 0),
+    latestActualRows: Number(result.latest_actual_rows || 0),
+    latestExpectedRows: Number(result.latest_expected_rows || 0),
+    visibleVoidedRows: Number(result.visible_voided_rows || 0)
+  };
+  if (
+    !verification.viewsExist ||
+    !verification.excludeVoided ||
+    verification.historyActualRows !== verification.historyExpectedRows ||
+    verification.latestActualRows !== verification.latestExpectedRows ||
+    verification.visibleVoidedRows !== 0
+  ) {
+    throw new Error('Invoice consumption view validation failed: ' + JSON.stringify(verification));
+  }
+  return { status: 'passed', ...verification };
 }
 
 function refreshInvoiceConnectedSheetsPipeline_(spreadsheet) {

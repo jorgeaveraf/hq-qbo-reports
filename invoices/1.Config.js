@@ -78,7 +78,9 @@ const INVOICE_BIGQUERY_SCHEMA = [
   { name: 'UpdatedAt', type: 'TIMESTAMP', mode: 'NULLABLE' },
   { name: 'LastModifiedBy', type: 'STRING', mode: 'NULLABLE' },
 
-  { name: 'Source', type: 'STRING', mode: 'REQUIRED' }
+  { name: 'Source', type: 'STRING', mode: 'REQUIRED' },
+  { name: 'PrivateNote', type: 'STRING', mode: 'NULLABLE' },
+  { name: 'IsVoided', type: 'BOOLEAN', mode: 'NULLABLE' }
 ];
 
 const INVOICE_EXPORT_COLUMNS = INVOICE_BIGQUERY_SCHEMA.map(field => field.name);
@@ -86,7 +88,8 @@ const INVOICE_EXPORT_COLUMNS = INVOICE_BIGQUERY_SCHEMA.map(field => field.name);
 const INVOICE_CONFIG = {
   baseUrl: 'https://qbo.headquarters.co',
   apiKeyProperty: 'QBO_API_KEY', environment: 'prod', reportType: 'Invoices', maxResults: 1000, currencyDefault: 'USD',
-  sourceDefault: 'QBO'
+  sourceDefault: 'QBO', weeklyLookbackWeeks: 12,
+  firstStartPosition: 1, maxPages: 1000, pageDelayMs: 100
 };
 
 const INVOICE_ENTITY_CONTROL = {
@@ -160,6 +163,7 @@ const INVOICE_SOURCE_FIELDS = {
     }, printStatus: { paths: ['PrintStatus', 'print_status'], required: false },
     emailStatus: { paths: ['EmailStatus', 'email_status'], required: false },
     eInvoiceStatus: { paths: ['EInvoiceStatus', 'ElectronicInvoiceStatus', 'e_invoice_status'], required: false },
+    privateNote: { paths: ['PrivateNote', 'private_note'], required: false },
     totalAmount: { paths: ['TotalAmt', 'TotalAmount', 'total_amount'], required: false },
     balance: { paths: ['Balance', 'OpenBalance', 'open_balance'], required: false },
     linkedTransactions: { paths: ['LinkedTxn', 'LinkedTransactions', 'linked_txn'], required: false },
