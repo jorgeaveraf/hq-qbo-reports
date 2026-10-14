@@ -5,11 +5,15 @@ WITH bounds AS (
     DATE_SUB(DATE_TRUNC(CURRENT_DATE('America/Mexico_City'), WEEK(MONDAY)), INTERVAL 78 DAY) AS start_date,
     DATE_SUB(DATE_TRUNC(CURRENT_DATE('America/Mexico_City'), WEEK(MONDAY)), INTERVAL 1 DAY) AS end_date
 ),
+canonical_dates AS (
+  SELECT snapshot_date
+  FROM bounds,
+  UNNEST(GENERATE_DATE_ARRAY(start_date, end_date, INTERVAL 7 DAY)) AS snapshot_date
+),
 window_rows AS (
   SELECT t.*
   FROM `qbo-gateway-reporting.raw.aging_snapshots` t
-  CROSS JOIN bounds b
-  WHERE t.snapshot_date BETWEEN b.start_date AND b.end_date
+  INNER JOIN canonical_dates d USING (snapshot_date)
 )
 SELECT
   MIN(snapshot_date) AS first_snapshot_date,

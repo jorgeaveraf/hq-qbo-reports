@@ -162,6 +162,42 @@ test('final validation accepts a completed zero-row week proven by worker state'
   assert.equal(validation.actualWeekCount, 0);
 });
 
+test('final validation scopes canonical Sundays and fingerprints all legacy captures', () => {
+  const context = loadContext();
+  const plan = context.buildAgingRollingReconciliationPlan_('2026-10-14');
+  const expectedByDate = {};
+  plan.periods.forEach(period => {
+    expectedByDate[period.snapshotDate] = [0, 0, 0, 0, 0, 0];
+  });
+  const state = {
+    plan,
+    completedCount: 12,
+    expectedByDate,
+    outsideWindowBaseline: { rowCount: 150520, rowFingerprint: 'legacy' }
+  };
+  const queries = [];
+  install(context, 'runAgingBigQueryQuery_', query => {
+    queries.push(query);
+    if (queries.length === 1) return {
+      schema: { fields: [
+        'row_count', 'actual_week_count', 'unique_row_count', 'ar_row_count', 'ap_row_count',
+        'ar_open_amount', 'ap_open_amount', 'noncanonical_date_count',
+        'invalid_report_type_count', 'invalid_bucket_count'
+      ].map(name => ({ name })) },
+      rows: [{ f: Array(10).fill(null).map(() => ({ v: '0' })) }]
+    };
+    return {
+      schema: { fields: [{ name: 'row_count' }, { name: 'row_fingerprint' }] },
+      rows: [{ f: [{ v: '150520' }, { v: 'legacy' }] }]
+    };
+  });
+
+  assert.equal(context.validateAgingRollingReconciliation_(state).status, 'passed');
+  assert.match(queries[0], /snapshot_date IN UNNEST\(GENERATE_DATE_ARRAY/);
+  assert.match(queries[1], /snapshot_date NOT IN UNNEST\(GENERATE_DATE_ARRAY/);
+  assert.doesNotMatch(queries[0], /snapshot_date BETWEEN/);
+});
+
 test('a final-validation failure blocks every Connected Sheets refresh', () => {
   const context = loadContext();
   const state = {

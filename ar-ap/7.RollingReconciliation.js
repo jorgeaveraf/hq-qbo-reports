@@ -71,13 +71,18 @@ function readAgingRollingScalarRow_(queryResult) {
   }, {});
 }
 
+function buildAgingRollingCanonicalDatePredicate_(plan, excluded) {
+  return 'snapshot_date ' + (excluded ? 'NOT ' : '') +
+    "IN UNNEST(GENERATE_DATE_ARRAY(DATE '" + plan.startDate + "', DATE '" +
+    plan.endDate + "', INTERVAL 7 DAY))";
+}
+
 function readAgingRollingOutsideFingerprint_(plan) {
   const result = runAgingBigQueryQuery_([
     'SELECT COUNT(*) AS row_count,',
     "  COALESCE(CAST(BIT_XOR(FARM_FINGERPRINT(TO_JSON_STRING(t))) AS STRING), '0') AS row_fingerprint",
     'FROM `' + AGING_BIGQUERY_TABLE + '` t',
-    "WHERE snapshot_date < DATE '" + plan.startDate + "'",
-    "   OR snapshot_date > DATE '" + plan.endDate + "'"
+    'WHERE ' + buildAgingRollingCanonicalDatePredicate_(plan, true)
   ].join('\n'));
   const row = readAgingRollingScalarRow_(result);
   return {
@@ -125,7 +130,7 @@ function validateAgingRollingReconciliation_(state) {
     "    WHEN days_overdue <= 30 THEN '1–30' WHEN days_overdue <= 60 THEN '31–60'",
     "    WHEN days_overdue <= 90 THEN '61–90' ELSE '91+' END) AS invalid_bucket_count",
     'FROM `' + AGING_BIGQUERY_TABLE + '` t',
-    "WHERE snapshot_date BETWEEN DATE '" + plan.startDate + "' AND DATE '" + plan.endDate + "'"
+    'WHERE ' + buildAgingRollingCanonicalDatePredicate_(plan, false)
   ].join('\n'));
   const row = readAgingRollingScalarRow_(result);
   const actual = {
