@@ -3149,6 +3149,7 @@ function validateInvoiceRollingSnapshotRows_(plan, rows, successfulClientIds) {
     const clientId = String(row && row.ClientId || '').trim();
     const period = periodsByWeek[String(row && row.SnapshotWeek || '').trim()];
     const txnDate = normalizeDateForOutput_(row && row.TxnDate);
+    const recordType = String(row && row.RecordType || '').trim().toUpperCase();
     if (!allowedClients[clientId]) {
       throw new Error('Invoice rolling row ' + index + ' belongs to a client outside the successful scope.');
     }
@@ -3159,9 +3160,16 @@ function validateInvoiceRollingSnapshotRows_(plan, rows, successfulClientIds) {
       row.DateFrom !== period.dateFrom ||
       row.DateTo !== period.dateTo ||
       row.SnapshotDate !== period.snapshotDate ||
-      !txnDate || txnDate < period.dateFrom || txnDate > period.dateTo
+      (recordType === 'HEADER' && (!txnDate || txnDate < period.dateFrom || txnDate > period.dateTo))
     ) {
-      throw new Error('Invoice rolling row ' + index + ' has non-canonical period dates.');
+      throw new Error('Invoice rolling row ' + index + ' has non-canonical period dates. ' + JSON.stringify({
+        recordType: recordType,
+        snapshotWeek: row && row.SnapshotWeek,
+        snapshotDate: row && row.SnapshotDate,
+        dateFrom: row && row.DateFrom,
+        dateTo: row && row.DateTo,
+        txnDate: txnDate || null
+      }));
     }
     validateInvoiceBigQueryRow_(row, index);
   });

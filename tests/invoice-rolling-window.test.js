@@ -189,6 +189,49 @@ test('rolling replacement touches only planned weeks and successful clients', ()
   assert.equal(removedTable, 'invoice_rolling_stage_12345678123412341234123456789abc');
 });
 
+test('rolling validation accepts invoice line rows without a duplicated TxnDate', () => {
+  const context = loadInvoicesContext();
+  const plan = context.getInvoiceRollingSnapshotPlan_('2026-10-19');
+  const period = plan.lastPeriod;
+  const base = {
+    ClientId: 'client-1', ClientName: 'Client 1', Entity: 'client_1', InvoiceId: 'invoice-1',
+    SnapshotWeek: period.snapshotWeek, SnapshotDate: period.snapshotDate,
+    DateFrom: period.dateFrom, DateTo: period.dateTo
+  };
+  const rows = [
+    {
+      ...base, idempotency_key: 'a'.repeat(64), RecordType: 'HEADER', RecordOrder: 0,
+      TxnDate: period.dateFrom
+    },
+    {
+      ...base, idempotency_key: 'b'.repeat(64), RecordType: 'LINE', RecordOrder: 1,
+      LineId: 'line-1', LineType: 'SalesItemLineDetail', TxnDate: null
+    }
+  ];
+  context.validateInvoiceBigQueryRow_ = () => {};
+  const result = context.validateInvoiceRollingSnapshotRows_(plan, rows, ['client-1']);
+  assert.equal(result.status, 'passed');
+  assert.equal(result.headerRowCount, 1);
+  assert.equal(result.lineRowCount, 1);
+});
+
+test('rolling validation still rejects a header whose TxnDate is outside its canonical week', () => {
+  const context = loadInvoicesContext();
+  const plan = context.getInvoiceRollingSnapshotPlan_('2026-10-19');
+  const period = plan.lastPeriod;
+  const rows = [{
+    idempotency_key: 'a'.repeat(64), RecordType: 'HEADER', RecordOrder: 0,
+    ClientId: 'client-1', InvoiceId: 'invoice-1', SnapshotWeek: period.snapshotWeek,
+    SnapshotDate: period.snapshotDate, DateFrom: period.dateFrom, DateTo: period.dateTo,
+    TxnDate: '2026-01-01'
+  }];
+  context.validateInvoiceBigQueryRow_ = () => {};
+  assert.throws(
+    () => context.validateInvoiceRollingSnapshotRows_(plan, rows, ['client-1']),
+    /non-canonical period dates/
+  );
+});
+
 test('an empty successful client removes stale invoices without creating a staging table', () => {
   const context = loadInvoicesContext();
   const plan = context.getInvoiceRollingSnapshotPlan_('2026-10-19');
