@@ -3198,35 +3198,10 @@ function replaceInvoiceSnapshotRangeClients_(plan, rows, successfulClientIds) {
   const token = Utilities.getUuid().replace(/-/g, '');
   const stagingTableId = 'invoice_rolling_stage_' + token;
   const weekScopeSql = plan.periods.map(period => "DATE '" + period.snapshotWeek + "'").join(', ');
-  let stagingLoadJob = null;
+  let stagingLoadJobs = [];
   try {
     if (prepared.length) {
-      const blob = Utilities.newBlob(
-        prepared.map(JSON.stringify).join('\n'),
-        'application/octet-stream',
-        stagingTableId + '.ndjson'
-      );
-      const inserted = BigQuery.Jobs.insert({
-        jobReference: { projectId: BQ_CONFIG.projectId, jobId: 'invoice_rolling_stage_' + token },
-        configuration: { load: {
-          destinationTable: {
-            projectId: BQ_CONFIG.projectId,
-            datasetId: BQ_CONFIG.rawDatasetId,
-            tableId: stagingTableId
-          },
-          sourceFormat: 'NEWLINE_DELIMITED_JSON',
-          createDisposition: 'CREATE_IF_NEEDED',
-          writeDisposition: 'WRITE_TRUNCATE',
-          autodetect: false,
-          ignoreUnknownValues: false,
-          maxBadRecords: 0,
-          schema: { fields: INVOICE_BIGQUERY_SCHEMA }
-        }}
-      }, BQ_CONFIG.projectId, blob);
-      if (!inserted || !inserted.jobReference) {
-        throw new Error('BigQuery did not return a job reference for the Invoice rolling staging load.');
-      }
-      stagingLoadJob = waitForBigQueryJob_(inserted.jobReference, 120000);
+      stagingLoadJobs = loadInvoiceRollingStagingChunks_(prepared, stagingTableId, token);
     }
     const statements = [
       'BEGIN TRANSACTION;',
@@ -3247,7 +3222,10 @@ function replaceInvoiceSnapshotRangeClients_(plan, rows, successfulClientIds) {
     return {
       mode: 'rolling_successful_clients_replace',
       jobId: queryResult && queryResult.jobReference && queryResult.jobReference.jobId || null,
-      stagingLoadJobId: stagingLoadJob && stagingLoadJob.jobReference && stagingLoadJob.jobReference.jobId || null,
+      stagingLoadJobId: stagingLoadJobs.length ? stagingLoadJobs[0].jobId : null,
+      stagingLoadJobIds: stagingLoadJobs.map(job => job.jobId),
+      stagingChunkCount: stagingLoadJobs.length,
+      stagingPayloadBytes: stagingLoadJobs.reduce((total, job) => total + job.payloadBytes, 0),
       destinationTable: tableReference,
       startDate: plan.startDate,
       horizonDate: plan.horizonDate,
@@ -3263,6 +3241,89 @@ function replaceInvoiceSnapshotRangeClients_(plan, rows, successfulClientIds) {
       catch (error) { Logger.log('Invoice rolling staging cleanup failed: ' + String(error && error.message || error)); }
     }
   }
+}
+
+function invoiceUtf8ByteLength_(value) {
+  const text = String(value || '');
+  let bytes = 0;
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xD800 && code <= 0xDBFF && index + 1 < text.length &&
+        text.charCodeAt(index + 1) >= 0xDC00 && text.charCodeAt(index + 1) <= 0xDFFF) {
+      bytes += 4;
+      index++;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+function loadInvoiceRollingStagingChunks_(preparedRows, stagingTableId, token, maxChunkBytesOverride) {
+  const maxChunkBytes = Number(maxChunkBytesOverride || INVOICE_CONFIG.maxStagingChunkBytes);
+  if (!Number.isInteger(maxChunkBytes) || maxChunkBytes < 1024) {
+    throw new Error('Invoice staging chunk size must be an integer of at least 1024 bytes.');
+  }
+  const jobs = [];
+  let lines = [];
+  let payloadBytes = 0;
+
+  const flush = () => {
+    if (!lines.length) return;
+    const chunkNumber = jobs.length + 1;
+    const jobId = 'invoice_rolling_stage_' + token + '_' + ('0000' + chunkNumber).slice(-4);
+    const blob = Utilities.newBlob(
+      lines.join('\n'),
+      'application/octet-stream',
+      stagingTableId + '_' + ('0000' + chunkNumber).slice(-4) + '.ndjson'
+    );
+    const request = {
+      jobReference: { projectId: BQ_CONFIG.projectId, jobId: jobId },
+      configuration: { load: {
+        destinationTable: {
+          projectId: BQ_CONFIG.projectId,
+          datasetId: BQ_CONFIG.rawDatasetId,
+          tableId: stagingTableId
+        },
+        sourceFormat: 'NEWLINE_DELIMITED_JSON',
+        createDisposition: chunkNumber === 1 ? 'CREATE_IF_NEEDED' : 'CREATE_NEVER',
+        writeDisposition: chunkNumber === 1 ? 'WRITE_TRUNCATE' : 'WRITE_APPEND',
+        autodetect: false,
+        ignoreUnknownValues: false,
+        maxBadRecords: 0,
+        schema: { fields: INVOICE_BIGQUERY_SCHEMA }
+      }}
+    };
+    const inserted = BigQuery.Jobs.insert(request, BQ_CONFIG.projectId, blob);
+    if (!inserted || !inserted.jobReference) {
+      throw new Error('BigQuery did not return a job reference for Invoice staging chunk ' + chunkNumber + '.');
+    }
+    const completed = waitForBigQueryJob_(inserted.jobReference, 120000);
+    jobs.push({
+      jobId: completed.jobReference.jobId,
+      rowCount: lines.length,
+      payloadBytes: payloadBytes,
+      writeDisposition: request.configuration.load.writeDisposition,
+      state: completed.status.state
+    });
+    lines = [];
+    payloadBytes = 0;
+  };
+
+  (preparedRows || []).forEach((row, index) => {
+    const line = JSON.stringify(row);
+    const lineBytes = invoiceUtf8ByteLength_(line);
+    if (lineBytes > maxChunkBytes) {
+      throw new Error('Invoice rolling row ' + index + ' exceeds the staging chunk byte limit.');
+    }
+    const separatorBytes = lines.length ? 1 : 0;
+    if (lines.length && payloadBytes + separatorBytes + lineBytes > maxChunkBytes) flush();
+    if (lines.length) payloadBytes += 1;
+    lines.push(line);
+    payloadBytes += lineBytes;
+  });
+  flush();
+  return jobs;
 }
 
 function readInvoiceOutsideWindowFingerprint_(plan) {

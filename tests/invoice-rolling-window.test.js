@@ -187,6 +187,31 @@ test('rolling replacement touches only planned weeks and successful clients', ()
   assert.doesNotMatch(query, /2026-07-20/);
   assert.match(query, /COMMIT TRANSACTION;/);
   assert.equal(removedTable, 'invoice_rolling_stage_12345678123412341234123456789abc');
+  assert.equal(result.stagingChunkCount, 1);
+});
+
+test('rolling staging load splits a large payload into ordered truncate and append jobs', () => {
+  const context = loadInvoicesContext();
+  const requests = [];
+  context.BigQuery = {
+    Jobs: { insert: (request, _projectId, blob) => {
+      requests.push({ request, bytes: blob.getBytes().length });
+      return { jobReference: request.jobReference };
+    }}
+  };
+  context.waitForBigQueryJob_ = jobReference => ({ jobReference, status: { state: 'DONE' } });
+  const rows = Array.from({ length: 8 }, (_, index) => ({
+    idempotency_key: String(index), Description: 'á'.repeat(90), InvoiceId: 'invoice-' + index
+  }));
+  const jobs = context.loadInvoiceRollingStagingChunks_(rows, 'stage_table', 'token', 1024);
+  assert.ok(jobs.length > 1);
+  assert.equal(requests[0].request.configuration.load.writeDisposition, 'WRITE_TRUNCATE');
+  requests.slice(1).forEach(({ request }) => {
+    assert.equal(request.configuration.load.writeDisposition, 'WRITE_APPEND');
+    assert.equal(request.configuration.load.createDisposition, 'CREATE_NEVER');
+  });
+  requests.forEach(({ bytes }) => assert.ok(bytes <= 1024));
+  assert.equal(jobs.reduce((total, job) => total + job.rowCount, 0), rows.length);
 });
 
 test('rolling validation accepts invoice line rows without a duplicated TxnDate', () => {

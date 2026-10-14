@@ -89,7 +89,8 @@ const INVOICE_CONFIG = {
   baseUrl: 'https://qbo.headquarters.co',
   apiKeyProperty: 'QBO_API_KEY', environment: 'prod', reportType: 'Invoices', maxResults: 1000, currencyDefault: 'USD',
   sourceDefault: 'QBO', weeklyLookbackWeeks: 12,
-  firstStartPosition: 1, maxPages: 1000, pageDelayMs: 100
+  firstStartPosition: 1, maxPages: 1000, pageDelayMs: 100,
+  maxStagingChunkBytes: 5 * 1024 * 1024
 };
 
 const INVOICE_ENTITY_CONTROL = {
