@@ -14,6 +14,9 @@ function loadAgingContext() {
   });
 
   context.Logger = { log: () => {} };
+  context.Utilities = {
+    formatDate: date => date.toISOString().slice(0, 10)
+  };
   return context;
 }
 
@@ -344,6 +347,80 @@ test('transient gateway failures retry only the affected reports', () => {
   assert.equal(results.every(result => result.success), true);
   assert.equal(results.find(result => result.reportKind === 'customer').attempts, 1);
   assert.equal(results.find(result => result.reportKind === 'vendor').attempts, 2);
+});
+
+test('snapshot fails closed before replacement when either AR or AP cannot be fetched', () => {
+  const context = loadAgingContext();
+  let fetchCount = 0;
+  let deleteStarted = false;
+  installFunction(context, 'fetchReport_', () => {
+    fetchCount++;
+    if (fetchCount === 2) throw new Error('AR/AP gateway returned HTTP 503');
+    return { data: { Header: { ReportDate: '2026-09-20' }, Rows: { Row: [] } } };
+  });
+  installFunction(context, 'ensureAgingBigQueryQueryJob_', () => {
+    deleteStarted = true;
+    return { done: true };
+  });
+
+  assert.throws(
+    () => context.processAgingBigQueryCheckpointClient_({
+      clients: [{ id: 'client-a', name: 'Client A', entity: 'client_a' }],
+      next_client_index: 0, current_client: null,
+      range: { snapshotDate: '2026-09-20', snapshotWeek: '2026-09-14' },
+      loaded_at: '2026-09-21T00:00:00.000Z'
+    }, Date.now()),
+    /HTTP 503/
+  );
+  assert.equal(deleteStarted, false);
+});
+
+test('a successful 200 report with no rows is a valid zero balance', () => {
+  const context = loadAgingContext();
+  installFunction(context, 'fetchReport_', () => ({
+    data: { Header: { ReportDate: '2026-09-20' }, Rows: { Row: [] } }
+  }));
+
+  const snapshot = context.buildAgingClientSnapshot_(
+    { id: 'client-a', name: 'Client A', entity: 'client_a' },
+    { snapshotDate: '2026-09-20', snapshotWeek: '2026-09-14' },
+    '2026-09-21T00:00:00.000Z'
+  );
+
+  assert.equal(snapshot.rowCount, 0);
+  assert.equal(snapshot.reportReconciliation.AR.sourceOpenAmountCents, 0);
+  assert.equal(snapshot.reportReconciliation.AP.sourceOpenAmountCents, 0);
+});
+
+test('QBO source totals must match normalized AR/AP rows', () => {
+  const context = loadAgingContext();
+  const payload = {
+    data: {
+      Columns: { Column: [
+        { ColTitle: 'Date' }, { ColTitle: 'Transaction Type' }, { ColTitle: 'Num' },
+        { ColTitle: 'Due Date' }, { ColTitle: 'Amount' }, { ColTitle: 'Open Balance' }
+      ] },
+      Rows: { Row: [{
+        Summary: { ColData: [
+          { value: 'TOTAL' }, { value: '' }, { value: '' },
+          { value: '' }, { value: '' }, { value: '100.00' }
+        ] }
+      }] }
+    }
+  };
+  const rows = [
+    ['AR', 'client_a', '2026-09-20', 'Current', 'A', '', 'Invoice', '', '', 0, 125.50, 'USD', 'QBO'],
+    ['AR', 'client_a', '2026-09-20', 'Current', 'B', '', 'Credit Memo', '', '', 0, -25.50, 'USD', 'QBO']
+  ];
+
+  assert.equal(
+    context.reconcileAgingReportTotal_(payload, rows, 'client-a', 'customer', '2026-09-20').status,
+    'passed'
+  );
+  assert.throws(
+    () => context.reconcileAgingReportTotal_(payload, rows.slice(0, 1), 'client-a', 'customer', '2026-09-20'),
+    /source total mismatch/
+  );
 });
 
 test('completed BigQuery fallback is grouped by entity and validated by row count', () => {

@@ -1457,29 +1457,7 @@ function fetchJsonResponse_(url) {
  ***********************/
 
 function snapshotAgingToBigQuery() {
-  const loaded = loadAgingEntityConfiguration_();
-  const range = buildAgingSnapshotRange_();
-  const deployment = queueAgingConfigurationDeployment_(
-    { request_id: Utilities.getUuid() },
-    loaded.configuration,
-    {
-      source: 'scheduled_snapshot',
-      range
-    }
-  );
-
-  if (deployment.status === 'completed' && deployment.queued !== true) {
-    Logger.log(JSON.stringify({
-      event: 'aging_snapshot_deployment_idempotent',
-      operationId: deployment.operationId,
-      snapshotDate: range.snapshotDate,
-      configurationVersion: deployment.configurationVersion,
-      configurationHash: deployment.configurationHash
-    }));
-    return deployment;
-  }
-
-  return processAgingConfigurationDeployment();
+  return startAgingRollingReconciliation();
 }
 
 
@@ -1593,10 +1571,17 @@ function buildAgingClientSnapshot_(client, range, loadedAt) {
   const rows = [];
   const reportRowCounts = { AR: 0, AP: 0 };
   const openAmountCents = { AR: 0, AP: 0 };
+  const reportReconciliation = {};
 
   ['customer', 'vendor'].forEach(reportKind => {
     const payload = fetchReport_(clientId, reportKind, range.snapshotDate);
-    if (!payload) return;
+    if (!payload) {
+      throw new Error(
+        'AR/AP report fetch failed. clientId=' + clientId +
+        ', reportKind=' + reportKind +
+        ', requested=' + range.snapshotDate
+      );
+    }
 
     const reportType = reportKind === 'customer' ? 'AR' : 'AP';
     const asOfDate = extractAsOfDate_(payload);
@@ -1612,13 +1597,18 @@ function buildAgingClientSnapshot_(client, range, loadedAt) {
       );
     }
     const flatRows = flattenReport_(payload);
+    const exportRows = mapToExportRows_(flatRows, client, reportKind, asOfDate);
+    reportReconciliation[reportType] = reconcileAgingReportTotal_(
+      payload,
+      exportRows,
+      clientId,
+      reportKind,
+      range.snapshotDate
+    );
 
     if (!flatRows.length) {
       Logger.log('Sin filas para clientId=' + clientId + ', reportKind=' + reportKind);
-      return;
     }
-
-    const exportRows = mapToExportRows_(flatRows, client, reportKind, asOfDate);
     exportRows.forEach(exportRow => {
       const row = {
         snapshot_date: range.snapshotDate,
@@ -1658,8 +1648,87 @@ function buildAgingClientSnapshot_(client, range, loadedAt) {
     rowCount: rows.length,
     uniqueRowCount: countUniqueAgingRows_(rows),
     reportRowCounts,
-    openAmountCents
+    openAmountCents,
+    reportReconciliation
   };
+}
+
+function reconcileAgingReportTotal_(payload, exportRows, clientId, reportKind, snapshotDate) {
+  let sourceOpenAmountCents = extractAgingReportTotalCents_(payload);
+  const normalizedOpenAmountCents = (exportRows || []).reduce(
+    (total, row) => total + agingAmountToCents_(row && row[10]),
+    0
+  );
+
+  // QBO may omit Summary for a valid report with no detail rows. That is a
+  // successful zero balance, not a transport failure.
+  if (sourceOpenAmountCents === null && !(exportRows || []).length) {
+    sourceOpenAmountCents = 0;
+  }
+  if (sourceOpenAmountCents === null) {
+    throw new Error(
+      'AR/AP source report total is unavailable. clientId=' + clientId +
+      ', reportKind=' + reportKind + ', requested=' + snapshotDate
+    );
+  }
+  if (sourceOpenAmountCents !== normalizedOpenAmountCents) {
+    throw new Error(
+      'AR/AP source total mismatch. clientId=' + clientId +
+      ', reportKind=' + reportKind + ', requested=' + snapshotDate +
+      ', sourceCents=' + sourceOpenAmountCents +
+      ', normalizedCents=' + normalizedOpenAmountCents
+    );
+  }
+
+  return {
+    status: 'passed',
+    sourceOpenAmountCents,
+    normalizedOpenAmountCents,
+    differenceCents: 0
+  };
+}
+
+function extractAgingReportTotalCents_(payload) {
+  const data = payload && payload.data ? payload.data : payload;
+  const columnMap = buildReportColumnMap_(payload);
+  const directSummary = data && data.Summary && data.Summary.ColData;
+  if (Array.isArray(directSummary)) {
+    return agingAmountToCents_(getAgingSummaryAmount_(directSummary, columnMap));
+  }
+
+  const rowsSummary = data && data.Rows && data.Rows.Summary && data.Rows.Summary.ColData;
+  if (Array.isArray(rowsSummary)) {
+    return agingAmountToCents_(getAgingSummaryAmount_(rowsSummary, columnMap));
+  }
+
+  const topRows = data && data.Rows && Array.isArray(data.Rows.Row)
+    ? data.Rows.Row
+    : [];
+  const grandTotalRow = topRows.find(row =>
+    row && row.Summary && Array.isArray(row.Summary.ColData) &&
+    !row.Header && !(row.Rows && Array.isArray(row.Rows.Row))
+  );
+  if (grandTotalRow) {
+    return agingAmountToCents_(
+      getAgingSummaryAmount_(grandTotalRow.Summary.ColData, columnMap)
+    );
+  }
+
+  const sectionTotals = topRows
+    .map(row => row && row.Summary && row.Summary.ColData)
+    .filter(Array.isArray)
+    .map(colData => agingAmountToCents_(getAgingSummaryAmount_(colData, columnMap)));
+  if (!sectionTotals.length) return null;
+  return sectionTotals.reduce((total, amount) => total + amount, 0);
+}
+
+function getAgingSummaryAmount_(colData, columnMap) {
+  return parseAmount_(firstNonEmpty_(
+    getColDataValueByRole_(colData, columnMap, 'openAmount'),
+    getColDataValueByRole_(colData, columnMap, 'balance'),
+    getColDataValueByRole_(colData, columnMap, 'amount'),
+    0
+  ));
 }
 
 function agingAmountToCents_(value) {
@@ -2089,45 +2158,29 @@ function clearEmptyAgingPartition_(snapshotDate) {
 
 function fetchReport_(clientId, reportKind, reportDate) {
   const url = buildAgingReportUrl_(clientId, reportKind, reportDate);
-  if (!url) return null;
+  if (!url) throw new Error('Unsupported AR/AP report kind: ' + reportKind);
   const response = fetchJsonResponse_(url);
 
   if (response.error) {
-    Logger.log(
-      'Error llamando reporte clientId=' +
-        clientId +
-        ', reportKind=' +
-        reportKind +
-        ': ' +
-        response.error
+    throw new Error(
+      'AR/AP gateway request failed. clientId=' + clientId +
+      ', reportKind=' + reportKind + ', error=' + response.error
     );
-    return null;
   }
 
   if (response.status < 200 || response.status >= 300) {
-    Logger.log(
-      'HTTP ' +
-        response.status +
-        ' en clientId=' +
-        clientId +
-        ', reportKind=' +
-        reportKind +
-        ', body=' +
-        response.body.slice(0, 500)
+    throw new Error(
+      'AR/AP gateway returned HTTP ' + response.status +
+      '. clientId=' + clientId + ', reportKind=' + reportKind +
+      ', body=' + String(response.body || '').slice(0, 500)
     );
-    return null;
   }
 
   if (response.parseError) {
-    Logger.log(
-      'JSON inválido en clientId=' +
-        clientId +
-        ', reportKind=' +
-        reportKind +
-        ', error=' +
-        response.parseError
+    throw new Error(
+      'AR/AP gateway returned invalid JSON. clientId=' + clientId +
+      ', reportKind=' + reportKind + ', error=' + response.parseError
     );
-    return null;
   }
 
   return response.json;

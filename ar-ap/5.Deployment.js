@@ -8,6 +8,13 @@ function queueAgingConfigurationDeployment_(pushPayload, configuration, options)
   const range = normalizeAgingDeploymentRange_(normalizedOptions.range);
   const source = String(normalizedOptions.source || 'configuration_push').trim();
   const skipOutputSheets = normalizedOptions.skipOutputSheets === true;
+  const skipConnectedSheets = normalizedOptions.skipConnectedSheets === true;
+  const forceReprocess = normalizedOptions.forceReprocess === true;
+  const selectedClientIds = Array.from(new Set(
+    (normalizedOptions.clientIds || [])
+      .map(clientId => String(clientId || '').trim())
+      .filter(Boolean)
+  )).sort();
   const current = readAgingDeploymentState_();
 
   const sameOperation = current &&
@@ -16,9 +23,10 @@ function queueAgingConfigurationDeployment_(pushPayload, configuration, options)
     current.configuration_version === validatedConfiguration.configuration_version &&
     current.configuration_hash === validatedConfiguration.configuration_hash &&
     current.range &&
-    current.range.periodKey === range.periodKey;
+    current.range.periodKey === range.periodKey &&
+    JSON.stringify(current.selected_client_ids || []) === JSON.stringify(selectedClientIds);
 
-  if (sameOperation && ['pending', 'processing', 'completed'].includes(current.status)) {
+  if (!forceReprocess && sameOperation && ['pending', 'processing', 'completed'].includes(current.status)) {
     if (current.status !== 'completed') {
       ensureAgingDeploymentWorkerScheduled_(AGING_OPERATIONAL_DEPLOYMENT.continuationDelayMs);
     }
@@ -39,6 +47,8 @@ function queueAgingConfigurationDeployment_(pushPayload, configuration, options)
     request_id: String(pushPayload && pushPayload.request_id || Utilities.getUuid()),
     report_key: AGING_ENTITY_CONTROL.reportKey,
     source,
+    selected_client_ids: selectedClientIds,
+    is_client_subset: selectedClientIds.length > 0,
     configuration_version: validatedConfiguration.configuration_version,
     configuration_hash: validatedConfiguration.configuration_hash,
     configuration: validatedConfiguration,
@@ -66,8 +76,14 @@ function queueAgingConfigurationDeployment_(pushPayload, configuration, options)
         ? { ...createAgingDeploymentStageState_(), status: 'completed', completed_at: now,
           result: { status: 'skipped_for_historical_backfill' } }
         : createAgingDeploymentStageState_(),
-      data_source_sheets: createAgingDeploymentStageState_(),
-      extracts: createAgingDeploymentStageState_()
+      data_source_sheets: skipConnectedSheets
+        ? { ...createAgingDeploymentStageState_(), status: 'completed', completed_at: now,
+          result: { status: 'skipped_for_rolling_reconciliation' } }
+        : createAgingDeploymentStageState_(),
+      extracts: skipConnectedSheets
+        ? { ...createAgingDeploymentStageState_(), status: 'completed', completed_at: now,
+          result: { status: 'skipped_for_rolling_reconciliation' } }
+        : createAgingDeploymentStageState_()
     }
   };
 
@@ -536,7 +552,7 @@ function executeAgingBigQueryContinuationStage_(state) {
     processedThisExecution++;
   }
 
-  if (!checkpoint.stale_cleanup_completed) {
+  if (!checkpoint.stale_cleanup_completed && !checkpoint.is_client_subset) {
     const cleanupResult = ensureAgingBigQueryQueryJob_(
       checkpoint.stale_cleanup_job_id,
       buildAgingStaleClientsDeleteQuery_(
@@ -551,6 +567,7 @@ function executeAgingBigQueryContinuationStage_(state) {
     checkpoint.updated_at = new Date().toISOString();
     persistAgingBigQueryCheckpoint_(checkpoint);
   }
+  if (checkpoint.is_client_subset) checkpoint.stale_cleanup_completed = true;
 
   if (checkpoint.verification) {
     return buildAgingBigQueryCompletionResult_(checkpoint);
@@ -632,6 +649,17 @@ function initializeAgingBigQueryCheckpoint_(state) {
     configuration
   };
   const snapshotClients = getAgingSnapshotClients_(loaded);
+  const requestedClientIds = Array.from(new Set(
+    (state.selected_client_ids || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
+  ));
+  const clients = requestedClientIds.length
+    ? snapshotClients.clients.filter(client => requestedClientIds.includes(String(client.id)))
+    : snapshotClients.clients;
+  const resolvedClientIds = clients.map(client => String(client.id));
+  const missingClientIds = requestedClientIds.filter(clientId => !resolvedClientIds.includes(clientId));
+  if (missingClientIds.length) {
+    throw new Error('Aging requested clients are not authorized or available: ' + missingClientIds.join(','));
+  }
   const now = new Date().toISOString();
   const checkpoint = {
     schema_version: '1.0',
@@ -644,7 +672,8 @@ function initializeAgingBigQueryCheckpoint_(state) {
       snapshotClients.selection
     ),
     schema_validation: validateAgingBigQuerySchema_(),
-    clients: snapshotClients.clients,
+    clients,
+    is_client_subset: requestedClientIds.length > 0,
     next_client_index: 0,
     processed_client_count: 0,
     clients_with_rows_count: 0,
@@ -712,6 +741,7 @@ function processAgingBigQueryCheckpointClient_(checkpoint, executionStartedAt) {
       unique_row_count: clientSnapshot.uniqueRowCount,
       report_row_counts: clientSnapshot.reportRowCounts,
       open_amount_cents: clientSnapshot.openAmountCents,
+      report_reconciliation: clientSnapshot.reportReconciliation,
       delete_job_id: null,
       load_job_id: null,
       prepared_at: new Date().toISOString()
@@ -846,6 +876,7 @@ function processAgingBigQueryCheckpointClient_(checkpoint, executionStartedAt) {
     clientName: currentClient.client_name,
     rowCount: currentClient.row_count,
     reportRowCounts: currentClient.report_row_counts,
+    reportReconciliation: currentClient.report_reconciliation,
     processedClientCount: checkpoint.processed_client_count,
     remainingClientCount:
       checkpoint.clients.length - checkpoint.next_client_index
@@ -1355,6 +1386,12 @@ function compactAgingDeploymentStageResult_(stage, result) {
         : result.remainingClientCount,
       reportRowCounts: result.reportRowCounts || null,
       rowCount: result.rowCount === undefined ? null : result.rowCount,
+      uniqueRowCount: result.uniqueRowCount === undefined ? null : result.uniqueRowCount,
+      openAmount: result.openAmount || null,
+      successfulClientCount: result.successfulClientCount === undefined
+        ? null : result.successfulClientCount,
+      failedClientCount: result.failedClientCount === undefined
+        ? null : result.failedClientCount,
       continuationCount: result.continuationCount || 0,
       schemaValidation: result.schemaValidation || null,
       verification: result.verification || null
