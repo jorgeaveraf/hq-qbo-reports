@@ -2137,7 +2137,11 @@ function executeAllProfitAndLossReports_(range) {
 }
 
 function snapshotAllProfitAndLossReports(event) {
-  return executeAllProfitAndLossReports_(resolvePnlSnapshotRange_(event));
+  const range = resolvePnlSnapshotRange_(event);
+  if (range.snapshotType === PNL_SNAPSHOT_TYPE_WEEKLY) {
+    return startPnlRollingReconciliation();
+  }
+  return executeAllProfitAndLossReports_(range);
 }
 
 /***********************
