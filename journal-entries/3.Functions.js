@@ -3,32 +3,7 @@
  ***********************/
 
 function snapshotJournalEntriesToBigQuery() {
-  const loaded = loadJournalEntityConfiguration_();
-  const deployment = queueJournalConfigurationDeployment_(
-    {
-      request_id: Utilities.getUuid(),
-      source: 'weekly_snapshot',
-      sent_at: new Date().toISOString()
-    },
-    loaded.configuration,
-    {
-      source: 'weekly_snapshot',
-      range: getPreviousCompletedWeekRange_()
-    }
-  );
-
-  if (!deployment.queued && deployment.status === 'completed') {
-    Logger.log(JSON.stringify({
-      event: 'journal_weekly_snapshot_idempotent',
-      operationId: deployment.operationId,
-      configurationVersion: deployment.configurationVersion,
-      configurationHash: deployment.configurationHash,
-      period: deployment.period
-    }));
-    return deployment;
-  }
-
-  return processJournalConfigurationDeployment();
+  return startJournalRollingReconciliation();
 }
 
 function executeJournalBigQuerySnapshot_(loadedEntityConfiguration, rangeOverride) {
@@ -824,6 +799,13 @@ function fetchJournalReport_(clientId, dateFrom, dateTo) {
         missingColumns.join(', ')
     );
   }
+  const responseRows = report.Rows && report.Rows.Row;
+  if (responseRows !== undefined && responseRows !== null && !Array.isArray(responseRows)) {
+    throw new Error(
+      'Invalid journal response for client ' + normalizedClientId +
+      '. Expected data.Rows.Row to be an array when present.'
+    );
+  }
   return {
     clientId: normalizedClientId,
     realmId: stringOrNull_(payload.realm_id),
@@ -831,7 +813,7 @@ function fetchJournalReport_(clientId, dateFrom, dateTo) {
     reportTime: stringOrNull_(header.Time),
     currency: stringOrNull_(header.Currency) || JOURNAL_CONFIG.currencyDefault,
     columnMap,
-    rows: report.Rows && Array.isArray(report.Rows.Row) ? report.Rows.Row : []
+    rows: Array.isArray(responseRows) ? responseRows : []
   };
 }
 
@@ -1686,10 +1668,23 @@ function normalizeJournalLoadedEntityConfiguration_(loadedEntityConfigurationOve
   };
 }
 
-function getJournalSnapshotClients_(loadedEntityConfiguration) {
+function getJournalSnapshotClients_(loadedEntityConfiguration, clientIds) {
   const clientsById = fetchClients_(loadedEntityConfiguration);
+  const requestedClientIds = Array.from(new Set(
+    (clientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
+  ));
+  const selectedClientIds = requestedClientIds.length
+    ? requestedClientIds
+    : Object.keys(clientsById);
+  const missingClientIds = selectedClientIds.filter(clientId => !clientsById[clientId]);
+  if (missingClientIds.length) {
+    throw new Error(
+      'Requested Journal Entries clients are not authorized or no longer available: ' +
+      missingClientIds.join(', ')
+    );
+  }
 
-  return Object.keys(clientsById)
+  return selectedClientIds
     .map(clientId => clientsById[clientId])
     .sort((left, right) => {
       const entityDifference = String(left.entityAlias || '')
@@ -1732,6 +1727,18 @@ function buildJournalClientSnapshot_(client, range, loadedAt) {
     range.dateTo
   );
   const normalized = normalizeJournalReport_(journalReport);
+  const rowsOutsidePeriod = normalized.rows.filter(row =>
+    String(row.transactionDate || '') < String(range.dateFrom || '') ||
+    String(row.transactionDate || '') > String(range.dateTo || '')
+  );
+  if (rowsOutsidePeriod.length) {
+    throw new Error(
+      'Journal report returned transactions outside the requested period. ClientId=' +
+      client.id + ', dateFrom=' + range.dateFrom + ', dateTo=' + range.dateTo +
+      ', firstTransactionId=' + rowsOutsidePeriod[0].transactionId +
+      ', firstTransactionDate=' + rowsOutsidePeriod[0].transactionDate
+    );
+  }
   const lineRows = [];
   const transactionIds = {};
   let debitCents = 0;

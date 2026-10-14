@@ -20,6 +20,9 @@ function queueJournalConfigurationDeployment_(
   options
 ) {
   assertJournalBackfillIdle_('the Journal Entries deployment');
+  if (typeof assertJournalRollingIdle_ === 'function') {
+    assertJournalRollingIdle_('the Journal Entries deployment');
+  }
   const validatedConfiguration =
     validateJournalEntityConfiguration_(configuration);
   const deploymentOptions = options || {};
@@ -733,8 +736,10 @@ function executeJournalDeploymentStage_(
 
 function executeJournalBigQueryContinuationStage_(
   state,
-  loadedEntityConfiguration
+  loadedEntityConfiguration,
+  options
 ) {
+  const executionOptions = options || {};
   const executionStartedAt = Date.now();
   let checkpoint =
     readJournalBigQueryCheckpoint_();
@@ -749,7 +754,8 @@ function executeJournalBigQueryContinuationStage_(
     checkpoint =
       initializeJournalBigQueryCheckpoint_(
         state,
-        loadedEntityConfiguration
+        loadedEntityConfiguration,
+        executionOptions
       );
   }
 
@@ -761,7 +767,10 @@ function executeJournalBigQueryContinuationStage_(
   if (!Array.isArray(checkpoint.client_failures)) {
     checkpoint.client_failures = [];
   }
-  if (!checkpoint.stale_cleanup_job_id) {
+  if (!['full', 'subset'].includes(checkpoint.scope_mode)) {
+    checkpoint.scope_mode = 'full';
+  }
+  if (!checkpoint.stale_cleanup_job_id && checkpoint.scope_mode === 'full') {
     checkpoint.stale_cleanup_job_id = buildJournalBigQueryJobId_(
       'journal_cleanup_stale_clients',
       checkpoint.operation_id,
@@ -769,7 +778,9 @@ function executeJournalBigQueryContinuationStage_(
       ''
     );
   }
-  checkpoint.stale_cleanup_completed = checkpoint.stale_cleanup_completed === true;
+  checkpoint.stale_cleanup_completed = checkpoint.scope_mode === 'subset'
+    ? true
+    : checkpoint.stale_cleanup_completed === true;
 
   Logger.log(JSON.stringify({
     event:
@@ -834,16 +845,19 @@ function executeJournalBigQueryContinuationStage_(
       const statusMatch = message.match(/returned HTTP\s+(\d{3})\b/i);
       const failure = {
         clientId: String(client && client.id || ''),
-        clientName: String(client && client.name || ''),
-        entity: String(client && (client.entityAlias || client.entity) || ''),
         httpStatus: statusMatch ? Number(statusMatch[1]) : null,
-        error: message
+        error: message.slice(0, 160)
       };
       checkpoint.client_failures.push(failure);
       checkpoint.next_client_index += 1;
       checkpoint.updated_at = new Date().toISOString();
       persistJournalBigQueryCheckpoint_(checkpoint);
-      Logger.log(JSON.stringify({ event: 'journal_bigquery_client_failed', failure: failure }));
+      Logger.log(JSON.stringify({
+        event: 'journal_bigquery_client_failed',
+        clientName: String(client && client.name || ''),
+        entity: String(client && (client.entityAlias || client.entity) || ''),
+        failure: failure
+      }));
       processedThisExecution++;
       continue;
     }
@@ -972,7 +986,7 @@ function executeJournalBigQueryContinuationStage_(
     '--- JOURNAL BIGQUERY SNAPSHOT END ---'
   );
 
-  if (checkpoint.client_failures.length) {
+  if (checkpoint.client_failures.length && executionOptions.returnPartialResult !== true) {
     const partialError = new Error(
       'Journal Entries snapshot loaded successful entities but completed with entity errors: ' +
       JSON.stringify({
@@ -991,7 +1005,8 @@ function executeJournalBigQueryContinuationStage_(
 
 function initializeJournalBigQueryCheckpoint_(
   state,
-  loadedEntityConfiguration
+  loadedEntityConfiguration,
+  options
 ) {
   Logger.log(
     '--- JOURNAL BIGQUERY SNAPSHOT START ---'
@@ -1005,9 +1020,19 @@ function initializeJournalBigQueryCheckpoint_(
     normalizeJournalLoadedEntityConfiguration_(
       loadedEntityConfiguration
     );
+  const requestedClientIds = Array.from(new Set(
+    ((options && options.clientIds) || [])
+      .map(clientId => String(clientId || '').trim())
+      .filter(Boolean)
+  ));
   const clients = getJournalSnapshotClients_(
-    normalizedLoadedConfiguration
-  );
+    normalizedLoadedConfiguration,
+    requestedClientIds
+  ).map(client => ({
+    id: client.id,
+    name: client.name,
+    entityAlias: client.entityAlias
+  }));
   const now = new Date().toISOString();
 
   const checkpoint = {
@@ -1025,6 +1050,7 @@ function initializeJournalBigQueryCheckpoint_(
       ),
     schema_validation:
       validateJournalBigQuerySchema_(),
+    scope_mode: requestedClientIds.length ? 'subset' : 'full',
     clients,
     next_client_index: 0,
     processed_client_count: 0,
@@ -1044,14 +1070,15 @@ function initializeJournalBigQueryCheckpoint_(
         range.snapshotWeek,
         ''
       ),
-    stale_cleanup_job_id:
-      buildJournalBigQueryJobId_(
-        'journal_cleanup_stale_clients',
-        state.operation_id,
-        range.snapshotWeek,
-        ''
-      ),
-    stale_cleanup_completed: false,
+    stale_cleanup_job_id: requestedClientIds.length
+      ? null
+      : buildJournalBigQueryJobId_(
+          'journal_cleanup_stale_clients',
+          state.operation_id,
+          range.snapshotWeek,
+          ''
+        ),
+    stale_cleanup_completed: requestedClientIds.length > 0,
     current_client: null,
     load_job_count: 0,
     query_job_count: 0,
