@@ -183,9 +183,16 @@ function executeBalanceDeploymentStage_(stage,  state) {
   if (stage === 'bigquery') {
     const configuration = validateBalanceEntityConfiguration_(state.configuration,  state.configurationVersion);
     if (configuration.configuration_hash !== state.configurationHash) throw new Error('Deployment configuration hash no longer matches the queued operation.');
+    const range = getBalanceWeeklySnapshotRange_();
     return executeBalanceSheetBigQuerySnapshot_({
       source: 'configuration_push_operation',
       configuration
+    }, {
+      snapshotType: range.snapshotType,
+      snapshotDate: range.snapshotDate,
+      snapshotWeek: range.snapshotWeek,
+      asOfDate: range.asOfDate,
+      requireAsOfDateMatch: true
     });
   } if (stage === 'data_source_sheets' || stage === 'extracts') return refreshBalanceConnectedSheetsStage_(stage);
   throw new Error('Unsupported Balance Sheet deployment stage: ' + stage);
