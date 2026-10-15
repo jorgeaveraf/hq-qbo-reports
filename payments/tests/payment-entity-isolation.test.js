@@ -8,7 +8,7 @@ function loadPaymentsContext() {
   const context = vm.createContext({});
   const projectDir = path.resolve(__dirname, '..');
 
-  ['1.Config.js', '3.Functions.js'].forEach(fileName => {
+  ['1.Config.js', '3.Functions.js', '7.RollingReconciliation.js'].forEach(fileName => {
     const source = fs.readFileSync(path.join(projectDir, fileName), 'utf8');
     vm.runInContext(source, context, { filename: fileName });
   });

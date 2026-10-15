@@ -16,7 +16,7 @@ function loadInvoicesContext() {
     Logger: { log: () => {} }
   });
   const root = path.resolve(__dirname, '..');
-  ['invoices/1.Config.js', 'invoices/3.Functions.js'].forEach(file => {
+  ['invoices/1.Config.js', 'invoices/3.Functions.js', 'invoices/7.RollingReconciliation.js'].forEach(file => {
     vm.runInContext(fs.readFileSync(path.join(root, file), 'utf8'), context, { filename: file });
   });
   return context;
