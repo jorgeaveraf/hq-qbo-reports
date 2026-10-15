@@ -152,7 +152,10 @@ function validateAgingRollingReconciliation_(state) {
     evidencedWeekCount: expectedDates.length,
     expectedNonEmptyWeekCount,
     actualWeekCount: actual.actualWeekCount,
-    duplicateBusinessRowCount: actual.rowCount - actual.uniqueRowCount,
+    expectedRepeatedSourceRowCount: expected.rowCount - expected.uniqueRowCount,
+    actualRepeatedSourceRowCount: actual.rowCount - actual.uniqueRowCount,
+    sourceRepetitionPreserved:
+      expected.rowCount - expected.uniqueRowCount === actual.rowCount - actual.uniqueRowCount,
     outsideWindowUnchanged: JSON.stringify(outside) === JSON.stringify(state.outsideWindowBaseline),
     expected,
     actual
@@ -164,7 +167,7 @@ function validateAgingRollingReconciliation_(state) {
   if (details.completedWeekCount !== details.expectedWeekCount ||
       details.evidencedWeekCount !== details.expectedWeekCount ||
       details.actualWeekCount !== details.expectedNonEmptyWeekCount || !totalsMatch ||
-      details.duplicateBusinessRowCount !== 0 || actual.noncanonicalDateCount !== 0 ||
+      !details.sourceRepetitionPreserved || actual.noncanonicalDateCount !== 0 ||
       actual.invalidReportTypeCount !== 0 || actual.invalidBucketCount !== 0 ||
       !details.outsideWindowUnchanged) {
     throw new Error('AR/AP rolling final validation failed: ' + JSON.stringify(details));

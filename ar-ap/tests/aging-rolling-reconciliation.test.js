@@ -162,6 +162,69 @@ test('final validation accepts a completed zero-row week proven by worker state'
   assert.equal(validation.actualWeekCount, 0);
 });
 
+test('final validation preserves repeated rows already present in the QBO source', () => {
+  const context = loadContext();
+  const state = {
+    plan: { weekCount: 1, startDate: '2026-10-11', endDate: '2026-10-11' },
+    completedCount: 1,
+    expectedByDate: { '2026-10-11': [3, 2, 3, 0, -90000, 0] },
+    outsideWindowBaseline: { rowCount: 5, rowFingerprint: 'abc' }
+  };
+  let call = 0;
+  install(context, 'runAgingBigQueryQuery_', () => {
+    call++;
+    if (call === 1) return {
+      schema: { fields: [
+        'row_count', 'actual_week_count', 'unique_row_count', 'ar_row_count', 'ap_row_count',
+        'ar_open_amount', 'ap_open_amount', 'noncanonical_date_count',
+        'invalid_report_type_count', 'invalid_bucket_count'
+      ].map(name => ({ name })) },
+      rows: [{ f: ['3', '1', '2', '3', '0', '-900', '0', '0', '0', '0'].map(v => ({ v })) }]
+    };
+    return {
+      schema: { fields: [{ name: 'row_count' }, { name: 'row_fingerprint' }] },
+      rows: [{ f: [{ v: '5' }, { v: 'abc' }] }]
+    };
+  });
+
+  const validation = context.validateAgingRollingReconciliation_(state);
+  assert.equal(validation.status, 'passed');
+  assert.equal(validation.expectedRepeatedSourceRowCount, 1);
+  assert.equal(validation.actualRepeatedSourceRowCount, 1);
+  assert.equal(validation.sourceRepetitionPreserved, true);
+});
+
+test('final validation rejects repetitions that were not present in the QBO source', () => {
+  const context = loadContext();
+  const state = {
+    plan: { weekCount: 1, startDate: '2026-10-11', endDate: '2026-10-11' },
+    completedCount: 1,
+    expectedByDate: { '2026-10-11': [3, 3, 3, 0, -90000, 0] },
+    outsideWindowBaseline: { rowCount: 5, rowFingerprint: 'abc' }
+  };
+  let call = 0;
+  install(context, 'runAgingBigQueryQuery_', () => {
+    call++;
+    if (call === 1) return {
+      schema: { fields: [
+        'row_count', 'actual_week_count', 'unique_row_count', 'ar_row_count', 'ap_row_count',
+        'ar_open_amount', 'ap_open_amount', 'noncanonical_date_count',
+        'invalid_report_type_count', 'invalid_bucket_count'
+      ].map(name => ({ name })) },
+      rows: [{ f: ['3', '1', '2', '3', '0', '-900', '0', '0', '0', '0'].map(v => ({ v })) }]
+    };
+    return {
+      schema: { fields: [{ name: 'row_count' }, { name: 'row_fingerprint' }] },
+      rows: [{ f: [{ v: '5' }, { v: 'abc' }] }]
+    };
+  });
+
+  assert.throws(
+    () => context.validateAgingRollingReconciliation_(state),
+    /sourceRepetitionPreserved.*false/
+  );
+});
+
 test('final validation scopes canonical Sundays and fingerprints all legacy captures', () => {
   const context = loadContext();
   const plan = context.buildAgingRollingReconciliationPlan_('2026-10-14');

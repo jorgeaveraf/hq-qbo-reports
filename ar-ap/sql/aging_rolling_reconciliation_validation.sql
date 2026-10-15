@@ -22,7 +22,7 @@ SELECT
   COUNT(*) AS row_count,
   COUNT(*) - COUNT(DISTINCT FARM_FINGERPRINT(
     TO_JSON_STRING((SELECT AS STRUCT window_rows.* EXCEPT(loaded_at)))
-  )) AS duplicate_business_rows,
+  )) AS repeated_source_rows,
   COUNTIF(
     snapshot_week != DATE_TRUNC(snapshot_date, WEEK(MONDAY)) OR
     as_of_date != snapshot_date OR
