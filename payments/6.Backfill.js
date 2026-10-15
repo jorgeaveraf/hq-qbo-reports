@@ -671,17 +671,6 @@ function assertPaymentBackfillIdle_(contextLabel) {
         state.current_stage
     );
   }
-  const repairState = typeof readPaymentHistoryRepairState_ === 'function'
-    ? readPaymentHistoryRepairState_()
-    : null;
-  if (repairState && ['pending', 'running'].includes(repairState.status)) {
-    throw new Error(
-      'Payments history repair is active and blocks ' +
-        String(contextLabel || 'this operation') +
-        '. CurrentStage=' +
-        repairState.current_stage
-    );
-  }
 }
 
 function validatePaymentBackfillConnectedSheetsPreflight_() {
@@ -703,15 +692,6 @@ function validatePaymentBackfillConnectedSheetsPreflight_() {
 
 function queuePaymentBackfill_(options) {
   assertPaymentDeploymentIdleForBackfill_();
-  const repairState = typeof readPaymentHistoryRepairState_ === 'function'
-    ? readPaymentHistoryRepairState_()
-    : null;
-  if (repairState && ['pending', 'running'].includes(repairState.status)) {
-    throw new Error(
-      'Payments history repair must finish before starting another backfill. ' +
-        'CurrentStage=' + repairState.current_stage
-    );
-  }
   const plan = planPaymentBackfill_(options);
   validatePaymentBackfillConnectedSheetsPreflight_();
   const loadedConfiguration = loadPaymentEntityConfiguration_();

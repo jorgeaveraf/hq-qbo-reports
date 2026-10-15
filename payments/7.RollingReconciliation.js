@@ -75,7 +75,7 @@ function executePaymentBigQuerySnapshot_(loadedEntityConfiguration) {
 }
 
 /***********************
- * Central Entity Configuration
+ * Rolling window planning
  ***********************/
 
 function getPaymentRollingSnapshotPlan_(referenceIsoDate, weekCountOverride) {
