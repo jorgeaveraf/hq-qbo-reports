@@ -476,6 +476,77 @@ function fetchAccountDetailPnlControl_(clientId, dateFrom, dateTo) {
   );
 }
 
+function parseAccountDetailAccountLabel_(value) {
+  const label = accountDetailText_(value);
+  const match = label.match(/^(\S+)\s+(.+)$/);
+  return {
+    number: match ? accountDetailText_(match[1]) : '',
+    name: match ? accountDetailText_(match[2]) : label
+  };
+}
+
+function collectAccountDetailPnlHierarchy_(payload) {
+  const data = payload && payload.data;
+  if (!data || !data.Rows) throw new Error('P&L control payload is missing report rows.');
+  const byId = {};
+  function walk(node, ancestors) {
+    if (!node || typeof node !== 'object') return;
+    const headerCells = node.Header && Array.isArray(node.Header.ColData)
+      ? node.Header.ColData : [];
+    const rowCells = Array.isArray(node.ColData) ? node.ColData : [];
+    const accountCell = headerCells.concat(rowCells).find(cell =>
+      accountDetailText_(cell && cell.id) && accountDetailText_(cell && cell.value)
+    );
+    let nextAncestors = ancestors;
+    if (accountCell) {
+      const id = accountDetailText_(accountCell.id);
+      const parsed = parseAccountDetailAccountLabel_(accountCell.value);
+      const parent = ancestors.length ? ancestors[ancestors.length - 1] : null;
+      byId[id] = {
+        id: id,
+        number: parsed.number,
+        name: parsed.name,
+        label: accountDetailText_(accountCell.value),
+        parentId: parent ? parent.id : null
+      };
+      nextAncestors = ancestors.concat([byId[id]]);
+    }
+    const children = node.Rows && Array.isArray(node.Rows.Row) ? node.Rows.Row : [];
+    children.forEach(child => walk(child, nextAncestors));
+    if (Array.isArray(node.Row)) node.Row.forEach(child => walk(child, nextAncestors));
+  }
+  walk(data.Rows, []);
+  return byId;
+}
+
+function resolveAccountDetailTargetsFromPnl_(payload, settings) {
+  const byId = collectAccountDetailPnlHierarchy_(payload);
+  const targets = settings.detail_account_ids.map(id => {
+    const account = byId[id];
+    if (!account) throw new Error('Configured detail account was not returned by P&L: ' + id);
+    const parentId = account.parentId;
+    const parent = parentId && byId[parentId];
+    if (!parent) throw new Error('Unable to resolve P&L parent for configured detail account: ' + id);
+    if (settings.parent_account_id && settings.parent_account_id !== parentId) {
+      throw new Error('Configured parent_account_id does not match the P&L hierarchy for account ' + id + '.');
+    }
+    return {
+      parentId: parentId,
+      parentNumber: parent.number,
+      parentName: parent.name,
+      id: id,
+      number: account.number,
+      name: account.name,
+      path: [parent.name, account.name].filter(Boolean).join(':')
+    };
+  });
+  const parentIds = Array.from(new Set(targets.map(target => target.parentId)));
+  if (parentIds.length !== 1) {
+    throw new Error('Configured detail accounts must share one P&L parent. parents=' + parentIds.join(','));
+  }
+  return { parent: byId[parentIds[0]], targets: targets };
+}
+
 /***********************
  * QBO response normalization and reconciliation
  ***********************/
@@ -745,12 +816,12 @@ function executeAccountDetailSnapshot_(options) {
     let targets;
     let pnlControl;
     try {
-      targets = resolveAccountDetailTargets_(fetchAccountDetailAccounts_(client.id), client.reportSettings).targets;
+      pnlControl = fetchAccountDetailPnlControl_(client.id, range.dateFrom, range.dateTo);
+      targets = resolveAccountDetailTargetsFromPnl_(pnlControl, client.reportSettings).targets;
       if (requestedAccountIds.length) {
         targets = targets.filter(target => requestedAccountIds.includes(target.id));
       }
       if (!targets.length) throw new Error('No configured account matched the requested account scope.');
-      pnlControl = fetchAccountDetailPnlControl_(client.id, range.dateFrom, range.dateTo);
     } catch (error) {
       failures.push({ clientId: client.id, stage: 'client_preflight', error: String(error.message || error) });
       return;

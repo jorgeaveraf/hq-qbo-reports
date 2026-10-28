@@ -24,16 +24,18 @@ function debugAccountDetailPreflight() {
   const loaded = loadAccountDetailEntityConfiguration_();
   const selection = resolveAccountDetailEntitySelection_(loaded);
   const clients = selection.clients.map(client => {
-    const resolved = resolveAccountDetailTargets_(
-      fetchAccountDetailAccounts_(client.id), client.reportSettings
+    const range = getAccountDetailLatestRange_(client.reportSettings);
+    const resolved = resolveAccountDetailTargetsFromPnl_(
+      fetchAccountDetailPnlControl_(client.id, range.dateFrom, range.dateTo),
+      client.reportSettings
     );
     return {
       clientId: client.id,
       clientName: client.name,
       parent: {
-        id: accountDetailText_(resolved.parent.Id),
-        number: accountDetailText_(resolved.parent.AcctNum),
-        name: accountDetailText_(resolved.parent.Name)
+        id: accountDetailText_(resolved.parent.id),
+        number: accountDetailText_(resolved.parent.number),
+        name: accountDetailText_(resolved.parent.name)
       },
       targets: resolved.targets
     };

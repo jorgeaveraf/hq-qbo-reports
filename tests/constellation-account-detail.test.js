@@ -170,6 +170,36 @@ function detailPayload(columnOrder) {
   };
 }
 
+function pnlControlPayload() {
+  function section(id, label, children) {
+    return {
+      type: 'Section',
+      Header: { ColData: [{ value: label, id }, { value: '' }] },
+      Rows: { Row: children || [] },
+      Summary: { ColData: [{ value: 'Total for ' + label }, { value: '0.00' }] }
+    };
+  }
+  function accountRow(id, label) {
+    return {
+      type: 'Data',
+      ColData: [{ value: label, id }, { value: '0.00' }]
+    };
+  }
+  return {
+    data: {
+      Header: { ReportName: 'ProfitAndLoss' },
+      Columns: { Column: [
+        { ColTitle: 'Account', ColType: 'Account', MetaData: [{ Name: 'ColKey', Value: 'account' }] },
+        { ColTitle: 'Total', ColType: 'Money', MetaData: [{ Name: 'ColKey', Value: 'total' }] }
+      ] },
+      Rows: { Row: [section('175', '40000 Retail Income', [
+        accountRow('1150040007', '40005 Retail Returned Product'),
+        accountRow('1150040008', '40010 Retail Refunds/Discounts')
+      ])] }
+    }
+  };
+}
+
 test('configuration keeps dynamic report settings in its hash and validates them', () => {
   const context = loadContext();
   const loaded = loadedConfiguration(context);
@@ -199,6 +229,16 @@ test('account hierarchy comes from ParentRef and rejects a numbered non-subaccou
   const invalid = settings();
   invalid.detail_account_ids = ['1150040077'];
   assert.throws(() => context.resolveAccountDetailTargets_(accounts(), invalid), /not a QBO subaccount/);
+});
+
+test('account hierarchy can be resolved from the P&L used for reconciliation', () => {
+  const context = loadContext();
+  const resolved = context.resolveAccountDetailTargetsFromPnl_(pnlControlPayload(), settings());
+  assert.equal(resolved.parent.id, '175');
+  assert.equal(resolved.parent.number, '40000');
+  assert.equal(resolved.targets[0].parentId, '175');
+  assert.equal(resolved.targets[0].number, '40005');
+  assert.equal(resolved.targets[0].path, 'Retail Income:Retail Returned Product');
 });
 
 test('detail endpoint is called only for configured subaccount IDs', () => {
