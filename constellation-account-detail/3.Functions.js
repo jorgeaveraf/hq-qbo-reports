@@ -817,8 +817,11 @@ function executeAccountDetailSnapshot_(options) {
     let targets;
     let pnlControl;
     try {
-      const accounts = fetchAccountDetailAccounts_(client.id);
-      targets = resolveAccountDetailTargets_(accounts, client.reportSettings).targets;
+      const hierarchyEnd = accountDetailToday_();
+      const hierarchyControl = fetchAccountDetailPnlControl_(
+        client.id, client.reportSettings.history_start_date, hierarchyEnd
+      );
+      targets = resolveAccountDetailTargetsFromPnl_(hierarchyControl, client.reportSettings).targets;
       pnlControl = fetchAccountDetailPnlControl_(client.id, range.dateFrom, range.dateTo);
       if (requestedAccountIds.length) {
         targets = targets.filter(target => requestedAccountIds.includes(target.id));
