@@ -719,6 +719,7 @@ function findAccountDetailPnlAmount_(payload, target) {
     if (Array.isArray(node.Row)) node.Row.forEach(walk);
   }
   walk(data.Rows || {});
+  if (!candidates.length) return 0;
   if (candidates.length !== 1) {
     throw new Error('Expected one P&L control amount for account ' + target.id + ', found=' + candidates.length);
   }
@@ -816,8 +817,9 @@ function executeAccountDetailSnapshot_(options) {
     let targets;
     let pnlControl;
     try {
+      const accounts = fetchAccountDetailAccounts_(client.id);
+      targets = resolveAccountDetailTargets_(accounts, client.reportSettings).targets;
       pnlControl = fetchAccountDetailPnlControl_(client.id, range.dateFrom, range.dateTo);
-      targets = resolveAccountDetailTargetsFromPnl_(pnlControl, client.reportSettings).targets;
       if (requestedAccountIds.length) {
         targets = targets.filter(target => requestedAccountIds.includes(target.id));
       }

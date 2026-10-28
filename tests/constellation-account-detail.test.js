@@ -284,6 +284,17 @@ test('detail reconciliation accepts cents and rejects a material difference', ()
     /does not reconcile/);
 });
 
+test('a configured account omitted from a zero-activity P&L period reconciles against zero', () => {
+  const context = loadContext();
+  const payload = pnlControlPayload();
+  payload.data.Rows.Row[0].Rows.Row = payload.data.Rows.Row[0].Rows.Row.slice(1);
+  const target = context.resolveAccountDetailTargets_(accounts(), settings()).targets[0];
+  assert.equal(context.findAccountDetailPnlAmount_(payload, target), 0);
+  assert.equal(context.reconcileAccountDetailRows_([], 0, target).status, 'passed');
+  assert.throws(() => context.reconcileAccountDetailRows_([{ Amount: 1 }], 0, target),
+    /does not reconcile/);
+});
+
 test('latest and monthly periods follow the approved cadence', () => {
   const context = loadContext();
   assert.deepEqual(JSON.parse(JSON.stringify(context.getAccountDetailLatestRange_(settings(), '2026-10-28'))), {
