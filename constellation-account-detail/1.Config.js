@@ -43,6 +43,9 @@ const ACCOUNT_DETAIL_SPREADSHEET = {
   targetsProperty: 'QBO_ACCOUNT_DETAIL_CONNECTED_SHEETS_TARGETS',
   latestSheetName: 'P&L Detail Latest',
   monthlySheetName: 'P&L Detail Monthly',
+  latestExtractSheetName: 'P&L Detail Latest_extract',
+  monthlyExtractSheetName: 'P&L Detail Monthly_extract',
+  extractRowLimit: 25000,
   timeoutSeconds: 300
 };
 

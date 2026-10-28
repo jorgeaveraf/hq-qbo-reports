@@ -58,6 +58,12 @@ function debugAccountDetailConnectedSheets() {
     dataSourceSheets: spreadsheet.getDataSourceSheets().map(source => ({
       name: source.asSheet().getName(),
       state: String(source.getStatus().getExecutionState())
+    })),
+    extracts: spreadsheet.getDataSourceTables().map(table => ({
+      name: table.getRange().getSheet().getName(),
+      range: table.getRange().getA1Notation(),
+      rowLimit: table.getRowLimit(),
+      state: String(table.getStatus().getExecutionState())
     }))
   };
   Logger.log(JSON.stringify(result, null, 2));

@@ -368,6 +368,24 @@ test('views expose separate latest and monthly contracts', () => {
   assert.match(latest, /DocNumber/);
 });
 
+test('Connected Sheets contract includes source sheets and matching extracts', () => {
+  const context = loadContext();
+  const definitions = context.getAccountDetailSheetDefinitions_();
+  assert.deepEqual(JSON.parse(JSON.stringify(definitions)), [
+    {
+      sourceName: 'P&L Detail Latest',
+      extractName: 'P&L Detail Latest_extract',
+      viewId: 'vw_profit_and_loss_account_detail_latest'
+    },
+    {
+      sourceName: 'P&L Detail Monthly',
+      extractName: 'P&L Detail Monthly_extract',
+      viewId: 'vw_monthly_profit_and_loss_account_detail'
+    }
+  ]);
+  assert.equal(vm.runInContext('ACCOUNT_DETAIL_SPREADSHEET.extractRowLimit', context), 25000);
+});
+
 test('schedule installs daily 5, monthly day 10 at 6, and Monday repair at 7', () => {
   const context = loadContext();
   const result = context.installAccountDetailCadenceTriggers();

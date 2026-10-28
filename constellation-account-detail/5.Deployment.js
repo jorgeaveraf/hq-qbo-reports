@@ -362,70 +362,147 @@ function createAccountDetailDataSourceSheet_(spreadsheet, name, viewId) {
   return dataSourceSheet;
 }
 
+function createAccountDetailExtract_(dataSourceSheet, name) {
+  const table = dataSourceSheet.getDataSource().createDataSourceTableOnNewSheet();
+  table.syncAllColumns();
+  table.setRowLimit(ACCOUNT_DETAIL_SPREADSHEET.extractRowLimit);
+  table.getRange().getSheet().setName(name);
+  return table;
+}
+
+function getAccountDetailSheetDefinitions_() {
+  return [
+    {
+      sourceName: ACCOUNT_DETAIL_SPREADSHEET.latestSheetName,
+      extractName: ACCOUNT_DETAIL_SPREADSHEET.latestExtractSheetName,
+      viewId: ACCOUNT_DETAIL_CONFIG.latestViewId
+    },
+    {
+      sourceName: ACCOUNT_DETAIL_SPREADSHEET.monthlySheetName,
+      extractName: ACCOUNT_DETAIL_SPREADSHEET.monthlyExtractSheetName,
+      viewId: ACCOUNT_DETAIL_CONFIG.monthlyViewId
+    }
+  ];
+}
+
 function installAccountDetailConnectedSheets_() {
   const spreadsheet = getAccountDetailSpreadsheet_();
   SpreadsheetApp.enableBigQueryExecution();
-  const expected = [
-    { name: ACCOUNT_DETAIL_SPREADSHEET.latestSheetName, viewId: ACCOUNT_DETAIL_CONFIG.latestViewId },
-    { name: ACCOUNT_DETAIL_SPREADSHEET.monthlySheetName, viewId: ACCOUNT_DETAIL_CONFIG.monthlyViewId }
-  ];
-  const existing = {};
+  const expected = getAccountDetailSheetDefinitions_();
+  const sourceByName = {};
   spreadsheet.getDataSourceSheets().forEach(source => {
-    existing[source.asSheet().getName()] = source;
+    sourceByName[source.asSheet().getName()] = source;
   });
-  const created = [];
+  const createdSources = [];
   expected.forEach(item => {
-    if (!existing[item.name]) {
-      createAccountDetailDataSourceSheet_(spreadsheet, item.name, item.viewId);
-      created.push(item.name);
+    if (!sourceByName[item.sourceName]) {
+      sourceByName[item.sourceName] = createAccountDetailDataSourceSheet_(
+        spreadsheet, item.sourceName, item.viewId
+      );
+      createdSources.push(item.sourceName);
     }
   });
-  const targets = { spreadsheetId: spreadsheet.getId(), sheets: expected.map(item => item.name) };
+
+  const extractByName = {};
+  spreadsheet.getDataSourceTables().forEach(table => {
+    extractByName[table.getRange().getSheet().getName()] = table;
+  });
+  const createdExtracts = [];
+  expected.forEach(item => {
+    if (!extractByName[item.extractName]) {
+      extractByName[item.extractName] = createAccountDetailExtract_(
+        sourceByName[item.sourceName], item.extractName
+      );
+      createdExtracts.push(item.extractName);
+    }
+  });
+
+  const targets = {
+    spreadsheetId: spreadsheet.getId(),
+    sourceSheets: expected.map(item => item.sourceName),
+    extracts: expected.map(item => item.extractName)
+  };
   PropertiesService.getScriptProperties().setProperty(
     ACCOUNT_DETAIL_SPREADSHEET.targetsProperty, JSON.stringify(targets)
   );
   const defaultSheet = spreadsheet.getSheetByName('Sheet1');
-  if (defaultSheet && spreadsheet.getSheets().length > expected.length) spreadsheet.deleteSheet(defaultSheet);
-  return { status: 'passed', spreadsheetId: spreadsheet.getId(), created: created, targets: targets.sheets };
+  if (defaultSheet && spreadsheet.getSheets().length > expected.length * 2) {
+    spreadsheet.deleteSheet(defaultSheet);
+  }
+  return {
+    status: 'passed',
+    spreadsheetId: spreadsheet.getId(),
+    created: { sourceSheets: createdSources, extracts: createdExtracts },
+    targets: targets
+  };
 }
 
 function getAccountDetailConnectedSheetTargets_() {
   const spreadsheet = getAccountDetailSpreadsheet_();
-  const expectedNames = [
-    ACCOUNT_DETAIL_SPREADSHEET.latestSheetName,
-    ACCOUNT_DETAIL_SPREADSHEET.monthlySheetName
-  ];
-  const targets = spreadsheet.getDataSourceSheets().filter(source =>
-    expectedNames.includes(source.asSheet().getName())
+  const definitions = getAccountDetailSheetDefinitions_();
+  const expectedSourceNames = definitions.map(item => item.sourceName);
+  const expectedExtractNames = definitions.map(item => item.extractName);
+  const sourceSheets = spreadsheet.getDataSourceSheets().filter(source =>
+    expectedSourceNames.includes(source.asSheet().getName())
   );
-  const actualNames = targets.map(source => source.asSheet().getName());
-  const missing = expectedNames.filter(name => !actualNames.includes(name));
-  if (missing.length || targets.length !== expectedNames.length) {
-    throw new Error('Connected Sheets targets are incomplete: ' + JSON.stringify({ expectedNames, actualNames }));
+  const extracts = spreadsheet.getDataSourceTables().filter(table =>
+    expectedExtractNames.includes(table.getRange().getSheet().getName())
+  );
+  const actualSourceNames = sourceSheets.map(source => source.asSheet().getName());
+  const actualExtractNames = extracts.map(table => table.getRange().getSheet().getName());
+  const missingSourceSheets = expectedSourceNames.filter(name => !actualSourceNames.includes(name));
+  const missingExtracts = expectedExtractNames.filter(name => !actualExtractNames.includes(name));
+  if (missingSourceSheets.length || missingExtracts.length) {
+    throw new Error('Connected Sheets targets are incomplete: ' + JSON.stringify({
+      expectedSourceNames: expectedSourceNames,
+      actualSourceNames: actualSourceNames,
+      expectedExtractNames: expectedExtractNames,
+      actualExtractNames: actualExtractNames
+    }));
   }
-  return { spreadsheet: spreadsheet, targets: targets };
+  return { spreadsheet: spreadsheet, sourceSheets: sourceSheets, extracts: extracts };
+}
+
+function describeAccountDetailDataExecution_(target, name) {
+  const status = target.getStatus();
+  return {
+    name: name,
+    state: String(status.getExecutionState()),
+    errorCode: String(status.getErrorCode() || 'NONE'),
+    errorMessage: accountDetailText_(status.getErrorMessage()),
+    truncated: status.isTruncated() === true
+  };
+}
+
+function assertAccountDetailDataExecutionsPassed_(stage, executions) {
+  const failed = executions.filter(item =>
+    item.state !== 'SUCCESS' || item.errorCode !== 'NONE' || item.truncated
+  );
+  if (failed.length) {
+    throw new Error('Connected Sheets ' + stage + ' refresh failed: ' + JSON.stringify(failed));
+  }
 }
 
 function refreshAccountDetailConnectedSheets_() {
   const resolved = getAccountDetailConnectedSheetTargets_();
   SpreadsheetApp.enableBigQueryExecution();
-  resolved.targets.forEach(target => target.refreshData());
+  resolved.sourceSheets.forEach(target => target.refreshData());
   resolved.spreadsheet.waitForAllDataExecutionsCompletion(ACCOUNT_DETAIL_SPREADSHEET.timeoutSeconds);
-  const executions = resolved.targets.map(target => {
-    const status = target.getStatus();
-    return {
-      name: target.asSheet().getName(),
-      state: String(status.getExecutionState()),
-      errorCode: String(status.getErrorCode() || 'NONE'),
-      errorMessage: accountDetailText_(status.getErrorMessage()),
-      truncated: status.isTruncated() === true
-    };
-  });
-  const failed = executions.filter(item =>
-    item.state !== 'SUCCESS' || item.errorCode !== 'NONE' || item.truncated
+  const sourceExecutions = resolved.sourceSheets.map(target =>
+    describeAccountDetailDataExecution_(target, target.asSheet().getName())
   );
-  if (failed.length) throw new Error('Connected Sheets refresh failed: ' + JSON.stringify(failed));
-  return { status: 'passed', executions: executions };
+  assertAccountDetailDataExecutionsPassed_('source', sourceExecutions);
+
+  resolved.extracts.forEach(target => target.refreshData());
+  resolved.spreadsheet.waitForAllDataExecutionsCompletion(ACCOUNT_DETAIL_SPREADSHEET.timeoutSeconds);
+  const extractExecutions = resolved.extracts.map(target =>
+    describeAccountDetailDataExecution_(target, target.getRange().getSheet().getName())
+  );
+  assertAccountDetailDataExecutionsPassed_('extract', extractExecutions);
+  return {
+    status: 'passed',
+    stages: { sourceSheets: sourceExecutions, extracts: extractExecutions }
+  };
 }
 
 function deleteAccountDetailCadenceTriggers_() {
