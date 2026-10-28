@@ -386,6 +386,38 @@ test('Connected Sheets contract includes source sheets and matching extracts', (
   assert.equal(vm.runInContext('ACCOUNT_DETAIL_SPREADSHEET.extractRowLimit', context), 25000);
 });
 
+test('Connected Sheets extracts receive a header filter without replacing an existing filter', () => {
+  const context = loadContext();
+  let filter = null;
+  let createCount = 0;
+  const sheet = {
+    getName: () => 'P&L Detail Latest_extract',
+    getFilter: () => filter
+  };
+  const range = {
+    getSheet: () => sheet,
+    getNumRows: () => 100,
+    getNumColumns: () => 39,
+    getA1Notation: () => 'A1:AM100',
+    createFilter() {
+      createCount += 1;
+      filter = { existing: true };
+    }
+  };
+  const table = { getRange: () => range };
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.ensureAccountDetailExtractFilter_(table))),
+    { name: 'P&L Detail Latest_extract', status: 'created', range: 'A1:AM100' }
+  );
+  assert.equal(createCount, 1);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.ensureAccountDetailExtractFilter_(table))),
+    { name: 'P&L Detail Latest_extract', status: 'preserved' }
+  );
+  assert.equal(createCount, 1);
+});
+
 test('schedule installs daily 5, monthly day 10 at 6, and Monday repair at 7', () => {
   const context = loadContext();
   const result = context.installAccountDetailCadenceTriggers();

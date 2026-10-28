@@ -370,6 +370,26 @@ function createAccountDetailExtract_(dataSourceSheet, name) {
   return table;
 }
 
+function ensureAccountDetailExtractFilter_(table) {
+  if (!table || typeof table.getRange !== 'function') {
+    throw new Error('Account Detail extract filter requires a valid DataSourceTable.');
+  }
+  const range = table.getRange();
+  const sheet = range.getSheet();
+  if (sheet.getFilter()) {
+    return { name: sheet.getName(), status: 'preserved' };
+  }
+  if (range.getNumRows() < 1 || range.getNumColumns() < 1) {
+    throw new Error('Account Detail extract has no range available for its filter: ' + sheet.getName());
+  }
+  range.createFilter();
+  return {
+    name: sheet.getName(),
+    status: 'created',
+    range: range.getA1Notation()
+  };
+}
+
 function getAccountDetailSheetDefinitions_() {
   return [
     {
@@ -416,6 +436,9 @@ function installAccountDetailConnectedSheets_() {
       createdExtracts.push(item.extractName);
     }
   });
+  const filters = expected.map(item =>
+    ensureAccountDetailExtractFilter_(extractByName[item.extractName])
+  );
 
   const targets = {
     spreadsheetId: spreadsheet.getId(),
@@ -433,6 +456,7 @@ function installAccountDetailConnectedSheets_() {
     status: 'passed',
     spreadsheetId: spreadsheet.getId(),
     created: { sourceSheets: createdSources, extracts: createdExtracts },
+    filters: filters,
     targets: targets
   };
 }
@@ -499,9 +523,11 @@ function refreshAccountDetailConnectedSheets_() {
     describeAccountDetailDataExecution_(target, target.getRange().getSheet().getName())
   );
   assertAccountDetailDataExecutionsPassed_('extract', extractExecutions);
+  const filters = resolved.extracts.map(target => ensureAccountDetailExtractFilter_(target));
   return {
     status: 'passed',
-    stages: { sourceSheets: sourceExecutions, extracts: extractExecutions }
+    stages: { sourceSheets: sourceExecutions, extracts: extractExecutions },
+    filters: filters
   };
 }
 
