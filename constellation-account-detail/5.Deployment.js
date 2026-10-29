@@ -353,6 +353,18 @@ function buildAccountDetailSheetQuery_(viewId) {
     '` ORDER BY DateFrom, Entity, SubAccountNumber, TxnDate, TxnId';
 }
 
+function normalizeAccountDetailSheetQuery_(query) {
+  return accountDetailText_(query).replace(/\s+/g, ' ').trim();
+}
+
+function buildAccountDetailDataSourceSpec_(viewId) {
+  return SpreadsheetApp.newDataSourceSpec()
+    .asBigQuery()
+    .setProjectId(ACCOUNT_DETAIL_CONFIG.projectId)
+    .setRawQuery(buildAccountDetailSheetQuery_(viewId))
+    .build();
+}
+
 function migrateAccountDetailSheetNames_(spreadsheet) {
   const pairs = [
     [ACCOUNT_DETAIL_SPREADSHEET.legacyNames.latestSheetName, ACCOUNT_DETAIL_SPREADSHEET.latestSheetName],
@@ -381,14 +393,37 @@ function migrateAccountDetailSheetNames_(spreadsheet) {
 }
 
 function createAccountDetailDataSourceSheet_(spreadsheet, name, viewId) {
-  const spec = SpreadsheetApp.newDataSourceSpec()
-    .asBigQuery()
-    .setProjectId(ACCOUNT_DETAIL_CONFIG.projectId)
-    .setRawQuery(buildAccountDetailSheetQuery_(viewId))
-    .build();
+  const spec = buildAccountDetailDataSourceSpec_(viewId);
   const dataSourceSheet = spreadsheet.insertDataSourceSheet(spec);
   dataSourceSheet.asSheet().setName(name);
   return dataSourceSheet;
+}
+
+function ensureAccountDetailDataSourceQuery_(dataSourceSheet, viewId) {
+  if (!dataSourceSheet || typeof dataSourceSheet.getDataSource !== 'function') {
+    throw new Error('Account Detail source query requires a valid DataSourceSheet.');
+  }
+  const dataSource = dataSourceSheet.getDataSource();
+  const actualQuery = accountDetailText_(dataSource.getSpec().asBigQuery().getRawQuery());
+  const expectedQuery = buildAccountDetailSheetQuery_(viewId);
+  if (normalizeAccountDetailSheetQuery_(actualQuery) ===
+      normalizeAccountDetailSheetQuery_(expectedQuery)) {
+    return { status: 'preserved', query: expectedQuery };
+  }
+
+  const updatedSpec = dataSource.getSpec()
+    .copy()
+    .asBigQuery()
+    .setProjectId(ACCOUNT_DETAIL_CONFIG.projectId)
+    .setRawQuery(expectedQuery)
+    .removeAllParameters()
+    .build();
+  dataSource.updateSpec(updatedSpec);
+  return {
+    status: 'updated',
+    previousQuery: actualQuery,
+    query: expectedQuery
+  };
 }
 
 function createAccountDetailExtract_(dataSourceSheet, name) {
@@ -491,6 +526,14 @@ function installAccountDetailConnectedSheets_() {
     }
   });
 
+  // Connected Sheets keep the original raw query even when this deployment
+  // code changes. Update existing sources explicitly so ordering and aliases
+  // follow the current view contract without recreating the extracts.
+  const sourceQueries = expected.map(item => ({
+    name: item.sourceName,
+    result: ensureAccountDetailDataSourceQuery_(sourceByName[item.sourceName], item.viewId)
+  }));
+
   // The view contract may have changed while the Connected Sheet retained its
   // previous schema. Refresh the source before replacing extract columns so
   // aliases such as DateFrom/DateTo are available to addColumns().
@@ -538,6 +581,7 @@ function installAccountDetailConnectedSheets_() {
     spreadsheetId: spreadsheet.getId(),
     renamed: renamed,
     created: { sourceSheets: createdSources, extracts: createdExtracts },
+    sourceQueries: sourceQueries,
     sourceSchemaRefresh: sourceExecutions,
     columns: columns,
     filters: filters,

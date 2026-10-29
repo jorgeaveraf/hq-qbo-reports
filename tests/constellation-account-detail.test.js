@@ -403,6 +403,56 @@ test('Connected Sheets contract includes source sheets and matching extracts', (
   assert.match(query, /ORDER BY DateFrom, Entity, SubAccountNumber, TxnDate, TxnId$/);
 });
 
+test('Connected Sheets source query is preserved when it already matches the contract', () => {
+  const context = loadContext();
+  const expected = context.buildAccountDetailSheetQuery_('monthly_view');
+  let updateCount = 0;
+  const dataSource = {
+    getSpec: () => ({
+      asBigQuery: () => ({ getRawQuery: () => '  ' + expected.replace(/ /g, '  ') + '  ' })
+    }),
+    updateSpec: () => { updateCount += 1; }
+  };
+  const result = JSON.parse(JSON.stringify(
+    context.ensureAccountDetailDataSourceQuery_({ getDataSource: () => dataSource }, 'monthly_view')
+  ));
+  assert.equal(result.status, 'preserved');
+  assert.equal(updateCount, 0);
+});
+
+test('Connected Sheets source query is updated when an existing extract has stale ordering', () => {
+  const context = loadContext();
+  const calls = [];
+  const builtSpec = { kind: 'updated-spec' };
+  const builder = {
+    asBigQuery() { calls.push('asBigQuery'); return builder; },
+    setProjectId(value) { calls.push(['setProjectId', value]); return builder; },
+    setRawQuery(value) { calls.push(['setRawQuery', value]); return builder; },
+    removeAllParameters() { calls.push('removeAllParameters'); return builder; },
+    build() { calls.push('build'); return builtSpec; }
+  };
+  let updatedWith = null;
+  const originalSpec = {
+    asBigQuery: () => ({
+      getRawQuery: () => 'SELECT * FROM `old.view` ORDER BY SubAccountNumber, TxnDate'
+    }),
+    copy: () => builder
+  };
+  const dataSource = {
+    getSpec: () => originalSpec,
+    updateSpec: value => { updatedWith = value; }
+  };
+
+  const result = JSON.parse(JSON.stringify(
+    context.ensureAccountDetailDataSourceQuery_({ getDataSource: () => dataSource }, 'monthly_view')
+  ));
+  assert.equal(result.status, 'updated');
+  assert.equal(updatedWith, builtSpec);
+  assert.ok(calls.includes('removeAllParameters'));
+  const rawQueryCall = calls.find(call => Array.isArray(call) && call[0] === 'setRawQuery');
+  assert.match(rawQueryCall[1], /ORDER BY DateFrom, Entity, SubAccountNumber, TxnDate, TxnId$/);
+});
+
 test('Connected Sheets migration renames legacy tabs without creating duplicates', () => {
   const context = loadContext();
   const sheets = new Map();
