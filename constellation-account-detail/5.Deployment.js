@@ -404,18 +404,26 @@ function ensureAccountDetailExtractFilter_(table) {
   if (!table || typeof table.getRange !== 'function') {
     throw new Error('Account Detail extract filter requires a valid DataSourceTable.');
   }
-  const range = table.getRange();
-  const sheet = range.getSheet();
-  if (sheet.getFilter()) {
-    return { name: sheet.getName(), status: 'preserved' };
-  }
-  if (range.getNumRows() < 1 || range.getNumColumns() < 1) {
+  const tableRange = table.getRange();
+  const sheet = tableRange.getSheet();
+  if (tableRange.getNumRows() < 1 || tableRange.getNumColumns() < 1) {
     throw new Error('Account Detail extract has no range available for its filter: ' + sheet.getName());
   }
+  const range = sheet.getRange(
+    1,
+    tableRange.getColumn(),
+    Math.max(sheet.getMaxRows(), tableRange.getNumRows()),
+    tableRange.getNumColumns()
+  );
+  const existing = sheet.getFilter();
+  if (existing && existing.getRange().getA1Notation() === range.getA1Notation()) {
+    return { name: sheet.getName(), status: 'preserved', range: range.getA1Notation() };
+  }
+  if (existing) existing.remove();
   range.createFilter();
   return {
     name: sheet.getName(),
-    status: 'created',
+    status: existing ? 'updated' : 'created',
     range: range.getA1Notation()
   };
 }
@@ -609,8 +617,16 @@ function deployAccountDetailReport() {
   const schema = ensureAccountDetailBigQuerySchema_();
   const views = deployAccountDetailViews_();
   const sheets = installAccountDetailConnectedSheets_();
+  const refresh = refreshAccountDetailConnectedSheets_();
   const cadence = installAccountDetailCadenceTriggers();
-  const result = { status: 'completed', schema: schema, views: views, sheets: sheets, cadence: cadence };
+  const result = {
+    status: 'completed',
+    schema: schema,
+    views: views,
+    sheets: sheets,
+    refresh: refresh,
+    cadence: cadence
+  };
   Logger.log(JSON.stringify({ event: 'account_detail_deployment_completed', result: result }));
   return result;
 }

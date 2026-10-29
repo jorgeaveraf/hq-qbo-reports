@@ -428,36 +428,59 @@ test('Connected Sheets extracts replace sync-all with the configured display col
   assert.equal(removeAllCount, 1);
 });
 
-test('Connected Sheets extracts receive a header filter without replacing an existing filter', () => {
+test('Connected Sheets extracts receive a full-column filter and repair a stale filter range', () => {
   const context = loadContext();
   let filter = null;
   let createCount = 0;
+  let removeCount = 0;
+  const filterRange = {
+    getA1Notation: () => 'A1:S1000',
+    createFilter() {
+      createCount += 1;
+      filter = {
+        getRange: () => filterRange,
+        remove: () => { removeCount += 1; filter = null; }
+      };
+    }
+  };
   const sheet = {
     getName: () => 'P&L Detail Latest_extract',
-    getFilter: () => filter
+    getFilter: () => filter,
+    getMaxRows: () => 1000,
+    getRange: (row, column, numRows, numColumns) => {
+      assert.deepEqual([row, column, numRows, numColumns], [1, 1, 1000, 19]);
+      return filterRange;
+    }
   };
   const range = {
     getSheet: () => sheet,
     getNumRows: () => 100,
-    getNumColumns: () => 39,
-    getA1Notation: () => 'A1:AM100',
-    createFilter() {
-      createCount += 1;
-      filter = { existing: true };
-    }
+    getNumColumns: () => 19,
+    getColumn: () => 1
   };
   const table = { getRange: () => range };
 
   assert.deepEqual(
     JSON.parse(JSON.stringify(context.ensureAccountDetailExtractFilter_(table))),
-    { name: 'P&L Detail Latest_extract', status: 'created', range: 'A1:AM100' }
+    { name: 'P&L Detail Latest_extract', status: 'created', range: 'A1:S1000' }
   );
   assert.equal(createCount, 1);
   assert.deepEqual(
     JSON.parse(JSON.stringify(context.ensureAccountDetailExtractFilter_(table))),
-    { name: 'P&L Detail Latest_extract', status: 'preserved' }
+    { name: 'P&L Detail Latest_extract', status: 'preserved', range: 'A1:S1000' }
   );
   assert.equal(createCount, 1);
+
+  filter = {
+    getRange: () => ({ getA1Notation: () => 'A1:S15' }),
+    remove: () => { removeCount += 1; filter = null; }
+  };
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.ensureAccountDetailExtractFilter_(table))),
+    { name: 'P&L Detail Latest_extract', status: 'updated', range: 'A1:S1000' }
+  );
+  assert.equal(removeCount, 1);
+  assert.equal(createCount, 2);
 });
 
 test('schedule installs daily 5, monthly day 10 at 6, and Monday repair at 7', () => {
