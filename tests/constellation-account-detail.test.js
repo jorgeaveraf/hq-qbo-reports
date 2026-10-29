@@ -384,6 +384,48 @@ test('Connected Sheets contract includes source sheets and matching extracts', (
     }
   ]);
   assert.equal(vm.runInContext('ACCOUNT_DETAIL_SPREADSHEET.extractRowLimit', context), 25000);
+  assert.deepEqual(
+    Array.from(vm.runInContext('ACCOUNT_DETAIL_SPREADSHEET.extractColumns', context)),
+    [
+      'SnapshotDate', 'PeriodStart', 'PeriodEnd', 'Entity',
+      'ParentAccountNumber', 'ParentAccountName', 'SubAccountNumber', 'SubAccountName',
+      'TxnDate', 'TxnType', 'DocNumber', 'Name', 'Location', 'Memo',
+      'SplitAccountName', 'Amount', 'RunningBalance', 'AccountingMethod', 'Currency'
+    ]
+  );
+});
+
+test('Connected Sheets extracts replace sync-all with the configured display columns', () => {
+  const context = loadContext();
+  const expected = Array.from(vm.runInContext('ACCOUNT_DETAIL_SPREADSHEET.extractColumns', context));
+  let current = ['SnapshotDate', 'ClientId', 'LoadedAt'];
+  let syncingAll = true;
+  let filterRemoved = 0;
+  let removeAllCount = 0;
+  const dataSourceColumn = name => ({ getName: () => name });
+  const table = {
+    getColumns: () => current.map(name => ({ getDataSourceColumn: () => dataSourceColumn(name) })),
+    isSyncingAllColumns: () => syncingAll,
+    getRange: () => ({
+      getSheet: () => ({
+        getName: () => 'P&L Detail Latest_extract',
+        getFilter: () => ({ remove: () => { filterRemoved += 1; } })
+      })
+    }),
+    removeAllColumns() { removeAllCount += 1; current = []; syncingAll = false; return table; },
+    addColumns(names) { current = Array.from(names); return table; }
+  };
+
+  const updated = JSON.parse(JSON.stringify(context.ensureAccountDetailExtractColumns_(table)));
+  assert.equal(updated.status, 'updated');
+  assert.deepEqual(updated.columns, expected);
+  assert.equal(filterRemoved, 1);
+  assert.equal(removeAllCount, 1);
+
+  const preserved = JSON.parse(JSON.stringify(context.ensureAccountDetailExtractColumns_(table)));
+  assert.equal(preserved.status, 'preserved');
+  assert.deepEqual(preserved.columns, expected);
+  assert.equal(removeAllCount, 1);
 });
 
 test('Connected Sheets extracts receive a header filter without replacing an existing filter', () => {

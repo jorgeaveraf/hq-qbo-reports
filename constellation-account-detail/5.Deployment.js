@@ -364,10 +364,40 @@ function createAccountDetailDataSourceSheet_(spreadsheet, name, viewId) {
 
 function createAccountDetailExtract_(dataSourceSheet, name) {
   const table = dataSourceSheet.getDataSource().createDataSourceTableOnNewSheet();
-  table.syncAllColumns();
+  table.addColumns(ACCOUNT_DETAIL_SPREADSHEET.extractColumns);
   table.setRowLimit(ACCOUNT_DETAIL_SPREADSHEET.extractRowLimit);
   table.getRange().getSheet().setName(name);
   return table;
+}
+
+function getAccountDetailExtractColumnNames_(table) {
+  return table.getColumns().map(column => column.getDataSourceColumn().getName());
+}
+
+function ensureAccountDetailExtractColumns_(table) {
+  if (!table || typeof table.getColumns !== 'function') {
+    throw new Error('Account Detail extract columns require a valid DataSourceTable.');
+  }
+  const expected = ACCOUNT_DETAIL_SPREADSHEET.extractColumns.slice();
+  const actual = getAccountDetailExtractColumnNames_(table);
+  const matches = table.isSyncingAllColumns() !== true &&
+    actual.length === expected.length &&
+    actual.every((name, index) => name === expected[index]);
+  const sheet = table.getRange().getSheet();
+  if (matches) {
+    return { name: sheet.getName(), status: 'preserved', columns: actual };
+  }
+
+  const filter = sheet.getFilter();
+  if (filter) filter.remove();
+  table.removeAllColumns();
+  table.addColumns(expected);
+  return {
+    name: sheet.getName(),
+    status: 'updated',
+    previousColumns: actual,
+    columns: expected
+  };
 }
 
 function ensureAccountDetailExtractFilter_(table) {
@@ -436,6 +466,9 @@ function installAccountDetailConnectedSheets_() {
       createdExtracts.push(item.extractName);
     }
   });
+  const columns = expected.map(item =>
+    ensureAccountDetailExtractColumns_(extractByName[item.extractName])
+  );
   const filters = expected.map(item =>
     ensureAccountDetailExtractFilter_(extractByName[item.extractName])
   );
@@ -456,6 +489,7 @@ function installAccountDetailConnectedSheets_() {
     status: 'passed',
     spreadsheetId: spreadsheet.getId(),
     created: { sourceSheets: createdSources, extracts: createdExtracts },
+    columns: columns,
     filters: filters,
     targets: targets
   };

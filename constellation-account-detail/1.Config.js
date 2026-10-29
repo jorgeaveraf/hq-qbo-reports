@@ -45,6 +45,12 @@ const ACCOUNT_DETAIL_SPREADSHEET = {
   monthlySheetName: 'P&L Detail Monthly',
   latestExtractSheetName: 'P&L Detail Latest_extract',
   monthlyExtractSheetName: 'P&L Detail Monthly_extract',
+  extractColumns: [
+    'SnapshotDate', 'PeriodStart', 'PeriodEnd', 'Entity',
+    'ParentAccountNumber', 'ParentAccountName', 'SubAccountNumber', 'SubAccountName',
+    'TxnDate', 'TxnType', 'DocNumber', 'Name', 'Location', 'Memo',
+    'SplitAccountName', 'Amount', 'RunningBalance', 'AccountingMethod', 'Currency'
+  ],
   extractRowLimit: 25000,
   timeoutSeconds: 300
 };
