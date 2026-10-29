@@ -100,7 +100,7 @@ function normalizeAccountDetailSettings_(settings, entityIndex) {
     latest: {
       enabled: latest.enabled !== false,
       cadence: 'DAILY',
-      mode: 'YTD_REPLACE'
+      mode: 'MTD_REPLACE'
     },
     monthly: {
       enabled: monthly.enabled !== false,
@@ -751,14 +751,15 @@ function reconcileAccountDetailRows_(rows, expectedAmount, target) {
 function getAccountDetailLatestRange_(settings, referenceIsoDate) {
   const today = formatAccountDetailDate_(referenceIsoDate || accountDetailToday_());
   if (!today) throw new Error('Invalid latest reference date: ' + referenceIsoDate);
+  const monthStart = accountDetailMonthStart_(today);
   return {
     snapshotType: ACCOUNT_DETAIL_SNAPSHOT_LATEST,
     snapshotDate: today,
-    periodStart: settings.history_start_date,
+    periodStart: monthStart,
     periodEnd: today,
-    dateFrom: settings.history_start_date,
+    dateFrom: monthStart,
     dateTo: today,
-    periodKey: settings.history_start_date + '|' + today
+    periodKey: monthStart + '|' + today
   };
 }
 

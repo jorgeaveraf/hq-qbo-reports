@@ -41,13 +41,19 @@ const ACCOUNT_DETAIL_ENTITY_CONTROL = {
 const ACCOUNT_DETAIL_SPREADSHEET = {
   idProperty: 'QBO_ACCOUNT_DETAIL_REPORT_SPREADSHEET_ID',
   targetsProperty: 'QBO_ACCOUNT_DETAIL_CONNECTED_SHEETS_TARGETS',
-  latestSheetName: 'P&L Detail Latest',
-  monthlySheetName: 'P&L Detail Monthly',
-  latestExtractSheetName: 'P&L Detail Latest_extract',
-  monthlyExtractSheetName: 'P&L Detail Monthly_extract',
+  latestSheetName: 'P&L_account_detail_latest',
+  monthlySheetName: 'P&L_account_detail_monthly',
+  latestExtractSheetName: 'P&L_account_detail_latest_extract',
+  monthlyExtractSheetName: 'P&L_account_detail_monthly_extract',
+  legacyNames: {
+    latestSheetName: 'P&L Detail Latest',
+    monthlySheetName: 'P&L Detail Monthly',
+    latestExtractSheetName: 'P&L Detail Latest_extract',
+    monthlyExtractSheetName: 'P&L Detail Monthly_extract'
+  },
   extractColumns: [
-    'SnapshotDate', 'PeriodStart', 'PeriodEnd', 'Entity',
-    'ParentAccountNumber', 'ParentAccountName', 'SubAccountNumber', 'SubAccountName',
+    'SnapshotDate', 'DateFrom', 'DateTo', 'Entity',
+    'ParentAccountNumber', 'ParentAccountName', 'SubAccountNumber', 'AccountName',
     'TxnDate', 'TxnType', 'DocNumber', 'Name', 'Location', 'Memo',
     'SplitAccountName', 'Amount', 'RunningBalance', 'AccountingMethod', 'Currency'
   ],

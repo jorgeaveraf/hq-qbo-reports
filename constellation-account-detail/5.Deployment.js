@@ -302,8 +302,9 @@ function recordAccountDetailRunScopes_(operationId, scopes, rows, configurationH
 
 function buildAccountDetailViewSql_(viewId, snapshotType) {
   const columns = [
-    'SnapshotDate', 'PeriodStart', 'PeriodEnd', 'Entity', 'ClientName',
-    'ParentAccountNumber', 'ParentAccountName', 'SubAccountNumber', 'SubAccountName', 'AccountPath',
+    'SnapshotDate', 'PeriodStart AS DateFrom', 'PeriodEnd AS DateTo', 'Entity', 'ClientName',
+    'ParentAccountNumber', 'ParentAccountName', 'SubAccountNumber',
+    'SubAccountName AS AccountName', 'AccountPath',
     'TxnDate', 'TxnType', 'DocNumber', 'Name', 'Location', 'Memo',
     'SplitAccountName', 'Amount', 'RunningBalance',
     'ClientId', 'ParentAccountId', 'SubAccountId', 'TxnId', 'NameId',
@@ -348,7 +349,35 @@ function getAccountDetailSpreadsheet_() {
 
 function buildAccountDetailSheetQuery_(viewId) {
   return 'SELECT * FROM `' + ACCOUNT_DETAIL_CONFIG.projectId + '.' +
-    ACCOUNT_DETAIL_CONFIG.viewsDatasetId + '.' + viewId + '` ORDER BY Entity, SubAccountNumber, TxnDate, TxnId';
+    ACCOUNT_DETAIL_CONFIG.viewsDatasetId + '.' + viewId +
+    '` ORDER BY DateFrom, Entity, SubAccountNumber, TxnDate, TxnId';
+}
+
+function migrateAccountDetailSheetNames_(spreadsheet) {
+  const pairs = [
+    [ACCOUNT_DETAIL_SPREADSHEET.legacyNames.latestSheetName, ACCOUNT_DETAIL_SPREADSHEET.latestSheetName],
+    [ACCOUNT_DETAIL_SPREADSHEET.legacyNames.monthlySheetName, ACCOUNT_DETAIL_SPREADSHEET.monthlySheetName],
+    [ACCOUNT_DETAIL_SPREADSHEET.legacyNames.latestExtractSheetName,
+      ACCOUNT_DETAIL_SPREADSHEET.latestExtractSheetName],
+    [ACCOUNT_DETAIL_SPREADSHEET.legacyNames.monthlyExtractSheetName,
+      ACCOUNT_DETAIL_SPREADSHEET.monthlyExtractSheetName]
+  ];
+  const renamed = [];
+  pairs.forEach(pair => {
+    const legacyName = pair[0];
+    const targetName = pair[1];
+    const legacy = spreadsheet.getSheetByName(legacyName);
+    const target = spreadsheet.getSheetByName(targetName);
+    if (legacy && target && legacy.getSheetId() !== target.getSheetId()) {
+      throw new Error('Cannot migrate Account Detail sheet name because both names exist: ' +
+        legacyName + ' and ' + targetName);
+    }
+    if (legacy && !target) {
+      legacy.setName(targetName);
+      renamed.push({ from: legacyName, to: targetName });
+    }
+  });
+  return renamed;
 }
 
 function createAccountDetailDataSourceSheet_(spreadsheet, name, viewId) {
@@ -446,6 +475,7 @@ function getAccountDetailSheetDefinitions_() {
 function installAccountDetailConnectedSheets_() {
   const spreadsheet = getAccountDetailSpreadsheet_();
   SpreadsheetApp.enableBigQueryExecution();
+  const renamed = migrateAccountDetailSheetNames_(spreadsheet);
   const expected = getAccountDetailSheetDefinitions_();
   const sourceByName = {};
   spreadsheet.getDataSourceSheets().forEach(source => {
@@ -460,6 +490,16 @@ function installAccountDetailConnectedSheets_() {
       createdSources.push(item.sourceName);
     }
   });
+
+  // The view contract may have changed while the Connected Sheet retained its
+  // previous schema. Refresh the source before replacing extract columns so
+  // aliases such as DateFrom/DateTo are available to addColumns().
+  expected.forEach(item => sourceByName[item.sourceName].refreshData());
+  spreadsheet.waitForAllDataExecutionsCompletion(ACCOUNT_DETAIL_SPREADSHEET.timeoutSeconds);
+  const sourceExecutions = expected.map(item =>
+    describeAccountDetailDataExecution_(sourceByName[item.sourceName], item.sourceName)
+  );
+  assertAccountDetailDataExecutionsPassed_('source schema migration', sourceExecutions);
 
   const extractByName = {};
   spreadsheet.getDataSourceTables().forEach(table => {
@@ -496,7 +536,9 @@ function installAccountDetailConnectedSheets_() {
   return {
     status: 'passed',
     spreadsheetId: spreadsheet.getId(),
+    renamed: renamed,
     created: { sourceSheets: createdSources, extracts: createdExtracts },
+    sourceSchemaRefresh: sourceExecutions,
     columns: columns,
     filters: filters,
     targets: targets

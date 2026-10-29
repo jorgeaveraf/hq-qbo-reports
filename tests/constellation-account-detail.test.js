@@ -79,7 +79,7 @@ function settings() {
     detail_account_ids: ['1150040007', '1150040008'],
     parent_account_id: null,
     history_start_date: '2026-01-01',
-    latest: { enabled: true, cadence: 'DAILY', mode: 'YTD_REPLACE' },
+    latest: { enabled: true, cadence: 'DAILY', mode: 'MTD_REPLACE' },
     monthly: { enabled: true, capture_day: 10, months_behind: 1 },
     repair: { enabled: true, cadence: 'WEEKLY', window_weeks: 12 }
   };
@@ -207,6 +207,7 @@ test('configuration keeps dynamic report settings in its hash and validates them
   assert.deepEqual(Array.from(validated.entities[0].report_settings.detail_account_ids), [
     '1150040007', '1150040008'
   ]);
+  assert.equal(validated.entities[0].report_settings.latest.mode, 'MTD_REPLACE');
   const changed = JSON.parse(JSON.stringify(loaded.configuration));
   changed.entities[0].report_settings.detail_account_ids.push('new-account');
   assert.throws(() => context.validateAccountDetailEntityConfiguration_(changed), /hash mismatch/);
@@ -299,8 +300,8 @@ test('latest and monthly periods follow the approved cadence', () => {
   const context = loadContext();
   assert.deepEqual(JSON.parse(JSON.stringify(context.getAccountDetailLatestRange_(settings(), '2026-10-28'))), {
     snapshotType: 'LATEST', snapshotDate: '2026-10-28',
-    periodStart: '2026-01-01', periodEnd: '2026-10-28',
-    dateFrom: '2026-01-01', dateTo: '2026-10-28', periodKey: '2026-01-01|2026-10-28'
+    periodStart: '2026-10-01', periodEnd: '2026-10-28',
+    dateFrom: '2026-10-01', dateTo: '2026-10-28', periodKey: '2026-10-01|2026-10-28'
   });
   assert.deepEqual(JSON.parse(JSON.stringify(context.getAccountDetailPreviousMonthRange_(settings(), '2026-10-28'))), {
     snapshotType: 'MONTHLY', snapshotDate: '2026-10-10',
@@ -363,6 +364,11 @@ test('views expose separate latest and monthly contracts', () => {
   const monthly = context.buildAccountDetailViewSql_('monthly_view', 'MONTHLY');
   assert.match(latest, /SnapshotType = 'LATEST'/);
   assert.match(monthly, /SnapshotType = 'MONTHLY'/);
+  assert.match(latest, /PeriodStart AS DateFrom/);
+  assert.match(latest, /PeriodEnd AS DateTo/);
+  assert.match(latest, /SubAccountName AS AccountName/);
+  assert.match(latest, /ClientName/);
+  assert.match(latest, /AccountPath/);
   assert.match(latest, /SubAccountNumber/);
   assert.match(latest, /TxnType/);
   assert.match(latest, /DocNumber/);
@@ -373,13 +379,13 @@ test('Connected Sheets contract includes source sheets and matching extracts', (
   const definitions = context.getAccountDetailSheetDefinitions_();
   assert.deepEqual(JSON.parse(JSON.stringify(definitions)), [
     {
-      sourceName: 'P&L Detail Latest',
-      extractName: 'P&L Detail Latest_extract',
+      sourceName: 'P&L_account_detail_latest',
+      extractName: 'P&L_account_detail_latest_extract',
       viewId: 'vw_profit_and_loss_account_detail_latest'
     },
     {
-      sourceName: 'P&L Detail Monthly',
-      extractName: 'P&L Detail Monthly_extract',
+      sourceName: 'P&L_account_detail_monthly',
+      extractName: 'P&L_account_detail_monthly_extract',
       viewId: 'vw_monthly_profit_and_loss_account_detail'
     }
   ]);
@@ -387,12 +393,50 @@ test('Connected Sheets contract includes source sheets and matching extracts', (
   assert.deepEqual(
     Array.from(vm.runInContext('ACCOUNT_DETAIL_SPREADSHEET.extractColumns', context)),
     [
-      'SnapshotDate', 'PeriodStart', 'PeriodEnd', 'Entity',
-      'ParentAccountNumber', 'ParentAccountName', 'SubAccountNumber', 'SubAccountName',
+      'SnapshotDate', 'DateFrom', 'DateTo', 'Entity',
+      'ParentAccountNumber', 'ParentAccountName', 'SubAccountNumber', 'AccountName',
       'TxnDate', 'TxnType', 'DocNumber', 'Name', 'Location', 'Memo',
       'SplitAccountName', 'Amount', 'RunningBalance', 'AccountingMethod', 'Currency'
     ]
   );
+  const query = context.buildAccountDetailSheetQuery_('monthly_view');
+  assert.match(query, /ORDER BY DateFrom, Entity, SubAccountNumber, TxnDate, TxnId$/);
+});
+
+test('Connected Sheets migration renames legacy tabs without creating duplicates', () => {
+  const context = loadContext();
+  const sheets = new Map();
+  function add(name, id) {
+    const sheet = {
+      getName: () => name,
+      getSheetId: () => id,
+      setName(value) {
+        sheets.delete(name);
+        name = value;
+        sheets.set(name, sheet);
+        return sheet;
+      }
+    };
+    sheets.set(name, sheet);
+    return sheet;
+  }
+  add('P&L Detail Latest', 1);
+  add('P&L Detail Monthly', 2);
+  add('P&L Detail Latest_extract', 3);
+  add('P&L Detail Monthly_extract', 4);
+  const spreadsheet = { getSheetByName: name => sheets.get(name) || null };
+
+  const renamed = JSON.parse(JSON.stringify(context.migrateAccountDetailSheetNames_(spreadsheet)));
+  assert.equal(renamed.length, 4);
+  assert.deepEqual(Array.from(sheets.keys()).sort(), [
+    'P&L_account_detail_latest',
+    'P&L_account_detail_latest_extract',
+    'P&L_account_detail_monthly',
+    'P&L_account_detail_monthly_extract'
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(
+    context.migrateAccountDetailSheetNames_(spreadsheet)
+  )), []);
 });
 
 test('Connected Sheets extracts replace sync-all with the configured display columns', () => {
@@ -408,7 +452,7 @@ test('Connected Sheets extracts replace sync-all with the configured display col
     isSyncingAllColumns: () => syncingAll,
     getRange: () => ({
       getSheet: () => ({
-        getName: () => 'P&L Detail Latest_extract',
+        getName: () => 'P&L_account_detail_latest_extract',
         getFilter: () => ({ remove: () => { filterRemoved += 1; } })
       })
     }),
@@ -444,7 +488,7 @@ test('Connected Sheets extracts receive a full-column filter and repair a stale 
     }
   };
   const sheet = {
-    getName: () => 'P&L Detail Latest_extract',
+    getName: () => 'P&L_account_detail_latest_extract',
     getFilter: () => filter,
     getMaxRows: () => 1000,
     getRange: (row, column, numRows, numColumns) => {
@@ -462,12 +506,12 @@ test('Connected Sheets extracts receive a full-column filter and repair a stale 
 
   assert.deepEqual(
     JSON.parse(JSON.stringify(context.ensureAccountDetailExtractFilter_(table))),
-    { name: 'P&L Detail Latest_extract', status: 'created', range: 'A1:S1000' }
+    { name: 'P&L_account_detail_latest_extract', status: 'created', range: 'A1:S1000' }
   );
   assert.equal(createCount, 1);
   assert.deepEqual(
     JSON.parse(JSON.stringify(context.ensureAccountDetailExtractFilter_(table))),
-    { name: 'P&L Detail Latest_extract', status: 'preserved', range: 'A1:S1000' }
+    { name: 'P&L_account_detail_latest_extract', status: 'preserved', range: 'A1:S1000' }
   );
   assert.equal(createCount, 1);
 
@@ -477,7 +521,7 @@ test('Connected Sheets extracts receive a full-column filter and repair a stale 
   };
   assert.deepEqual(
     JSON.parse(JSON.stringify(context.ensureAccountDetailExtractFilter_(table))),
-    { name: 'P&L Detail Latest_extract', status: 'updated', range: 'A1:S1000' }
+    { name: 'P&L_account_detail_latest_extract', status: 'updated', range: 'A1:S1000' }
   );
   assert.equal(removeCount, 1);
   assert.equal(createCount, 2);
