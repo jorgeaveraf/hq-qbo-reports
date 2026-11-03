@@ -216,6 +216,11 @@ function readPnlRollingState_() {
 }
 
 function persistPnlRollingState_(state) {
+  ['dataSourceSheets', 'extracts'].forEach(key => {
+    if (state[key] && Array.isArray(state[key].executions)) {
+      state[key] = summarizePnlRollingSheetRefresh_(state[key]);
+    }
+  });
   const serialized = JSON.stringify(state);
   const byteCount = unescape(encodeURIComponent(serialized)).length;
   if (byteCount > PNL_ROLLING_RECONCILIATION.maxStateBytes) {
@@ -225,6 +230,44 @@ function persistPnlRollingState_(state) {
     PNL_ROLLING_RECONCILIATION.statePropertyKey, serialized
   );
   return byteCount;
+}
+
+function summarizePnlRollingSheetRefresh_(result) {
+  // The full per-sheet statuses are already logged by the refresh function.
+  // Keep only a bounded checkpoint in Script Properties so the final stage
+  // cannot exceed its per-value size limit.
+  return {
+    status: result.status,
+    refreshedObjectCount: result.refreshedObjectCount,
+    names: (result.executions || []).map(execution => execution.name)
+  };
+}
+
+/** Resume only a validated run whose final extract checkpoint could not be saved. */
+function resumePnlRollingFinalization() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) throw new Error('P&L rolling reconciliation is busy.');
+  try {
+    const state = readPnlRollingState_();
+    if (!state || state.status !== 'failed' || state.currentStage !== 'extracts' ||
+        !state.finalValidation || state.finalValidation.status !== 'passed' ||
+        !state.dataSourceSheets || state.dataSourceSheets.status !== 'passed' ||
+        state.completedCount !== state.plan.jobs.length) {
+      throw new Error('Only a fully validated P&L run stopped at extract finalization can be resumed.');
+    }
+    state.status = 'pending';
+    state.stageAttempts = 0;
+    state.lastError = null;
+    state.updatedAt = new Date().toISOString();
+    persistPnlRollingState_(state);
+    ensurePnlRollingRecoveryTrigger_();
+    replacePnlRollingSchedule_(PNL_ROLLING_RECONCILIATION.continuationDelayMs, {
+      reason: 'resume_validated_finalization'
+    });
+    return { status: 'scheduled', operationId: state.operationId, currentStage: state.currentStage };
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function deletePnlRollingTriggers_() {
@@ -421,11 +464,15 @@ function processPnlRollingReconciliation() {
       state.currentStage = 'data_source_sheets';
       state.stageAttempts = 0;
     } else if (state.currentStage === 'data_source_sheets') {
-      state.dataSourceSheets = refreshPnlConnectedSheetsStage_('data_source_sheets');
+      state.dataSourceSheets = summarizePnlRollingSheetRefresh_(
+        refreshPnlConnectedSheetsStage_('data_source_sheets')
+      );
       state.currentStage = 'extracts';
       state.stageAttempts = 0;
     } else if (state.currentStage === 'extracts') {
-      state.extracts = refreshPnlConnectedSheetsStage_('extracts');
+      state.extracts = summarizePnlRollingSheetRefresh_(
+        refreshPnlConnectedSheetsStage_('extracts')
+      );
       state.currentStage = 'completed';
       state.status = 'completed';
       state.completedAt = new Date().toISOString();

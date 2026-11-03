@@ -336,3 +336,67 @@ test('full productive P&L rolling state remains below the Script Properties limi
   const bytes = context.persistPnlRollingState_(state);
   assert.ok(bytes < 8500, 'serialized state was ' + bytes + ' bytes');
 });
+
+test('P&L final sheet checkpoints stay below the property limit', () => {
+  const context = loadPnlContext();
+  const plan = context.buildPnlRollingReconciliationPlan_('2026-11-03');
+  const execution = name => ({
+    name, type: 'extract', state: 'SUCCESS', errorCode: 'NONE', errorMessage: null,
+    lastExecutionAt: '2026-11-03T21:38:57.000Z',
+    lastRefreshedAt: '2026-11-03T21:38:57.000Z', truncated: false
+  });
+  const refresh = names => ({
+    status: 'passed', reportKey: 'all', stage: 'extracts',
+    refreshedObjectCount: names.length, executions: names.map(execution)
+  });
+  const state = {
+    operationId: 'x'.repeat(36), report: 'profit_and_loss', planVersion: '2026-pnl-rolling-v2',
+    status: 'completed', currentStage: 'completed', jobIndex: plan.jobs.length, plan,
+    currentClientIds: null, completedCount: plan.jobs.length, retriedClientCount: 0,
+    completedByVariant: { normal: { weekly: 12, monthly: 3 }, by_class: { weekly: 12, monthly: 3 } },
+    configuration: { normal: 'a'.repeat(64), by_class: 'b'.repeat(64) },
+    outsideWindowBaseline: {
+      normal: { rowCount: 999999, distinctKeyCount: 999999, rowFingerprint: '-9223372036854775808' },
+      by_class: { rowCount: 999999, distinctKeyCount: 999999, rowFingerprint: '9223372036854775807' }
+    },
+    finalValidation: { status: 'passed', variants: { normal: { outsideWindowUnchanged: true }, by_class: { outsideWindowUnchanged: true } } },
+    lastResult: { status: 'completed', variant: 'by_class', snapshotType: 'MONTHLY', snapshotWeek: '2026-09-01', rowCount: 999999, clientCount: 16, verification: 'passed' },
+    lastError: null, stageAttempts: 0, createdAt: '2026-11-03T20:00:00.000Z',
+    updatedAt: '2026-11-03T21:38:57.000Z', completedAt: '2026-11-03T21:38:57.000Z'
+  };
+  const names = ['P&L_latest_extract', 'P&L_weekly_extract', 'P&L_monthly_extract',
+    'P&L_byClass_weekly_extract', 'P&L_byClass_latest_extract', 'P&L_byClass_monthly_extract'];
+  state.dataSourceSheets = context.summarizePnlRollingSheetRefresh_(refresh(names));
+  state.extracts = context.summarizePnlRollingSheetRefresh_(refresh(names));
+  assert.equal(state.extracts.refreshedObjectCount, 6);
+  assert.equal(state.extracts.names.length, 6);
+  const bytes = context.persistPnlRollingState_(state);
+  assert.ok(bytes < 8500, 'serialized state was ' + bytes + ' bytes');
+  state.dataSourceSheets = refresh(names);
+  state.extracts = refresh(names);
+  assert.ok(Buffer.byteLength(JSON.stringify(state)) > 8500);
+  assert.ok(context.persistPnlRollingState_(state) < 8500);
+  assert.equal(state.dataSourceSheets.executions, undefined);
+});
+
+test('P&L finalization resumes only after successful validation and source refresh', () => {
+  const context = loadPnlContext();
+  const state = {
+    status: 'failed', currentStage: 'extracts', stageAttempts: 3, lastError: 'state too large',
+    operationId: 'operation', plan: { jobs: [{}, {}] }, completedCount: 2,
+    finalValidation: { status: 'passed' }, dataSourceSheets: { status: 'passed' }
+  };
+  let scheduled = 0;
+  context.LockService = { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) };
+  context.readPnlRollingState_ = () => state;
+  context.persistPnlRollingState_ = () => 0;
+  context.ensurePnlRollingRecoveryTrigger_ = () => {};
+  context.replacePnlRollingSchedule_ = () => { scheduled++; };
+  assert.equal(context.resumePnlRollingFinalization().status, 'scheduled');
+  assert.equal(state.status, 'pending');
+  assert.equal(state.stageAttempts, 0);
+  assert.equal(scheduled, 1);
+  state.status = 'failed';
+  state.finalValidation.status = 'failed';
+  assert.throws(() => context.resumePnlRollingFinalization(), /fully validated/);
+});
