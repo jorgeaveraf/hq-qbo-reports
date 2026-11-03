@@ -11,8 +11,8 @@ const JOURNAL_ROLLING_RECONCILIATION = {
   weekCount: 12,
   statePropertyKey: 'QBO_JOURNAL_ROLLING_RECONCILIATION',
   workerHandler: 'processJournalRollingReconciliation',
-  initialDelayMs: 5000,
-  continuationDelayMs: 5000,
+  initialDelayMs: 60000,
+  continuationDelayMs: 60000,
   failureRetryDelayMs: 60000,
   watchdogDelayMs: 13 * 60 * 1000,
   maxJobAttempts: 3,
@@ -177,10 +177,20 @@ function deleteJournalRollingTriggers_() {
     .forEach(trigger => ScriptApp.deleteTrigger(trigger));
 }
 
-function replaceJournalRollingSchedule_(delayMs) {
-  deleteJournalRollingTriggers_();
-  ScriptApp.newTrigger(JOURNAL_ROLLING_RECONCILIATION.workerHandler)
-    .timeBased().after(Math.max(1000, Number(delayMs) || 1000)).create();
+function replaceJournalRollingSchedule_(delayMs, options) {
+  const settings = options || {};
+  const effectiveDelayMs = Math.max(60000, Number(delayMs) || 60000);
+  if (!settings.preserveExisting) deleteJournalRollingTriggers_();
+  const trigger = ScriptApp.newTrigger(JOURNAL_ROLLING_RECONCILIATION.workerHandler)
+    .timeBased().after(effectiveDelayMs).create();
+  Logger.log(JSON.stringify({
+    event: 'journal_rolling_trigger_created',
+    reason: settings.reason || 'unspecified',
+    delayMs: effectiveDelayMs,
+    preserveExisting: Boolean(settings.preserveExisting),
+    triggerId: trigger && trigger.getUniqueId ? trigger.getUniqueId() : null
+  }));
+  return trigger;
 }
 
 function assertJournalRollingIdle_(contextLabel) {
@@ -219,7 +229,10 @@ function startJournalRollingReconciliation(referenceIsoDate) {
     current.planVersion === JOURNAL_ROLLING_RECONCILIATION.planVersion &&
     ['pending', 'running'].includes(current.status)
   ) {
-    replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.continuationDelayMs);
+    replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.continuationDelayMs, {
+      preserveExisting: true,
+      reason: 'resume_existing_operation'
+    });
     return current;
   }
 
@@ -249,7 +262,11 @@ function startJournalRollingReconciliation(referenceIsoDate) {
   };
   deleteJournalBigQueryCheckpoint_();
   persistJournalRollingState_(state);
-  replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.initialDelayMs);
+  replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.initialDelayMs, { reason: 'initial_continuation' });
+  replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.watchdogDelayMs, {
+    preserveExisting: true,
+    reason: 'initial_watchdog'
+  });
   return state;
 }
 
@@ -309,9 +326,16 @@ function executeJournalRollingJob_(state) {
 }
 
 function processJournalRollingReconciliation() {
+  Logger.log(JSON.stringify({
+    event: 'journal_rolling_worker_started',
+    startedAt: new Date().toISOString()
+  }));
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
-    replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.continuationDelayMs);
+    replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.continuationDelayMs, {
+      preserveExisting: true,
+      reason: 'lock_busy_retry'
+    });
     return { status: 'deferred_lock_busy' };
   }
 
@@ -323,7 +347,9 @@ function processJournalRollingReconciliation() {
     state.status = 'running';
     state.updatedAt = new Date().toISOString();
     persistJournalRollingState_(state);
-    replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.watchdogDelayMs);
+    replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.watchdogDelayMs, {
+      reason: 'active_worker_watchdog'
+    });
 
     if (state.currentStage === 'bigquery') {
       const result = executeJournalRollingJob_(state);
@@ -361,7 +387,10 @@ function processJournalRollingReconciliation() {
     state.updatedAt = new Date().toISOString();
     persistJournalRollingState_(state);
     if (state.status === 'completed') deleteJournalRollingTriggers_();
-    else replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.continuationDelayMs);
+    else replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.continuationDelayMs, {
+      preserveExisting: true,
+      reason: 'next_stage_continuation'
+    });
     return state;
   } catch (error) {
     const state = readJournalRollingState_();
@@ -375,7 +404,10 @@ function processJournalRollingReconciliation() {
       prepareJournalBigQueryCheckpointForRetry_();
       persistJournalRollingState_(state);
       if (state.status === 'pending') {
-        replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.failureRetryDelayMs);
+        replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.failureRetryDelayMs, {
+          preserveExisting: true,
+          reason: 'failure_retry'
+        });
       } else {
         deleteJournalRollingTriggers_();
       }

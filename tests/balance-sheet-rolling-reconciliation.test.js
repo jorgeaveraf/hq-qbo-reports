@@ -36,18 +36,23 @@ function loadBalanceContext() {
   return context;
 }
 
-test('plans 12 closed Balance Sheet weeks without external calls', () => {
+test('plans 12 closed Balance Sheet weeks and due months without external calls', () => {
   const context = loadBalanceContext();
   let externalCalls = 0;
   context.runBalanceBigQueryQuery_ = () => { externalCalls++; };
   context.fetchBalanceSheet_ = () => { externalCalls++; };
   const plan = context.getBalanceRollingReconciliationPlan('2026-10-19');
-  assert.equal(plan.strategy, 'rolling_closed_weeks');
+  assert.equal(plan.strategy, 'rolling_closed_weeks_and_due_months');
   assert.equal(plan.weekCount, 12);
   assert.equal(plan.startWeek, '2026-07-27');
   assert.equal(plan.endWeek, '2026-10-12');
   assert.equal(plan.horizonDate, '2026-10-18');
   assert.equal(plan.periods.length, 12);
+  assert.equal(plan.monthlyPeriods.length, 3);
+  assert.deepEqual(JSON.parse(JSON.stringify(plan.monthlyPeriods.at(-1))), {
+    snapshotType: 'MONTHLY', snapshotWeek: '2026-09-01',
+    asOfDate: '2026-09-30', snapshotDate: '2026-10-10'
+  });
   assert.deepEqual(JSON.parse(JSON.stringify(plan.periods.at(-1))), {
     snapshotType: 'WEEKLY', snapshotWeek: '2026-10-12',
     asOfDate: '2026-10-18', snapshotDate: '2026-10-19'
@@ -194,10 +199,16 @@ test('final validation requires audit coverage and unchanged out-of-scope rows',
     audit: { rowCount: 20, rowFingerprint: '2' }
   };
   const state = {
-    plan, expectedClientIds: ['a', 'b'], completedCount: 12,
+    plan, expectedClientIds: ['a', 'b'], completedCount: 12, completedMonthCount: 3,
     createdAt: '2026-10-19T00:00:00.000Z', outsideScopeBaseline: baseline
   };
-  context.runBalanceBigQueryQuery_ = () => ({
+  context.runBalanceBigQueryQuery_ = query => query.includes('AS actual_month_count') ? ({
+    schema: { fields: [
+      { name: 'actual_month_count' }, { name: 'duplicate_line_count' },
+      { name: 'covered_client_month_count' }, { name: 'duplicate_audit_count' }
+    ] },
+    rows: [{ f: [{ v: '3' }, { v: '0' }, { v: '6' }, { v: '0' }] }]
+  }) : ({
     schema: { fields: [
       { name: 'actual_line_week_count' }, { name: 'duplicate_line_count' },
       { name: 'covered_client_week_count' }, { name: 'duplicate_audit_count' },

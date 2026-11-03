@@ -330,6 +330,16 @@ test('weekly repair covers only closed months intersecting the 12-week window', 
   assert.deepEqual(Array.from(plan.jobs, job => job.range.periodStart), ['2026-08-01', '2026-09-01']);
 });
 
+test('weekly repair waits until the monthly capture day before including last month', () => {
+  const context = loadContext();
+  const loaded = loadedConfiguration(context);
+  const sourceClients = clients();
+  const before = context.buildAccountDetailRollingPlan_(loaded, sourceClients, '2026-11-03');
+  const due = context.buildAccountDetailRollingPlan_(loaded, sourceClients, '2026-11-10');
+  assert.equal(Array.from(before.jobs, job => job.range.periodStart).includes('2026-10-01'), false);
+  assert.equal(Array.from(due.jobs, job => job.range.periodStart).includes('2026-10-01'), true);
+});
+
 test('BigQuery replacement deletes only explicitly successful scopes', () => {
   const context = loadContext();
   const sql = context.buildAccountDetailAtomicReplaceSql_(

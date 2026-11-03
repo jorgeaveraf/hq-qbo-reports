@@ -41,3 +41,30 @@ test('Payments no longer deploys the completed one-time 2026 history repair', ()
   assert.doesNotMatch(config, /PAYMENT_HISTORY_REPAIR_CONFIG/);
   assert.doesNotMatch(backfill, /PaymentHistoryRepair|history repair/i);
 });
+
+test('asynchronous rolling workers retain a watchdog until the next continuation starts', () => {
+  const asynchronousProjects = [
+    ['profit-and-loss', '7.RollingReconciliation.js', 'pnl'],
+    ['journal-entries', '7.RollingReconciliation.js', 'journal'],
+    ['balance-sheet', '7.RollingReconciliation.js', 'balance'],
+    ['ar-ap', '7.RollingReconciliation.js', 'aging'],
+    ['constellation-account-detail', '7.RollingReconciliation.js', 'account_detail']
+  ];
+
+  asynchronousProjects.forEach(([project, fileName, eventPrefix]) => {
+    const moduleSource = fs.readFileSync(path.join(root, project, fileName), 'utf8');
+    const configPath = path.join(root, project, '1.Config.js');
+    const combinedSource = fs.existsSync(configPath)
+      ? fs.readFileSync(configPath, 'utf8') + '\n' + moduleSource
+      : moduleSource;
+
+    assert.match(combinedSource, /initialDelayMs:\s*60000/, `${project} must not use a 5-second initial trigger`);
+    assert.match(combinedSource, /continuationDelayMs:\s*60000/, `${project} must use a 60-second continuation`);
+    assert.match(moduleSource, /reason:\s*'initial_watchdog'/, `${project} must arm an initial watchdog`);
+    assert.match(moduleSource, /reason:\s*'active_worker_watchdog'/, `${project} must arm an active-worker watchdog`);
+    assert.match(moduleSource, /reason:\s*'next_stage_continuation'/, `${project} must schedule the next stage explicitly`);
+    assert.match(moduleSource, /preserveExisting:\s*true/, `${project} must retain the watchdog when adding a continuation`);
+    assert.match(moduleSource, new RegExp(`event:\\s*'${eventPrefix}_rolling_trigger_created'`));
+    assert.match(moduleSource, new RegExp(`event:\\s*'${eventPrefix}_rolling_worker_started'`));
+  });
+});

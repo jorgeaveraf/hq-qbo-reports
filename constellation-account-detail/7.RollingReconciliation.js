@@ -16,8 +16,13 @@ function buildAccountDetailRollingPlan_(loaded, sourceClients, referenceIsoDate)
       (client.reportSettings.repair.window_weeks * 7 - 1) * 86400000);
     const currentMonth = accountDetailMonthStart_(reference);
     const lastClosedMonth = shiftAccountDetailMonths_(currentMonth, -1);
+    const captureDay = Number(client.reportSettings.monthly.capture_day);
+    const latestDueMonth = shiftAccountDetailMonths_(currentMonth,
+      -client.reportSettings.monthly.months_behind -
+        (referenceDate.getUTCDate() < captureDay ? 1 : 0));
     let month = accountDetailMonthStart_(formatAccountDetailDate_(firstMonday));
-    while (accountDetailDate_(month).getTime() <= accountDetailDate_(lastClosedMonth).getTime()) {
+    while (accountDetailDate_(month).getTime() <= accountDetailDate_(latestDueMonth).getTime() &&
+        accountDetailDate_(month).getTime() <= accountDetailDate_(lastClosedMonth).getTime()) {
       const range = buildAccountDetailMonthRange_(client.reportSettings, month);
       jobs.push({ clientId: client.id, range: range });
       month = shiftAccountDetailMonths_(month, 1);
@@ -61,10 +66,20 @@ function deleteAccountDetailRollingTriggers_() {
     .forEach(trigger => ScriptApp.deleteTrigger(trigger));
 }
 
-function replaceAccountDetailRollingSchedule_(delayMs) {
-  deleteAccountDetailRollingTriggers_();
-  ScriptApp.newTrigger(ACCOUNT_DETAIL_WORKER.repairHandler).timeBased()
-    .after(Math.max(1000, Number(delayMs) || 1000)).create();
+function replaceAccountDetailRollingSchedule_(delayMs, options) {
+  const settings = options || {};
+  const effectiveDelayMs = Math.max(60000, Number(delayMs) || 60000);
+  if (!settings.preserveExisting) deleteAccountDetailRollingTriggers_();
+  const trigger = ScriptApp.newTrigger(ACCOUNT_DETAIL_WORKER.repairHandler).timeBased()
+    .after(effectiveDelayMs).create();
+  Logger.log(JSON.stringify({
+    event: 'account_detail_rolling_trigger_created',
+    reason: settings.reason || 'unspecified',
+    delayMs: effectiveDelayMs,
+    preserveExisting: Boolean(settings.preserveExisting),
+    triggerId: trigger && trigger.getUniqueId ? trigger.getUniqueId() : null
+  }));
+  return trigger;
 }
 
 function startAccountDetailRollingReconciliation(referenceIsoDate) {
@@ -77,7 +92,10 @@ function startAccountDetailRollingReconciliation(referenceIsoDate) {
   const current = readAccountDetailRollingState_();
   if (current && current.configurationHash === plan.configurationHash &&
       ['pending', 'running'].includes(current.status)) {
-    replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.continuationDelayMs);
+    replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.continuationDelayMs, {
+      preserveExisting: true,
+      reason: 'resume_existing_operation'
+    });
     return current;
   }
   const now = new Date().toISOString();
@@ -97,14 +115,27 @@ function startAccountDetailRollingReconciliation(referenceIsoDate) {
     completedAt: plan.jobs.length ? null : now
   };
   persistAccountDetailRollingState_(state);
-  if (plan.jobs.length) replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.initialDelayMs);
+  if (plan.jobs.length) {
+    replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.initialDelayMs, { reason: 'initial_continuation' });
+    replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.watchdogDelayMs, {
+      preserveExisting: true,
+      reason: 'initial_watchdog'
+    });
+  }
   return state;
 }
 
 function processAccountDetailRollingReconciliation() {
+  Logger.log(JSON.stringify({
+    event: 'account_detail_rolling_worker_started',
+    startedAt: new Date().toISOString()
+  }));
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
-    replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.continuationDelayMs);
+    replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.continuationDelayMs, {
+      preserveExisting: true,
+      reason: 'lock_busy_retry'
+    });
     return { status: 'deferred_lock_busy' };
   }
   try {
@@ -119,7 +150,9 @@ function processAccountDetailRollingReconciliation() {
     state.attempts = Number(state.attempts || 0) + 1;
     state.updatedAt = new Date().toISOString();
     persistAccountDetailRollingState_(state);
-    replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.watchdogDelayMs);
+    replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.watchdogDelayMs, {
+      reason: 'active_worker_watchdog'
+    });
     const job = state.jobs[state.jobIndex];
     const result = executeAccountDetailSnapshot_({
       loadedConfiguration: loaded,
@@ -142,12 +175,18 @@ function processAccountDetailRollingReconciliation() {
       state.status = 'completed';
       state.completedAt = state.updatedAt;
       refreshAccountDetailConnectedSheets_();
-      deleteAccountDetailRollingTriggers_();
     } else {
       state.status = 'pending';
-      replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.continuationDelayMs);
     }
     persistAccountDetailRollingState_(state);
+    if (state.status === 'completed') {
+      deleteAccountDetailRollingTriggers_();
+    } else {
+      replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.continuationDelayMs, {
+        preserveExisting: true,
+        reason: 'next_stage_continuation'
+      });
+    }
     return state;
   } catch (error) {
     const state = readAccountDetailRollingState_();
@@ -158,7 +197,10 @@ function processAccountDetailRollingReconciliation() {
       state.updatedAt = new Date().toISOString();
       persistAccountDetailRollingState_(state);
       if (state.status === 'pending') {
-        replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.failureRetryDelayMs);
+        replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.failureRetryDelayMs, {
+          preserveExisting: true,
+          reason: 'failure_retry'
+        });
       } else {
         deleteAccountDetailRollingTriggers_();
       }
