@@ -36,18 +36,23 @@ function loadBalanceContext() {
   return context;
 }
 
-test('plans 12 closed Balance Sheet weeks without external calls', () => {
+test('plans 12 closed Balance Sheet weeks and due months without external calls', () => {
   const context = loadBalanceContext();
   let externalCalls = 0;
   context.runBalanceBigQueryQuery_ = () => { externalCalls++; };
   context.fetchBalanceSheet_ = () => { externalCalls++; };
   const plan = context.getBalanceRollingReconciliationPlan('2026-10-19');
-  assert.equal(plan.strategy, 'rolling_closed_weeks');
+  assert.equal(plan.strategy, 'rolling_closed_weeks_and_due_months');
   assert.equal(plan.weekCount, 12);
   assert.equal(plan.startWeek, '2026-07-27');
   assert.equal(plan.endWeek, '2026-10-12');
   assert.equal(plan.horizonDate, '2026-10-18');
   assert.equal(plan.periods.length, 12);
+  assert.equal(plan.monthlyPeriods.length, 3);
+  assert.deepEqual(JSON.parse(JSON.stringify(plan.monthlyPeriods.at(-1))), {
+    snapshotType: 'MONTHLY', snapshotWeek: '2026-09-01',
+    asOfDate: '2026-09-30', snapshotDate: '2026-10-10'
+  });
   assert.deepEqual(JSON.parse(JSON.stringify(plan.periods.at(-1))), {
     snapshotType: 'WEEKLY', snapshotWeek: '2026-10-12',
     asOfDate: '2026-10-18', snapshotDate: '2026-10-19'
@@ -194,10 +199,19 @@ test('final validation requires audit coverage and unchanged out-of-scope rows',
     audit: { rowCount: 20, rowFingerprint: '2' }
   };
   const state = {
-    plan, expectedClientIds: ['a', 'b'], completedCount: 12,
+    plan, expectedClientIds: ['a', 'b'], completedCount: 12, completedMonthCount: 3,
     createdAt: '2026-10-19T00:00:00.000Z', outsideScopeBaseline: baseline
   };
-  context.runBalanceBigQueryQuery_ = () => ({
+  let monthlySql = '';
+  let noncanonicalMonthlyAuditCount = '0';
+  context.runBalanceBigQueryQuery_ = query => query.includes('AS actual_month_count') ? ((monthlySql = query), {
+    schema: { fields: [
+      { name: 'actual_month_count' }, { name: 'duplicate_line_count' },
+      { name: 'noncanonical_line_count' }, { name: 'covered_client_month_count' },
+      { name: 'duplicate_audit_count' }, { name: 'noncanonical_audit_count' }
+    ] },
+    rows: [{ f: [{ v: '3' }, { v: '0' }, { v: '0' }, { v: '6' }, { v: '0' }, { v: noncanonicalMonthlyAuditCount }] }]
+  }) : ({
     schema: { fields: [
       { name: 'actual_line_week_count' }, { name: 'duplicate_line_count' },
       { name: 'covered_client_week_count' }, { name: 'duplicate_audit_count' },
@@ -207,6 +221,11 @@ test('final validation requires audit coverage and unchanged out-of-scope rows',
   });
   context.readBalanceRollingOutsideFingerprints_ = () => baseline;
   assert.equal(context.validateBalanceRollingReconciliation_(state).status, 'passed');
+  assert.match(monthlySql, /SnapshotDate IS DISTINCT FROM DATE_ADD/);
+  assert.match(monthlySql, /AsOfDate IS DISTINCT FROM LAST_DAY/);
+  noncanonicalMonthlyAuditCount = '1';
+  assert.throws(() => context.validateBalanceRollingReconciliation_(state), /final validation failed/);
+  noncanonicalMonthlyAuditCount = '0';
   context.readBalanceRollingOutsideFingerprints_ = () => ({ ...baseline, snapshots: { rowCount: 99, rowFingerprint: '9' } });
   assert.throws(() => context.validateBalanceRollingReconciliation_(state), /final validation failed/);
 });
@@ -224,6 +243,8 @@ test('failed final validation blocks Balance Sheet Connected Sheets refresh', ()
   context.persistBalanceRollingState_ = () => 0;
   context.replaceBalanceRollingSchedule_ = () => {};
   context.deleteBalanceRollingTriggers_ = () => {};
+  context.ensureBalanceRollingRecoveryTrigger_ = () => {};
+  context.deleteBalanceRollingRecoveryTriggers_ = () => {};
   context.validateBalanceRollingReconciliation_ = () => { throw new Error('validation failed'); };
   context.refreshBalanceConnectedSheetsStage_ = () => { refreshCount++; };
   assert.throws(() => context.processBalanceRollingReconciliation(), /validation failed/);
@@ -255,21 +276,32 @@ test('configuration deployment uses a canonical weekly range instead of today', 
 test('an active Balance Sheet rolling plan is resumed without changing its window', () => {
   const context = loadBalanceContext();
   const current = {
-    planVersion: '2026-balance-rolling-v1', status: 'pending',
-    plan: context.buildBalanceRollingReconciliationPlan_('2026-10-12'), weekIndex: 7
+    planVersion: '2026-balance-rolling-v2', status: 'pending',
+    plan: context.buildBalanceRollingReconciliationPlan_('2026-10-12'), jobIndex: 7
   };
   let scheduled = 0;
   context.validateBalanceRollingPreflight_ = () => ({});
   context.readBalanceRollingState_ = () => current;
   context.replaceBalanceRollingSchedule_ = () => { scheduled++; };
+  context.ensureBalanceRollingRecoveryTrigger_ = () => {};
   context.resolveBalanceEntitySelection_ = () => {
     throw new Error('a resumed plan must not select a new client set');
   };
   const result = context.startBalanceRollingReconciliation('2026-10-19');
   assert.equal(result, current);
-  assert.equal(result.weekIndex, 7);
+  assert.equal(result.jobIndex, 7);
   assert.equal(result.plan.endWeek, '2026-10-05');
   assert.equal(scheduled, 1);
+});
+
+test('an older active Balance Sheet plan cannot be overwritten', () => {
+  const context = loadBalanceContext();
+  context.validateBalanceRollingPreflight_ = () => ({});
+  context.readBalanceRollingState_ = () => ({
+    planVersion: '2026-balance-rolling-v1', status: 'running', weekIndex: 7
+  });
+  assert.throws(() => context.startBalanceRollingReconciliation('2026-10-19'),
+    /earlier Balance Sheet reconciliation is still active/);
 });
 
 test('full productive Balance Sheet rolling state stays below Script Properties limit', () => {
@@ -279,7 +311,7 @@ test('full productive Balance Sheet rolling state stays below Script Properties 
     String(index).padStart(8, '0') + '-aaaa-bbbb-cccc-' + String(index).padStart(12, '0'));
   const state = {
     operationId: 'x'.repeat(36), report: 'balance_sheet',
-    planVersion: '2026-balance-rolling-v1', status: 'pending', currentStage: 'bigquery',
+    planVersion: '2026-balance-rolling-v2', status: 'pending', currentStage: 'bigquery',
     weekIndex: 11, plan, expectedClientIds: ids, currentClientIds: ids,
     completedCount: 11, retriedClientCount: 20,
     configurationVersion: 'v'.repeat(100), configurationHash: 'h'.repeat(64),

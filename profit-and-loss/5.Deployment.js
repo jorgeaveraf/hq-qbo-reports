@@ -485,16 +485,21 @@ function loadOrDiscoverPnlConnectedSheetTargets_(spreadsheetOverride) {
   const spreadsheet = spreadsheetOverride || getPnlReportSpreadsheet_();
   const properties = PropertiesService.getScriptProperties();
   const serialized = properties.getProperty(PNL_OPERATIONAL_DEPLOYMENT.connectedSheetTargetsProperty);
+  const discovered = discoverPnlConnectedSheetTargets_(spreadsheet);
+  let previous = null;
   if (serialized) {
     try {
-      const parsed = JSON.parse(serialized);
-      if (parsed && parsed.spreadsheetId === spreadsheet.getId() && parsed.reports) return parsed;
+      previous = JSON.parse(serialized);
     } catch (error) {
       Logger.log(JSON.stringify({ event: 'pnl_connected_sheet_targets_invalid', error: error.message }));
     }
   }
-  const discovered = discoverPnlConnectedSheetTargets_(spreadsheet);
-  properties.setProperty(PNL_OPERATIONAL_DEPLOYMENT.connectedSheetTargetsProperty, JSON.stringify(discovered));
+  const sameTargets = previous && previous.spreadsheetId === discovered.spreadsheetId &&
+    JSON.stringify(previous.reports) === JSON.stringify(discovered.reports);
+  if (!sameTargets) {
+    properties.setProperty(PNL_OPERATIONAL_DEPLOYMENT.connectedSheetTargetsProperty, JSON.stringify(discovered));
+    Logger.log(JSON.stringify({ event: 'pnl_connected_sheet_targets_updated', reports: discovered.reports }));
+  }
   return discovered;
 }
 

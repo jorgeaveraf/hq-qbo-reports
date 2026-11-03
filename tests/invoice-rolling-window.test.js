@@ -303,25 +303,25 @@ test('does not refresh Connected Sheets when rolling validation fails', () => {
   context.executeInvoiceRollingBigQuerySnapshot_ = () => {
     throw new Error('invoice rolling validation failed');
   };
-  context.refreshInvoiceConnectedSheetsPipeline_ = () => { refreshCount++; };
+  context.queueInvoiceWeeklySheetRefresh_ = () => { refreshCount++; };
   assert.throws(() => context.snapshotInvoicesToBigQuery(), /rolling validation failed/);
   assert.equal(refreshCount, 0);
   assert.equal(released, true);
 });
 
-test('refreshes Connected Sheets once after successful rolling validation', () => {
+test('queues Connected Sheets after successful rolling validation', () => {
   const context = loadInvoicesContext();
   let refreshCount = 0;
   context.LockService = { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) };
   context.executeInvoiceRollingBigQuerySnapshot_ = () => ({ status: 'completed' });
   context.verifyInvoiceConsumptionViews_ = () => ({ status: 'passed' });
-  context.refreshInvoiceConnectedSheetsPipeline_ = () => {
+  context.queueInvoiceWeeklySheetRefresh_ = () => {
     refreshCount++;
-    return { status: 'passed' };
+    return { status: 'queued' };
   };
   const result = context.snapshotInvoicesToBigQuery();
   assert.equal(refreshCount, 1);
-  assert.equal(result.connectedSheets.status, 'passed');
+  assert.equal(result.connectedSheets.status, 'queued');
   assert.equal(result.consumptionViews.status, 'passed');
 });
 
@@ -333,7 +333,7 @@ test('does not refresh Connected Sheets when consumption-view validation fails',
   context.verifyInvoiceConsumptionViews_ = () => {
     throw new Error('Invoice consumption view validation failed');
   };
-  context.refreshInvoiceConnectedSheetsPipeline_ = () => { refreshCount++; };
+  context.queueInvoiceWeeklySheetRefresh_ = () => { refreshCount++; };
   assert.throws(() => context.snapshotInvoicesToBigQuery(), /consumption view validation failed/);
   assert.equal(refreshCount, 0);
 });

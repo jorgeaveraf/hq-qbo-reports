@@ -1,18 +1,19 @@
 /***********************
  * Rolling weekly reconciliation
  *
- * Re-captures the last 12 completed Balance Sheet weeks. Writes are limited
- * to successful clients and to the exact canonical Monday/Sunday/next-Monday
- * tuple. Monthly snapshots and legacy daily evidence are outside the scope.
+ * Re-captures the last 12 completed Balance Sheet weeks and each due monthly
+ * close intersecting that window. Writes stay scoped to successful clients and
+ * canonical weekly or month-end tuples.
  ***********************/
 
 const BALANCE_ROLLING_RECONCILIATION = {
-  planVersion: '2026-balance-rolling-v1',
+  planVersion: '2026-balance-rolling-v2',
   weekCount: 12,
   statePropertyKey: 'QBO_BALANCE_ROLLING_RECONCILIATION',
   workerHandler: 'processBalanceRollingReconciliation',
-  initialDelayMs: 5000,
-  continuationDelayMs: 5000,
+  recoveryHandler: 'recoverBalanceRollingReconciliation',
+  initialDelayMs: 60000,
+  continuationDelayMs: 60000,
   failureRetryDelayMs: 60000,
   watchdogDelayMs: 840000,
   maxStageAttempts: 3,
@@ -33,13 +34,34 @@ function buildBalanceRollingReconciliationPlan_(referenceIsoDate, weekCountOverr
       new Date(latestMonday.getTime() - offset * 7 * 86400000)
     )));
   }
+  const monthlyPeriods = [];
+  const reference = parseIsoDateUtc_(referenceIsoDate || todayIsoDate_());
+  const currentMonthStart = new Date(Date.UTC(reference.getUTCFullYear(), reference.getUTCMonth(), 1));
+  const lastClosedMonthStart = new Date(Date.UTC(currentMonthStart.getUTCFullYear(), currentMonthStart.getUTCMonth() - 1, 1));
+  const firstWeekDate = parseIsoDateUtc_(periods[0].snapshotWeek);
+  let monthStart = new Date(Date.UTC(firstWeekDate.getUTCFullYear(), firstWeekDate.getUTCMonth(), 1));
+  while (monthStart.getTime() <= lastClosedMonthStart.getTime()) {
+    const captureDate = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth() + 1, BALANCE_CADENCE.monthlyDay));
+    if (captureDate.getTime() <= reference.getTime()) {
+      const nextMonth = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth() + 1, 1));
+      monthlyPeriods.push({
+        snapshotType: BALANCE_SNAPSHOT_TYPE_MONTHLY,
+        snapshotWeek: formatUtcDate_(monthStart),
+        asOfDate: formatUtcDate_(new Date(nextMonth.getTime() - 86400000)),
+        snapshotDate: formatUtcDate_(captureDate)
+      });
+    }
+    monthStart = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth() + 1, 1));
+  }
   return {
-    strategy: 'rolling_closed_weeks',
+    strategy: 'rolling_closed_weeks_and_due_months',
     weekCount: weekCount,
     startWeek: periods[0].snapshotWeek,
     endWeek: periods[periods.length - 1].snapshotWeek,
     horizonDate: periods[periods.length - 1].asOfDate,
-    periods: periods
+    periods: periods,
+    monthlyPeriods: monthlyPeriods,
+    jobs: periods.concat(monthlyPeriods)
   };
 }
 
@@ -58,12 +80,14 @@ function readBalanceRollingScalarRow_(queryResult) {
 }
 
 function buildBalanceRollingCanonicalPredicate_(plan) {
-  return [
-    "COALESCE(SnapshotType, 'WEEKLY') = 'WEEKLY'",
-    "SnapshotWeek BETWEEN DATE '" + plan.startWeek + "' AND DATE '" + plan.endWeek + "'",
-    'SnapshotDate = DATE_ADD(SnapshotWeek, INTERVAL 7 DAY)',
-    'AsOfDate = DATE_ADD(SnapshotWeek, INTERVAL 6 DAY)'
-  ].join(' AND ');
+  const weekly = "(COALESCE(SnapshotType, 'WEEKLY') = 'WEEKLY' AND SnapshotWeek BETWEEN DATE '" +
+    plan.startWeek + "' AND DATE '" + plan.endWeek + "' AND SnapshotDate = DATE_ADD(SnapshotWeek, INTERVAL 7 DAY)" +
+    ' AND AsOfDate = DATE_ADD(SnapshotWeek, INTERVAL 6 DAY))';
+  const monthly = (plan.monthlyPeriods || []).map(period =>
+    "(SnapshotType = 'MONTHLY' AND SnapshotWeek = DATE '" + period.snapshotWeek +
+      "' AND SnapshotDate = DATE '" + period.snapshotDate + "' AND AsOfDate = DATE '" + period.asOfDate + "')"
+  ).join(' OR ');
+  return monthly ? '(' + weekly + ' OR ' + monthly + ')' : weekly;
 }
 
 function readBalanceRollingOutsideFingerprint_(tableName, datasetId, plan) {
@@ -104,8 +128,11 @@ function validateBalanceRollingReconciliation_(state) {
   const clientIds = Array.from(new Set((state.expectedClientIds || []).map(String))).sort();
   if (!clientIds.length) throw new Error('Balance Sheet rolling validation requires expected clients.');
   const clientScope = buildBalanceClientScopeSql_(clientIds);
-  const canonical = buildBalanceRollingCanonicalPredicate_(plan);
-  const result = runBalanceBigQueryQuery_([
+  const canonical = "(COALESCE(SnapshotType, 'WEEKLY') = 'WEEKLY' AND SnapshotWeek BETWEEN DATE '" +
+    plan.startWeek + "' AND DATE '" + plan.endWeek +
+    "' AND SnapshotDate = DATE_ADD(SnapshotWeek, INTERVAL 7 DAY)" +
+    ' AND AsOfDate = DATE_ADD(SnapshotWeek, INTERVAL 6 DAY))';
+  const weeklyResult = runBalanceBigQueryQuery_([
     'SELECT',
     '  (SELECT COUNT(DISTINCT SnapshotWeek) FROM `' + BALANCE_SNAPSHOT_TABLE + '`',
     '   WHERE ' + canonical + ' AND ClientId IN (' + clientScope + ')) AS actual_line_week_count,',
@@ -126,7 +153,30 @@ function validateBalanceRollingReconciliation_(state) {
     '     AND (SnapshotDate != DATE_ADD(SnapshotWeek, INTERVAL 7 DAY)',
     '       OR AsOfDate != DATE_ADD(SnapshotWeek, INTERVAL 6 DAY))) AS processed_noncanonical_count'
   ].join('\n'), BQ_CONFIG.snapshotsDatasetId);
-  const row = readBalanceRollingScalarRow_(result);
+  const row = readBalanceRollingScalarRow_(weeklyResult);
+  const monthlyWeeks = (plan.monthlyPeriods || []).map(period => "DATE '" + period.snapshotWeek + "'");
+  const monthlyCanonical = "(SnapshotWeek IS DISTINCT FROM DATE_TRUNC(SnapshotWeek, MONTH)" +
+    " OR SnapshotDate IS DISTINCT FROM DATE_ADD(DATE_TRUNC(DATE_ADD(SnapshotWeek, INTERVAL 1 MONTH), MONTH), INTERVAL " +
+      (BALANCE_CADENCE.monthlyDay - 1) + " DAY)" +
+    " OR AsOfDate IS DISTINCT FROM LAST_DAY(SnapshotWeek, MONTH))";
+  const monthlyResult = monthlyWeeks.length ? runBalanceBigQueryQuery_([
+    'SELECT',
+    '  COUNT(DISTINCT SnapshotWeek) AS actual_month_count,',
+    '  COUNT(*) - COUNT(DISTINCT ' + buildBalanceRollingLogicalKeySql_() + ') AS duplicate_line_count,',
+    '  COUNTIF(' + monthlyCanonical + ') AS noncanonical_line_count,',
+    '  (SELECT COUNT(DISTINCT CONCAT(CAST(SnapshotWeek AS STRING), "|", ClientId))',
+    '   FROM `' + BALANCE_AUDIT_TABLE + '` WHERE SnapshotType = \'MONTHLY\' AND SnapshotWeek IN (' + monthlyWeeks.join(',') + ')' +
+      ' AND ClientId IN (' + clientScope + ')) AS covered_client_month_count,',
+    '  (SELECT COUNT(*) - COUNT(DISTINCT CONCAT(CAST(SnapshotWeek AS STRING), "|", ClientId))',
+    '   FROM `' + BALANCE_AUDIT_TABLE + '` WHERE SnapshotType = \'MONTHLY\' AND SnapshotWeek IN (' + monthlyWeeks.join(',') + ')' +
+      ' AND ClientId IN (' + clientScope + ')) AS duplicate_audit_count,',
+    '  (SELECT COUNTIF(' + monthlyCanonical + ')',
+    '   FROM `' + BALANCE_AUDIT_TABLE + '` WHERE SnapshotType = \'MONTHLY\' AND SnapshotWeek IN (' + monthlyWeeks.join(',') + ')' +
+      ' AND ClientId IN (' + clientScope + ')) AS noncanonical_audit_count',
+    'FROM `' + BALANCE_SNAPSHOT_TABLE + '` WHERE SnapshotType = \'MONTHLY\' AND SnapshotWeek IN (' + monthlyWeeks.join(',') + ')' +
+      ' AND ClientId IN (' + clientScope + ')'
+  ].join('\n'), BQ_CONFIG.snapshotsDatasetId) : null;
+  const mrow = monthlyResult ? readBalanceRollingScalarRow_(monthlyResult) : {};
   const currentOutside = readBalanceRollingOutsideFingerprints_(plan);
   const details = {
     expectedWeekCount: plan.weekCount,
@@ -137,11 +187,24 @@ function validateBalanceRollingReconciliation_(state) {
     duplicateLineCount: Number(row.duplicate_line_count || 0),
     duplicateAuditCount: Number(row.duplicate_audit_count || 0),
     processedNoncanonicalCount: Number(row.processed_noncanonical_count || 0),
+    expectedMonthCount: monthlyWeeks.length,
+    completedMonthCount: Number(state.completedMonthCount || 0),
+    actualMonthCount: Number(mrow.actual_month_count || 0),
+    expectedClientMonthCount: monthlyWeeks.length * clientIds.length,
+    coveredClientMonthCount: Number(mrow.covered_client_month_count || 0),
+    duplicateMonthlyLineCount: Number(mrow.duplicate_line_count || 0),
+    duplicateMonthlyAuditCount: Number(mrow.duplicate_audit_count || 0),
+    noncanonicalMonthlyLineCount: Number(mrow.noncanonical_line_count || 0),
+    noncanonicalMonthlyAuditCount: Number(mrow.noncanonical_audit_count || 0),
     outsideScopeUnchanged: JSON.stringify(currentOutside) === JSON.stringify(state.outsideScopeBaseline)
   };
   if (details.completedWeekCount !== details.expectedWeekCount ||
       details.coveredClientWeekCount !== details.expectedClientWeekCount ||
+      details.completedMonthCount !== details.expectedMonthCount ||
+      details.coveredClientMonthCount !== details.expectedClientMonthCount ||
       details.duplicateLineCount || details.duplicateAuditCount ||
+      details.duplicateMonthlyLineCount || details.duplicateMonthlyAuditCount ||
+      details.noncanonicalMonthlyLineCount || details.noncanonicalMonthlyAuditCount ||
       details.processedNoncanonicalCount || !details.outsideScopeUnchanged) {
     throw new Error('Balance Sheet rolling final validation failed: ' + JSON.stringify(details));
   }
@@ -173,10 +236,52 @@ function deleteBalanceRollingTriggers_() {
     .forEach(trigger => ScriptApp.deleteTrigger(trigger));
 }
 
-function replaceBalanceRollingSchedule_(delayMs) {
-  deleteBalanceRollingTriggers_();
-  ScriptApp.newTrigger(BALANCE_ROLLING_RECONCILIATION.workerHandler).timeBased()
-    .after(Math.max(1000, Number(delayMs) || 1000)).create();
+function ensureBalanceRollingRecoveryTrigger_() {
+  const existing = ScriptApp.getProjectTriggers().find(trigger =>
+    trigger.getHandlerFunction() === BALANCE_ROLLING_RECONCILIATION.recoveryHandler
+  );
+  if (existing) return existing;
+  return ScriptApp.newTrigger(BALANCE_ROLLING_RECONCILIATION.recoveryHandler)
+    .timeBased().everyHours(1).create();
+}
+
+function deleteBalanceRollingRecoveryTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === BALANCE_ROLLING_RECONCILIATION.recoveryHandler)
+    .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+}
+
+function recoverBalanceRollingReconciliation() {
+  const state = readBalanceRollingState_();
+  if (!state || !['pending', 'running'].includes(state.status)) {
+    deleteBalanceRollingRecoveryTriggers_();
+    return { status: 'idle' };
+  }
+  const hasWorker = ScriptApp.getProjectTriggers().some(trigger =>
+    trigger.getHandlerFunction() === BALANCE_ROLLING_RECONCILIATION.workerHandler
+  );
+  const updatedAt = Date.parse(state.updatedAt || '');
+  const stale = !Number.isFinite(updatedAt) ||
+    Date.now() - updatedAt >= BALANCE_ROLLING_RECONCILIATION.watchdogDelayMs;
+  if (hasWorker && !stale) return { status: 'scheduled' };
+  Logger.log(JSON.stringify({ event: 'balance_rolling_recovery_started', hasWorker, stale }));
+  return processBalanceRollingReconciliation();
+}
+
+function replaceBalanceRollingSchedule_(delayMs, options) {
+  const settings = options || {};
+  const effectiveDelayMs = Math.max(60000, Number(delayMs) || 60000);
+  if (!settings.preserveExisting) deleteBalanceRollingTriggers_();
+  const trigger = ScriptApp.newTrigger(BALANCE_ROLLING_RECONCILIATION.workerHandler).timeBased()
+    .after(effectiveDelayMs).create();
+  Logger.log(JSON.stringify({
+    event: 'balance_rolling_trigger_created',
+    reason: settings.reason || 'unspecified',
+    delayMs: effectiveDelayMs,
+    preserveExisting: Boolean(settings.preserveExisting),
+    triggerId: trigger && trigger.getUniqueId ? trigger.getUniqueId() : null
+  }));
+  return trigger;
 }
 
 function validateBalanceRollingPreflight_() {
@@ -209,9 +314,17 @@ function validateBalanceRollingPreflight_() {
 function startBalanceRollingReconciliation(referenceIsoDate) {
   const loaded = validateBalanceRollingPreflight_();
   const current = readBalanceRollingState_();
+  if (current && ['pending', 'running'].includes(current.status) &&
+      current.planVersion !== BALANCE_ROLLING_RECONCILIATION.planVersion) {
+    throw new Error('An earlier Balance Sheet reconciliation is still active; finish it before starting the monthly plan.');
+  }
   if (current && current.planVersion === BALANCE_ROLLING_RECONCILIATION.planVersion &&
       ['pending', 'running'].includes(current.status)) {
-    replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.continuationDelayMs);
+    ensureBalanceRollingRecoveryTrigger_();
+    replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.continuationDelayMs, {
+      preserveExisting: true,
+      reason: 'resume_existing_operation'
+    });
     return current;
   }
   const selection = resolveBalanceEntitySelection_(null, loaded);
@@ -222,9 +335,9 @@ function startBalanceRollingReconciliation(referenceIsoDate) {
   const state = {
     operationId: Utilities.getUuid(), report: 'balance_sheet',
     planVersion: BALANCE_ROLLING_RECONCILIATION.planVersion,
-    status: 'pending', currentStage: 'bigquery', weekIndex: 0,
+    status: 'pending', currentStage: 'bigquery', jobIndex: 0,
     plan: plan, expectedClientIds: expectedClientIds, currentClientIds: null,
-    completedCount: 0, retriedClientCount: 0,
+    completedCount: 0, completedMonthCount: 0, retriedClientCount: 0,
     configurationVersion: loaded.configuration.configuration_version,
     configurationHash: loaded.configuration.configuration_hash,
     outsideScopeBaseline: readBalanceRollingOutsideFingerprints_(plan),
@@ -232,7 +345,12 @@ function startBalanceRollingReconciliation(referenceIsoDate) {
     createdAt: now, updatedAt: now, completedAt: null
   };
   persistBalanceRollingState_(state);
-  replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.initialDelayMs);
+  ensureBalanceRollingRecoveryTrigger_();
+  replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.initialDelayMs, { reason: 'initial_continuation' });
+  replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.watchdogDelayMs, {
+    preserveExisting: true,
+    reason: 'initial_watchdog'
+  });
   return state;
 }
 
@@ -262,7 +380,7 @@ function executeBalanceRollingWeek_(range, state) {
       JSON.stringify(result.clientFailures));
   }
   return {
-    status: 'completed', snapshotWeek: range.snapshotWeek,
+    status: 'completed', snapshotWeek: range.snapshotWeek, snapshotType: range.snapshotType,
     rowCount: result.lineRowCount, clientCount: result.clientCount,
     verification: result.verification && result.verification.status
   };
@@ -276,30 +394,44 @@ function compactBalanceRollingRefreshResult_(result) {
 }
 
 function processBalanceRollingReconciliation() {
+  Logger.log(JSON.stringify({
+    event: 'balance_rolling_worker_started',
+    startedAt: new Date().toISOString()
+  }));
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
-    replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.continuationDelayMs);
+    replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.continuationDelayMs, {
+      preserveExisting: true,
+      reason: 'lock_busy_retry'
+    });
     return { status: 'deferred_lock_busy' };
   }
   try {
     deleteBalanceRollingTriggers_();
     const state = readBalanceRollingState_();
     if (!state) return { status: 'not_started' };
-    if (state.status === 'completed') return state;
+    if (['completed', 'failed'].includes(state.status)) {
+      deleteBalanceRollingRecoveryTriggers_();
+      return state;
+    }
+    ensureBalanceRollingRecoveryTrigger_();
     state.status = 'running';
     state.stageAttempts = Number(state.stageAttempts || 0) + 1;
     state.updatedAt = new Date().toISOString();
     persistBalanceRollingState_(state);
-    replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.watchdogDelayMs);
+    replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.watchdogDelayMs, {
+      reason: 'active_worker_watchdog'
+    });
 
     if (state.currentStage === 'bigquery') {
-      const result = executeBalanceRollingWeek_(state.plan.periods[state.weekIndex], state);
+      const result = executeBalanceRollingWeek_(state.plan.jobs[state.jobIndex], state);
       state.lastResult = result;
-      state.weekIndex += 1;
-      state.completedCount += 1;
+      state.jobIndex += 1;
+      if (result.snapshotType === BALANCE_SNAPSHOT_TYPE_MONTHLY) state.completedMonthCount += 1;
+      else state.completedCount += 1;
       state.currentClientIds = null;
       state.stageAttempts = 0;
-      if (state.weekIndex >= state.plan.periods.length) state.currentStage = 'validation';
+      if (state.jobIndex >= state.plan.jobs.length) state.currentStage = 'validation';
     } else if (state.currentStage === 'validation') {
       state.finalValidation = validateBalanceRollingReconciliation_(state);
       state.currentStage = 'data_source_sheets';
@@ -326,8 +458,14 @@ function processBalanceRollingReconciliation() {
     state.lastError = null;
     state.updatedAt = new Date().toISOString();
     persistBalanceRollingState_(state);
-    if (state.status === 'completed') deleteBalanceRollingTriggers_();
-    else replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.continuationDelayMs);
+    if (state.status === 'completed') {
+      deleteBalanceRollingTriggers_();
+      deleteBalanceRollingRecoveryTriggers_();
+    }
+    else replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.continuationDelayMs, {
+      preserveExisting: true,
+      reason: 'next_stage_continuation'
+    });
     return state;
   } catch (error) {
     const state = readBalanceRollingState_();
@@ -338,9 +476,13 @@ function processBalanceRollingReconciliation() {
       state.updatedAt = new Date().toISOString();
       persistBalanceRollingState_(state);
       if (state.status === 'pending') {
-        replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.failureRetryDelayMs);
+        replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.failureRetryDelayMs, {
+          preserveExisting: true,
+          reason: 'failure_retry'
+        });
       } else {
         deleteBalanceRollingTriggers_();
+        deleteBalanceRollingRecoveryTriggers_();
       }
     }
     throw error;

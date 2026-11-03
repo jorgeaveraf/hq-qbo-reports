@@ -225,11 +225,53 @@ test('worker blocks both Connected Sheets refresh stages when final validation f
   context.persistJournalRollingState_ = () => 1;
   context.replaceJournalRollingSchedule_ = () => {};
   context.deleteJournalRollingTriggers_ = () => {};
+  context.ensureJournalRollingRecoveryTrigger_ = () => {};
+  context.deleteJournalRollingRecoveryTriggers_ = () => {};
   context.validateJournalRollingReconciliation_ = () => { throw new Error('validation failed'); };
   context.refreshJournalConnectedSheetsStage_ = () => { refreshCount++; };
   assert.throws(() => context.processJournalRollingReconciliation(), /validation failed/);
   assert.equal(refreshCount, 0);
   assert.equal(state.status, 'failed');
+});
+
+test('recovery resumes an active Journal window with no worker trigger', () => {
+  const context = loadJournalRollingContext();
+  const state = { status: 'pending', updatedAt: new Date().toISOString() };
+  let resumed = 0;
+  context.readJournalRollingState_ = () => state;
+  context.ScriptApp = { getProjectTriggers: () => [] };
+  context.processJournalRollingReconciliation = () => { resumed++; return { status: 'resumed' }; };
+  assert.equal(context.recoverJournalRollingReconciliation().status, 'resumed');
+  assert.equal(resumed, 1);
+
+  context.ScriptApp = { getProjectTriggers: () => [{
+    getHandlerFunction: () => 'processJournalRollingReconciliation'
+  }] };
+  assert.equal(context.recoverJournalRollingReconciliation().status, 'scheduled');
+  assert.equal(resumed, 1);
+});
+
+test('Journal recovery trigger exists only while a window is active', () => {
+  const context = loadJournalRollingContext();
+  const triggers = [];
+  context.ScriptApp = {
+    getProjectTriggers: () => triggers,
+    newTrigger: handler => ({ timeBased: () => ({ everyHours: hours => ({
+      create: () => {
+        assert.equal(hours, 1);
+        const trigger = { getHandlerFunction: () => handler };
+        triggers.push(trigger);
+        return trigger;
+      }
+    }) }) }),
+    deleteTrigger: trigger => triggers.splice(triggers.indexOf(trigger), 1)
+  };
+  context.ensureJournalRollingRecoveryTrigger_();
+  context.ensureJournalRollingRecoveryTrigger_();
+  assert.equal(triggers.length, 1);
+  context.readJournalRollingState_ = () => ({ status: 'completed' });
+  assert.equal(context.recoverJournalRollingReconciliation().status, 'idle');
+  assert.equal(triggers.length, 0);
 });
 
 test('productive worst-case rolling state remains below Script Properties limit', () => {

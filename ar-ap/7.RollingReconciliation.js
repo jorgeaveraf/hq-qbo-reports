@@ -12,8 +12,9 @@ const AGING_ROLLING_RECONCILIATION = {
   weekCount: 12,
   statePropertyKey: 'QBO_AGING_ROLLING_RECONCILIATION',
   workerHandler: 'processAgingRollingReconciliation',
-  initialDelayMs: 5000,
-  continuationDelayMs: 5000,
+  recoveryHandler: 'recoverAgingRollingReconciliation',
+  initialDelayMs: 60000,
+  continuationDelayMs: 60000,
   childPollDelayMs: 60000,
   failureRetryDelayMs: 60000,
   watchdogDelayMs: 14 * 60 * 1000,
@@ -201,10 +202,52 @@ function deleteAgingRollingTriggers_() {
     .forEach(trigger => ScriptApp.deleteTrigger(trigger));
 }
 
-function replaceAgingRollingSchedule_(delayMs) {
-  deleteAgingRollingTriggers_();
-  ScriptApp.newTrigger(AGING_ROLLING_RECONCILIATION.workerHandler).timeBased()
-    .after(Math.max(1000, Number(delayMs) || 1000)).create();
+function ensureAgingRollingRecoveryTrigger_() {
+  const existing = ScriptApp.getProjectTriggers().find(trigger =>
+    trigger.getHandlerFunction() === AGING_ROLLING_RECONCILIATION.recoveryHandler
+  );
+  if (existing) return existing;
+  return ScriptApp.newTrigger(AGING_ROLLING_RECONCILIATION.recoveryHandler)
+    .timeBased().everyHours(1).create();
+}
+
+function deleteAgingRollingRecoveryTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === AGING_ROLLING_RECONCILIATION.recoveryHandler)
+    .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+}
+
+function recoverAgingRollingReconciliation() {
+  const state = readAgingRollingState_();
+  if (!state || !['pending', 'running'].includes(state.status)) {
+    deleteAgingRollingRecoveryTriggers_();
+    return { status: 'idle' };
+  }
+  const hasWorker = ScriptApp.getProjectTriggers().some(trigger =>
+    trigger.getHandlerFunction() === AGING_ROLLING_RECONCILIATION.workerHandler
+  );
+  const updatedAt = Date.parse(state.updatedAt || '');
+  const stale = !Number.isFinite(updatedAt) ||
+    Date.now() - updatedAt >= AGING_ROLLING_RECONCILIATION.watchdogDelayMs;
+  if (hasWorker && !stale) return { status: 'scheduled' };
+  Logger.log(JSON.stringify({ event: 'aging_rolling_recovery_started', hasWorker, stale }));
+  return processAgingRollingReconciliation();
+}
+
+function replaceAgingRollingSchedule_(delayMs, options) {
+  const settings = options || {};
+  const effectiveDelayMs = Math.max(60000, Number(delayMs) || 60000);
+  if (!settings.preserveExisting) deleteAgingRollingTriggers_();
+  const trigger = ScriptApp.newTrigger(AGING_ROLLING_RECONCILIATION.workerHandler).timeBased()
+    .after(effectiveDelayMs).create();
+  Logger.log(JSON.stringify({
+    event: 'aging_rolling_trigger_created',
+    reason: settings.reason || 'unspecified',
+    delayMs: effectiveDelayMs,
+    preserveExisting: Boolean(settings.preserveExisting),
+    triggerId: trigger && trigger.getUniqueId ? trigger.getUniqueId() : null
+  }));
+  return trigger;
 }
 
 function validateAgingRollingPreflight_() {
@@ -228,7 +271,11 @@ function startAgingRollingReconciliation(referenceIsoDate) {
   const current = readAgingRollingState_();
   if (current && current.planVersion === AGING_ROLLING_RECONCILIATION.planVersion &&
       ['pending', 'running'].includes(current.status)) {
-    replaceAgingRollingSchedule_(AGING_ROLLING_RECONCILIATION.continuationDelayMs);
+    ensureAgingRollingRecoveryTrigger_();
+    replaceAgingRollingSchedule_(AGING_ROLLING_RECONCILIATION.continuationDelayMs, {
+      preserveExisting: true,
+      reason: 'resume_existing_operation'
+    });
     return current;
   }
   const now = new Date().toISOString();
@@ -245,7 +292,12 @@ function startAgingRollingReconciliation(referenceIsoDate) {
     createdAt: now, updatedAt: now, completedAt: null
   };
   persistAgingRollingState_(state);
-  replaceAgingRollingSchedule_(AGING_ROLLING_RECONCILIATION.initialDelayMs);
+  ensureAgingRollingRecoveryTrigger_();
+  replaceAgingRollingSchedule_(AGING_ROLLING_RECONCILIATION.initialDelayMs, { reason: 'initial_continuation' });
+  replaceAgingRollingSchedule_(AGING_ROLLING_RECONCILIATION.watchdogDelayMs, {
+    preserveExisting: true,
+    reason: 'initial_watchdog'
+  });
   return state;
 }
 
@@ -347,20 +399,33 @@ function advanceAgingRollingJob_(state) {
 }
 
 function processAgingRollingReconciliation() {
+  Logger.log(JSON.stringify({
+    event: 'aging_rolling_worker_started',
+    startedAt: new Date().toISOString()
+  }));
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
-    replaceAgingRollingSchedule_(AGING_ROLLING_RECONCILIATION.continuationDelayMs);
+    replaceAgingRollingSchedule_(AGING_ROLLING_RECONCILIATION.continuationDelayMs, {
+      preserveExisting: true,
+      reason: 'lock_busy_retry'
+    });
     return { status: 'deferred_lock_busy' };
   }
   try {
     deleteAgingRollingTriggers_();
     const state = readAgingRollingState_();
     if (!state) return { status: 'not_started' };
-    if (state.status === 'completed') return state;
+    if (['completed', 'failed'].includes(state.status)) {
+      deleteAgingRollingRecoveryTriggers_();
+      return state;
+    }
+    ensureAgingRollingRecoveryTrigger_();
     state.status = 'running';
     state.updatedAt = new Date().toISOString();
     persistAgingRollingState_(state);
-    replaceAgingRollingSchedule_(AGING_ROLLING_RECONCILIATION.watchdogDelayMs);
+    replaceAgingRollingSchedule_(AGING_ROLLING_RECONCILIATION.watchdogDelayMs, {
+      reason: 'active_worker_watchdog'
+    });
 
     let nextDelay = AGING_ROLLING_RECONCILIATION.continuationDelayMs;
     if (state.currentStage === 'bigquery') {
@@ -388,8 +453,14 @@ function processAgingRollingReconciliation() {
     state.lastError = null;
     state.updatedAt = new Date().toISOString();
     persistAgingRollingState_(state);
-    if (state.status === 'completed') deleteAgingRollingTriggers_();
-    else replaceAgingRollingSchedule_(nextDelay);
+    if (state.status === 'completed') {
+      deleteAgingRollingTriggers_();
+      deleteAgingRollingRecoveryTriggers_();
+    }
+    else replaceAgingRollingSchedule_(nextDelay, {
+      preserveExisting: true,
+      reason: 'next_stage_continuation'
+    });
     return state;
   } catch (error) {
     const state = readAgingRollingState_();
@@ -400,6 +471,7 @@ function processAgingRollingReconciliation() {
       persistAgingRollingState_(state);
     }
     deleteAgingRollingTriggers_();
+    deleteAgingRollingRecoveryTriggers_();
     throw error;
   } finally {
     lock.releaseLock();
