@@ -35,6 +35,29 @@ function loadPnlContext() {
   return context;
 }
 
+test('P&L refresh discovers monthly extracts even when cached targets omit them', () => {
+  const context = loadPnlContext();
+  const source = fs.readFileSync(path.resolve(__dirname, '..', 'profit-and-loss/5.Deployment.js'), 'utf8');
+  vm.runInContext(source, context, { filename: 'profit-and-loss/5.Deployment.js' });
+  const spreadsheet = { getId: () => 'report-sheet' };
+  const cached = { spreadsheetId: 'report-sheet', reports: {
+    profit_and_loss: { dataSourceSheets: ['weekly'], extracts: ['P&L_weekly_extract'] },
+    profit_and_loss_by_class: { dataSourceSheets: ['class-weekly'], extracts: ['P&L_byClass_weekly_extract'] }
+  } };
+  context.__propertyValues[vm.runInContext('PNL_OPERATIONAL_DEPLOYMENT.connectedSheetTargetsProperty', context)] = JSON.stringify(cached);
+  context.discoverPnlConnectedSheetTargets_ = () => ({
+    spreadsheetId: 'report-sheet', reports: {
+      profit_and_loss: { dataSourceSheets: ['weekly', 'monthly'], extracts: ['P&L_weekly_extract', 'P&L_monthly_extract'] },
+      profit_and_loss_by_class: { dataSourceSheets: ['class-weekly', 'class-monthly'], extracts: ['P&L_byClass_weekly_extract', 'P&L_byClass_monthly_extract'] }
+    }
+  });
+  const result = context.loadOrDiscoverPnlConnectedSheetTargets_(spreadsheet);
+  assert.equal(result.reports.profit_and_loss.extracts.includes('P&L_monthly_extract'), true);
+  assert.equal(JSON.parse(context.__propertyValues[
+    vm.runInContext('PNL_OPERATIONAL_DEPLOYMENT.connectedSheetTargetsProperty', context)
+  ]).reports.profit_and_loss_by_class.extracts.includes('P&L_byClass_monthly_extract'), true);
+});
+
 test('plans 12 closed P&L weeks and already-due intersecting months without external calls', () => {
   const context = loadPnlContext();
   let externalCalls = 0;
