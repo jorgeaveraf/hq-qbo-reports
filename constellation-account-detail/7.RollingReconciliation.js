@@ -66,6 +66,38 @@ function deleteAccountDetailRollingTriggers_() {
     .forEach(trigger => ScriptApp.deleteTrigger(trigger));
 }
 
+function ensureAccountDetailRollingRecoveryTrigger_() {
+  const existing = ScriptApp.getProjectTriggers().find(trigger =>
+    trigger.getHandlerFunction() === ACCOUNT_DETAIL_WORKER.recoveryHandler
+  );
+  if (existing) return existing;
+  return ScriptApp.newTrigger(ACCOUNT_DETAIL_WORKER.recoveryHandler)
+    .timeBased().everyHours(1).create();
+}
+
+function deleteAccountDetailRollingRecoveryTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === ACCOUNT_DETAIL_WORKER.recoveryHandler)
+    .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+}
+
+function recoverAccountDetailRollingReconciliation() {
+  const state = readAccountDetailRollingState_();
+  if (!state || !['pending', 'running'].includes(state.status)) {
+    deleteAccountDetailRollingRecoveryTriggers_();
+    return { status: 'idle' };
+  }
+  const hasWorker = ScriptApp.getProjectTriggers().some(trigger =>
+    trigger.getHandlerFunction() === ACCOUNT_DETAIL_WORKER.repairHandler
+  );
+  const updatedAt = Date.parse(state.updatedAt || '');
+  const stale = !Number.isFinite(updatedAt) ||
+    Date.now() - updatedAt >= ACCOUNT_DETAIL_WORKER.watchdogDelayMs;
+  if (hasWorker && !stale) return { status: 'scheduled' };
+  Logger.log(JSON.stringify({ event: 'account_detail_rolling_recovery_started', hasWorker, stale }));
+  return processAccountDetailRollingReconciliation();
+}
+
 function replaceAccountDetailRollingSchedule_(delayMs, options) {
   const settings = options || {};
   const effectiveDelayMs = Math.max(60000, Number(delayMs) || 60000);
@@ -92,6 +124,7 @@ function startAccountDetailRollingReconciliation(referenceIsoDate) {
   const current = readAccountDetailRollingState_();
   if (current && current.configurationHash === plan.configurationHash &&
       ['pending', 'running'].includes(current.status)) {
+    ensureAccountDetailRollingRecoveryTrigger_();
     replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.continuationDelayMs, {
       preserveExisting: true,
       reason: 'resume_existing_operation'
@@ -116,6 +149,7 @@ function startAccountDetailRollingReconciliation(referenceIsoDate) {
   };
   persistAccountDetailRollingState_(state);
   if (plan.jobs.length) {
+    ensureAccountDetailRollingRecoveryTrigger_();
     replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.initialDelayMs, { reason: 'initial_continuation' });
     replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.watchdogDelayMs, {
       preserveExisting: true,
@@ -141,7 +175,11 @@ function processAccountDetailRollingReconciliation() {
   try {
     deleteAccountDetailRollingTriggers_();
     const state = readAccountDetailRollingState_();
-    if (!state || state.status === 'completed') return state || { status: 'not_started' };
+    if (!state || ['completed', 'failed'].includes(state.status)) {
+      deleteAccountDetailRollingRecoveryTriggers_();
+      return state || { status: 'not_started' };
+    }
+    ensureAccountDetailRollingRecoveryTrigger_();
     const loaded = loadAccountDetailEntityConfiguration_();
     if (loaded.configuration.configuration_hash !== state.configurationHash) {
       throw new Error('Entity configuration changed during account detail rolling repair.');
@@ -181,6 +219,7 @@ function processAccountDetailRollingReconciliation() {
     persistAccountDetailRollingState_(state);
     if (state.status === 'completed') {
       deleteAccountDetailRollingTriggers_();
+      deleteAccountDetailRollingRecoveryTriggers_();
     } else {
       replaceAccountDetailRollingSchedule_(ACCOUNT_DETAIL_WORKER.continuationDelayMs, {
         preserveExisting: true,
@@ -203,6 +242,7 @@ function processAccountDetailRollingReconciliation() {
         });
       } else {
         deleteAccountDetailRollingTriggers_();
+        deleteAccountDetailRollingRecoveryTriggers_();
       }
     }
     throw error;

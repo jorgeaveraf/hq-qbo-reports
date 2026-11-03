@@ -2715,7 +2715,7 @@ function snapshotInvoicesToBigQuery() {
   try {
     const snapshotResult = executeInvoiceRollingBigQuerySnapshot_();
     const consumptionViews = verifyInvoiceConsumptionViews_();
-    const connectedSheets = refreshInvoiceConnectedSheetsPipeline_();
+    const connectedSheets = queueInvoiceWeeklySheetRefresh_(snapshotResult, consumptionViews);
     return {
       ...snapshotResult,
       consumptionViews: consumptionViews,

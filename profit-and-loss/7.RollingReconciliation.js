@@ -13,6 +13,7 @@ const PNL_ROLLING_RECONCILIATION = {
   weekCount: 12,
   statePropertyKey: 'QBO_PNL_ROLLING_RECONCILIATION',
   workerHandler: 'processPnlRollingReconciliation',
+  recoveryHandler: 'recoverPnlRollingReconciliation',
   initialDelayMs: 60000,
   continuationDelayMs: 60000,
   failureRetryDelayMs: 60000,
@@ -232,6 +233,38 @@ function deletePnlRollingTriggers_() {
     .forEach(trigger => ScriptApp.deleteTrigger(trigger));
 }
 
+function ensurePnlRollingRecoveryTrigger_() {
+  const existing = ScriptApp.getProjectTriggers().find(trigger =>
+    trigger.getHandlerFunction() === PNL_ROLLING_RECONCILIATION.recoveryHandler
+  );
+  if (existing) return existing;
+  return ScriptApp.newTrigger(PNL_ROLLING_RECONCILIATION.recoveryHandler)
+    .timeBased().everyHours(1).create();
+}
+
+function deletePnlRollingRecoveryTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === PNL_ROLLING_RECONCILIATION.recoveryHandler)
+    .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+}
+
+function recoverPnlRollingReconciliation() {
+  const state = readPnlRollingState_();
+  if (!state || !['pending', 'running'].includes(state.status)) {
+    deletePnlRollingRecoveryTriggers_();
+    return { status: 'idle' };
+  }
+  const hasWorker = ScriptApp.getProjectTriggers().some(trigger =>
+    trigger.getHandlerFunction() === PNL_ROLLING_RECONCILIATION.workerHandler
+  );
+  const updatedAt = Date.parse(state.updatedAt || '');
+  const stale = !Number.isFinite(updatedAt) ||
+    Date.now() - updatedAt >= PNL_ROLLING_RECONCILIATION.watchdogDelayMs;
+  if (hasWorker && !stale) return { status: 'scheduled' };
+  Logger.log(JSON.stringify({ event: 'pnl_rolling_recovery_started', hasWorker, stale }));
+  return processPnlRollingReconciliation();
+}
+
 function replacePnlRollingSchedule_(delayMs, options) {
   const settings = options || {};
   const effectiveDelayMs = Math.max(60000, Number(delayMs) || 60000);
@@ -275,6 +308,7 @@ function startPnlRollingReconciliation(referenceIsoDate) {
   }
   if (current && current.planVersion === PNL_ROLLING_RECONCILIATION.planVersion &&
       ['pending', 'running'].includes(current.status)) {
+    ensurePnlRollingRecoveryTrigger_();
     replacePnlRollingSchedule_(PNL_ROLLING_RECONCILIATION.continuationDelayMs, {
       preserveExisting: true,
       reason: 'resume_existing_operation'
@@ -304,6 +338,7 @@ function startPnlRollingReconciliation(referenceIsoDate) {
     createdAt: now, updatedAt: now, completedAt: null
   };
   persistPnlRollingState_(state);
+  ensurePnlRollingRecoveryTrigger_();
   replacePnlRollingSchedule_(PNL_ROLLING_RECONCILIATION.initialDelayMs, { reason: 'initial_continuation' });
   replacePnlRollingSchedule_(PNL_ROLLING_RECONCILIATION.watchdogDelayMs, {
     preserveExisting: true,
@@ -357,7 +392,11 @@ function processPnlRollingReconciliation() {
     deletePnlRollingTriggers_();
     const state = readPnlRollingState_();
     if (!state) return { status: 'not_started' };
-    if (state.status === 'completed') return state;
+    if (['completed', 'failed'].includes(state.status)) {
+      deletePnlRollingRecoveryTriggers_();
+      return state;
+    }
+    ensurePnlRollingRecoveryTrigger_();
     state.status = 'running';
     state.stageAttempts = Number(state.stageAttempts || 0) + 1;
     state.updatedAt = new Date().toISOString();
@@ -399,7 +438,10 @@ function processPnlRollingReconciliation() {
     state.lastError = null;
     state.updatedAt = new Date().toISOString();
     persistPnlRollingState_(state);
-    if (state.status === 'completed') deletePnlRollingTriggers_();
+    if (state.status === 'completed') {
+      deletePnlRollingTriggers_();
+      deletePnlRollingRecoveryTriggers_();
+    }
     else replacePnlRollingSchedule_(PNL_ROLLING_RECONCILIATION.continuationDelayMs, {
       preserveExisting: true,
       reason: 'next_stage_continuation'
@@ -420,6 +462,7 @@ function processPnlRollingReconciliation() {
         });
       } else {
         deletePnlRollingTriggers_();
+        deletePnlRollingRecoveryTriggers_();
       }
     }
     throw error;

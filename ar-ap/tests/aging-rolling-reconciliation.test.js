@@ -274,6 +274,8 @@ test('a final-validation failure blocks every Connected Sheets refresh', () => {
   install(context, 'readAgingRollingState_', () => state);
   install(context, 'persistAgingRollingState_', () => 100);
   install(context, 'deleteAgingRollingTriggers_', () => {});
+  install(context, 'ensureAgingRollingRecoveryTrigger_', () => {});
+  install(context, 'deleteAgingRollingRecoveryTriggers_', () => {});
   install(context, 'replaceAgingRollingSchedule_', () => {});
   install(context, 'validateAgingRollingReconciliation_', () => {
     throw new Error('validation failed');

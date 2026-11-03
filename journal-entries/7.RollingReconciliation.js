@@ -11,6 +11,7 @@ const JOURNAL_ROLLING_RECONCILIATION = {
   weekCount: 12,
   statePropertyKey: 'QBO_JOURNAL_ROLLING_RECONCILIATION',
   workerHandler: 'processJournalRollingReconciliation',
+  recoveryHandler: 'recoverJournalRollingReconciliation',
   initialDelayMs: 60000,
   continuationDelayMs: 60000,
   failureRetryDelayMs: 60000,
@@ -177,6 +178,38 @@ function deleteJournalRollingTriggers_() {
     .forEach(trigger => ScriptApp.deleteTrigger(trigger));
 }
 
+function ensureJournalRollingRecoveryTrigger_() {
+  const existing = ScriptApp.getProjectTriggers().find(trigger =>
+    trigger.getHandlerFunction() === JOURNAL_ROLLING_RECONCILIATION.recoveryHandler
+  );
+  if (existing) return existing;
+  return ScriptApp.newTrigger(JOURNAL_ROLLING_RECONCILIATION.recoveryHandler)
+    .timeBased().everyHours(1).create();
+}
+
+function deleteJournalRollingRecoveryTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === JOURNAL_ROLLING_RECONCILIATION.recoveryHandler)
+    .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+}
+
+function recoverJournalRollingReconciliation() {
+  const state = readJournalRollingState_();
+  if (!state || !['pending', 'running'].includes(state.status)) {
+    deleteJournalRollingRecoveryTriggers_();
+    return { status: 'idle' };
+  }
+  const hasWorker = ScriptApp.getProjectTriggers().some(trigger =>
+    trigger.getHandlerFunction() === JOURNAL_ROLLING_RECONCILIATION.workerHandler
+  );
+  const updatedAt = Date.parse(state.updatedAt || '');
+  const stale = !Number.isFinite(updatedAt) ||
+    Date.now() - updatedAt >= JOURNAL_ROLLING_RECONCILIATION.watchdogDelayMs;
+  if (hasWorker && !stale) return { status: 'scheduled' };
+  Logger.log(JSON.stringify({ event: 'journal_rolling_recovery_started', hasWorker, stale }));
+  return processJournalRollingReconciliation();
+}
+
 function replaceJournalRollingSchedule_(delayMs, options) {
   const settings = options || {};
   const effectiveDelayMs = Math.max(60000, Number(delayMs) || 60000);
@@ -229,6 +262,7 @@ function startJournalRollingReconciliation(referenceIsoDate) {
     current.planVersion === JOURNAL_ROLLING_RECONCILIATION.planVersion &&
     ['pending', 'running'].includes(current.status)
   ) {
+    ensureJournalRollingRecoveryTrigger_();
     replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.continuationDelayMs, {
       preserveExisting: true,
       reason: 'resume_existing_operation'
@@ -262,6 +296,7 @@ function startJournalRollingReconciliation(referenceIsoDate) {
   };
   deleteJournalBigQueryCheckpoint_();
   persistJournalRollingState_(state);
+  ensureJournalRollingRecoveryTrigger_();
   replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.initialDelayMs, { reason: 'initial_continuation' });
   replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.watchdogDelayMs, {
     preserveExisting: true,
@@ -343,7 +378,11 @@ function processJournalRollingReconciliation() {
     deleteJournalRollingTriggers_();
     const state = readJournalRollingState_();
     if (!state) return { status: 'not_started' };
-    if (state.status === 'completed') return state;
+    if (['completed', 'failed'].includes(state.status)) {
+      deleteJournalRollingRecoveryTriggers_();
+      return state;
+    }
+    ensureJournalRollingRecoveryTrigger_();
     state.status = 'running';
     state.updatedAt = new Date().toISOString();
     persistJournalRollingState_(state);
@@ -386,7 +425,10 @@ function processJournalRollingReconciliation() {
     state.lastError = null;
     state.updatedAt = new Date().toISOString();
     persistJournalRollingState_(state);
-    if (state.status === 'completed') deleteJournalRollingTriggers_();
+    if (state.status === 'completed') {
+      deleteJournalRollingTriggers_();
+      deleteJournalRollingRecoveryTriggers_();
+    }
     else replaceJournalRollingSchedule_(JOURNAL_ROLLING_RECONCILIATION.continuationDelayMs, {
       preserveExisting: true,
       reason: 'next_stage_continuation'
@@ -410,6 +452,7 @@ function processJournalRollingReconciliation() {
         });
       } else {
         deleteJournalRollingTriggers_();
+        deleteJournalRollingRecoveryTriggers_();
       }
     }
     throw error;

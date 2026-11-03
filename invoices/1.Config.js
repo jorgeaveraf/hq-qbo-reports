@@ -126,12 +126,14 @@ const INVOICE_OPERATIONAL_DEPLOYMENT = {
   statePropertyKey: 'QBO_INVOICE_CONFIGURATION_DEPLOYMENT_STATE',
   reportSpreadsheetIdProperty: 'QBO_REPORT_SPREADSHEET_ID',
   workerHandler: 'processInvoiceConfigurationDeployment',
+  recoveryHandler: 'recoverInvoiceConfigurationDeployment',
   initialDelayMs: 5000,
   nextStageDelayMs: 5000,
   busyRetryDelayMs: 60000,
   failureRetryDelayMs: 60000,
   maxStageAttempts: 3,
   staleProcessingSeconds: 900,
+  recoveryDelayMs: 60 * 60 * 1000,
   maxStateBytes: 9000
 };
 

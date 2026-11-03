@@ -77,6 +77,7 @@ const ACCOUNT_DETAIL_WORKER = {
   backfillHandler: 'processAccountDetailBackfill',
   repairStateProperty: 'QBO_ACCOUNT_DETAIL_ROLLING_RECONCILIATION',
   repairHandler: 'processAccountDetailRollingReconciliation',
+  recoveryHandler: 'recoverAccountDetailRollingReconciliation',
   initialDelayMs: 60000,
   continuationDelayMs: 60000,
   failureRetryDelayMs: 60000,

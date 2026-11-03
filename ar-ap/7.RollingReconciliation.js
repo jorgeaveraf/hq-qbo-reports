@@ -12,6 +12,7 @@ const AGING_ROLLING_RECONCILIATION = {
   weekCount: 12,
   statePropertyKey: 'QBO_AGING_ROLLING_RECONCILIATION',
   workerHandler: 'processAgingRollingReconciliation',
+  recoveryHandler: 'recoverAgingRollingReconciliation',
   initialDelayMs: 60000,
   continuationDelayMs: 60000,
   childPollDelayMs: 60000,
@@ -201,6 +202,38 @@ function deleteAgingRollingTriggers_() {
     .forEach(trigger => ScriptApp.deleteTrigger(trigger));
 }
 
+function ensureAgingRollingRecoveryTrigger_() {
+  const existing = ScriptApp.getProjectTriggers().find(trigger =>
+    trigger.getHandlerFunction() === AGING_ROLLING_RECONCILIATION.recoveryHandler
+  );
+  if (existing) return existing;
+  return ScriptApp.newTrigger(AGING_ROLLING_RECONCILIATION.recoveryHandler)
+    .timeBased().everyHours(1).create();
+}
+
+function deleteAgingRollingRecoveryTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === AGING_ROLLING_RECONCILIATION.recoveryHandler)
+    .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+}
+
+function recoverAgingRollingReconciliation() {
+  const state = readAgingRollingState_();
+  if (!state || !['pending', 'running'].includes(state.status)) {
+    deleteAgingRollingRecoveryTriggers_();
+    return { status: 'idle' };
+  }
+  const hasWorker = ScriptApp.getProjectTriggers().some(trigger =>
+    trigger.getHandlerFunction() === AGING_ROLLING_RECONCILIATION.workerHandler
+  );
+  const updatedAt = Date.parse(state.updatedAt || '');
+  const stale = !Number.isFinite(updatedAt) ||
+    Date.now() - updatedAt >= AGING_ROLLING_RECONCILIATION.watchdogDelayMs;
+  if (hasWorker && !stale) return { status: 'scheduled' };
+  Logger.log(JSON.stringify({ event: 'aging_rolling_recovery_started', hasWorker, stale }));
+  return processAgingRollingReconciliation();
+}
+
 function replaceAgingRollingSchedule_(delayMs, options) {
   const settings = options || {};
   const effectiveDelayMs = Math.max(60000, Number(delayMs) || 60000);
@@ -238,6 +271,7 @@ function startAgingRollingReconciliation(referenceIsoDate) {
   const current = readAgingRollingState_();
   if (current && current.planVersion === AGING_ROLLING_RECONCILIATION.planVersion &&
       ['pending', 'running'].includes(current.status)) {
+    ensureAgingRollingRecoveryTrigger_();
     replaceAgingRollingSchedule_(AGING_ROLLING_RECONCILIATION.continuationDelayMs, {
       preserveExisting: true,
       reason: 'resume_existing_operation'
@@ -258,6 +292,7 @@ function startAgingRollingReconciliation(referenceIsoDate) {
     createdAt: now, updatedAt: now, completedAt: null
   };
   persistAgingRollingState_(state);
+  ensureAgingRollingRecoveryTrigger_();
   replaceAgingRollingSchedule_(AGING_ROLLING_RECONCILIATION.initialDelayMs, { reason: 'initial_continuation' });
   replaceAgingRollingSchedule_(AGING_ROLLING_RECONCILIATION.watchdogDelayMs, {
     preserveExisting: true,
@@ -380,7 +415,11 @@ function processAgingRollingReconciliation() {
     deleteAgingRollingTriggers_();
     const state = readAgingRollingState_();
     if (!state) return { status: 'not_started' };
-    if (state.status === 'completed') return state;
+    if (['completed', 'failed'].includes(state.status)) {
+      deleteAgingRollingRecoveryTriggers_();
+      return state;
+    }
+    ensureAgingRollingRecoveryTrigger_();
     state.status = 'running';
     state.updatedAt = new Date().toISOString();
     persistAgingRollingState_(state);
@@ -414,7 +453,10 @@ function processAgingRollingReconciliation() {
     state.lastError = null;
     state.updatedAt = new Date().toISOString();
     persistAgingRollingState_(state);
-    if (state.status === 'completed') deleteAgingRollingTriggers_();
+    if (state.status === 'completed') {
+      deleteAgingRollingTriggers_();
+      deleteAgingRollingRecoveryTriggers_();
+    }
     else replaceAgingRollingSchedule_(nextDelay, {
       preserveExisting: true,
       reason: 'next_stage_continuation'
@@ -429,6 +471,7 @@ function processAgingRollingReconciliation() {
       persistAgingRollingState_(state);
     }
     deleteAgingRollingTriggers_();
+    deleteAgingRollingRecoveryTriggers_();
     throw error;
   } finally {
     lock.releaseLock();

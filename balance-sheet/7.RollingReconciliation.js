@@ -11,6 +11,7 @@ const BALANCE_ROLLING_RECONCILIATION = {
   weekCount: 12,
   statePropertyKey: 'QBO_BALANCE_ROLLING_RECONCILIATION',
   workerHandler: 'processBalanceRollingReconciliation',
+  recoveryHandler: 'recoverBalanceRollingReconciliation',
   initialDelayMs: 60000,
   continuationDelayMs: 60000,
   failureRetryDelayMs: 60000,
@@ -224,6 +225,38 @@ function deleteBalanceRollingTriggers_() {
     .forEach(trigger => ScriptApp.deleteTrigger(trigger));
 }
 
+function ensureBalanceRollingRecoveryTrigger_() {
+  const existing = ScriptApp.getProjectTriggers().find(trigger =>
+    trigger.getHandlerFunction() === BALANCE_ROLLING_RECONCILIATION.recoveryHandler
+  );
+  if (existing) return existing;
+  return ScriptApp.newTrigger(BALANCE_ROLLING_RECONCILIATION.recoveryHandler)
+    .timeBased().everyHours(1).create();
+}
+
+function deleteBalanceRollingRecoveryTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === BALANCE_ROLLING_RECONCILIATION.recoveryHandler)
+    .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+}
+
+function recoverBalanceRollingReconciliation() {
+  const state = readBalanceRollingState_();
+  if (!state || !['pending', 'running'].includes(state.status)) {
+    deleteBalanceRollingRecoveryTriggers_();
+    return { status: 'idle' };
+  }
+  const hasWorker = ScriptApp.getProjectTriggers().some(trigger =>
+    trigger.getHandlerFunction() === BALANCE_ROLLING_RECONCILIATION.workerHandler
+  );
+  const updatedAt = Date.parse(state.updatedAt || '');
+  const stale = !Number.isFinite(updatedAt) ||
+    Date.now() - updatedAt >= BALANCE_ROLLING_RECONCILIATION.watchdogDelayMs;
+  if (hasWorker && !stale) return { status: 'scheduled' };
+  Logger.log(JSON.stringify({ event: 'balance_rolling_recovery_started', hasWorker, stale }));
+  return processBalanceRollingReconciliation();
+}
+
 function replaceBalanceRollingSchedule_(delayMs, options) {
   const settings = options || {};
   const effectiveDelayMs = Math.max(60000, Number(delayMs) || 60000);
@@ -276,6 +309,7 @@ function startBalanceRollingReconciliation(referenceIsoDate) {
   }
   if (current && current.planVersion === BALANCE_ROLLING_RECONCILIATION.planVersion &&
       ['pending', 'running'].includes(current.status)) {
+    ensureBalanceRollingRecoveryTrigger_();
     replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.continuationDelayMs, {
       preserveExisting: true,
       reason: 'resume_existing_operation'
@@ -300,6 +334,7 @@ function startBalanceRollingReconciliation(referenceIsoDate) {
     createdAt: now, updatedAt: now, completedAt: null
   };
   persistBalanceRollingState_(state);
+  ensureBalanceRollingRecoveryTrigger_();
   replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.initialDelayMs, { reason: 'initial_continuation' });
   replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.watchdogDelayMs, {
     preserveExisting: true,
@@ -364,7 +399,11 @@ function processBalanceRollingReconciliation() {
     deleteBalanceRollingTriggers_();
     const state = readBalanceRollingState_();
     if (!state) return { status: 'not_started' };
-    if (state.status === 'completed') return state;
+    if (['completed', 'failed'].includes(state.status)) {
+      deleteBalanceRollingRecoveryTriggers_();
+      return state;
+    }
+    ensureBalanceRollingRecoveryTrigger_();
     state.status = 'running';
     state.stageAttempts = Number(state.stageAttempts || 0) + 1;
     state.updatedAt = new Date().toISOString();
@@ -408,7 +447,10 @@ function processBalanceRollingReconciliation() {
     state.lastError = null;
     state.updatedAt = new Date().toISOString();
     persistBalanceRollingState_(state);
-    if (state.status === 'completed') deleteBalanceRollingTriggers_();
+    if (state.status === 'completed') {
+      deleteBalanceRollingTriggers_();
+      deleteBalanceRollingRecoveryTriggers_();
+    }
     else replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.continuationDelayMs, {
       preserveExisting: true,
       reason: 'next_stage_continuation'
@@ -429,6 +471,7 @@ function processBalanceRollingReconciliation() {
         });
       } else {
         deleteBalanceRollingTriggers_();
+        deleteBalanceRollingRecoveryTriggers_();
       }
     }
     throw error;

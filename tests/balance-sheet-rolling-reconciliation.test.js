@@ -235,6 +235,8 @@ test('failed final validation blocks Balance Sheet Connected Sheets refresh', ()
   context.persistBalanceRollingState_ = () => 0;
   context.replaceBalanceRollingSchedule_ = () => {};
   context.deleteBalanceRollingTriggers_ = () => {};
+  context.ensureBalanceRollingRecoveryTrigger_ = () => {};
+  context.deleteBalanceRollingRecoveryTriggers_ = () => {};
   context.validateBalanceRollingReconciliation_ = () => { throw new Error('validation failed'); };
   context.refreshBalanceConnectedSheetsStage_ = () => { refreshCount++; };
   assert.throws(() => context.processBalanceRollingReconciliation(), /validation failed/);
@@ -273,6 +275,7 @@ test('an active Balance Sheet rolling plan is resumed without changing its windo
   context.validateBalanceRollingPreflight_ = () => ({});
   context.readBalanceRollingState_ = () => current;
   context.replaceBalanceRollingSchedule_ = () => { scheduled++; };
+  context.ensureBalanceRollingRecoveryTrigger_ = () => {};
   context.resolveBalanceEntitySelection_ = () => {
     throw new Error('a resumed plan must not select a new client set');
   };

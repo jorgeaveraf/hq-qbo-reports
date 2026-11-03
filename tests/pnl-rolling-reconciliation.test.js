@@ -278,6 +278,7 @@ test('a still-running plan is resumed instead of being overwritten by a newer Mo
   context.validatePnlRollingPreflight_ = () => ({});
   context.readPnlRollingState_ = () => current;
   context.replacePnlRollingSchedule_ = () => { scheduled++; };
+  context.ensurePnlRollingRecoveryTrigger_ = () => {};
   context.readPnlRollingOutsideFingerprint_ = () => {
     throw new Error('a resumed plan must not capture a new baseline');
   };
@@ -301,6 +302,8 @@ test('rolling worker blocks Connected Sheets refresh when final validation fails
   context.persistPnlRollingState_ = () => 0;
   context.replacePnlRollingSchedule_ = () => {};
   context.deletePnlRollingTriggers_ = () => {};
+  context.ensurePnlRollingRecoveryTrigger_ = () => {};
+  context.deletePnlRollingRecoveryTriggers_ = () => {};
   context.validatePnlRollingReconciliation_ = () => { throw new Error('validation failed'); };
   context.refreshPnlConnectedSheetsStage_ = () => { refreshCount++; };
   assert.throws(() => context.processPnlRollingReconciliation(), /validation failed/);
