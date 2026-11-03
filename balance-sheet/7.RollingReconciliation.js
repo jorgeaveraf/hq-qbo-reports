@@ -155,16 +155,24 @@ function validateBalanceRollingReconciliation_(state) {
   ].join('\n'), BQ_CONFIG.snapshotsDatasetId);
   const row = readBalanceRollingScalarRow_(weeklyResult);
   const monthlyWeeks = (plan.monthlyPeriods || []).map(period => "DATE '" + period.snapshotWeek + "'");
+  const monthlyCanonical = "(SnapshotWeek IS DISTINCT FROM DATE_TRUNC(SnapshotWeek, MONTH)" +
+    " OR SnapshotDate IS DISTINCT FROM DATE_ADD(DATE_TRUNC(DATE_ADD(SnapshotWeek, INTERVAL 1 MONTH), MONTH), INTERVAL " +
+      (BALANCE_CADENCE.monthlyDay - 1) + " DAY)" +
+    " OR AsOfDate IS DISTINCT FROM LAST_DAY(SnapshotWeek, MONTH))";
   const monthlyResult = monthlyWeeks.length ? runBalanceBigQueryQuery_([
     'SELECT',
     '  COUNT(DISTINCT SnapshotWeek) AS actual_month_count,',
     '  COUNT(*) - COUNT(DISTINCT ' + buildBalanceRollingLogicalKeySql_() + ') AS duplicate_line_count,',
+    '  COUNTIF(' + monthlyCanonical + ') AS noncanonical_line_count,',
     '  (SELECT COUNT(DISTINCT CONCAT(CAST(SnapshotWeek AS STRING), "|", ClientId))',
     '   FROM `' + BALANCE_AUDIT_TABLE + '` WHERE SnapshotType = \'MONTHLY\' AND SnapshotWeek IN (' + monthlyWeeks.join(',') + ')' +
       ' AND ClientId IN (' + clientScope + ')) AS covered_client_month_count,',
     '  (SELECT COUNT(*) - COUNT(DISTINCT CONCAT(CAST(SnapshotWeek AS STRING), "|", ClientId))',
     '   FROM `' + BALANCE_AUDIT_TABLE + '` WHERE SnapshotType = \'MONTHLY\' AND SnapshotWeek IN (' + monthlyWeeks.join(',') + ')' +
-      ' AND ClientId IN (' + clientScope + ')) AS duplicate_audit_count',
+      ' AND ClientId IN (' + clientScope + ')) AS duplicate_audit_count,',
+    '  (SELECT COUNTIF(' + monthlyCanonical + ')',
+    '   FROM `' + BALANCE_AUDIT_TABLE + '` WHERE SnapshotType = \'MONTHLY\' AND SnapshotWeek IN (' + monthlyWeeks.join(',') + ')' +
+      ' AND ClientId IN (' + clientScope + ')) AS noncanonical_audit_count',
     'FROM `' + BALANCE_SNAPSHOT_TABLE + '` WHERE SnapshotType = \'MONTHLY\' AND SnapshotWeek IN (' + monthlyWeeks.join(',') + ')' +
       ' AND ClientId IN (' + clientScope + ')'
   ].join('\n'), BQ_CONFIG.snapshotsDatasetId) : null;
@@ -186,6 +194,8 @@ function validateBalanceRollingReconciliation_(state) {
     coveredClientMonthCount: Number(mrow.covered_client_month_count || 0),
     duplicateMonthlyLineCount: Number(mrow.duplicate_line_count || 0),
     duplicateMonthlyAuditCount: Number(mrow.duplicate_audit_count || 0),
+    noncanonicalMonthlyLineCount: Number(mrow.noncanonical_line_count || 0),
+    noncanonicalMonthlyAuditCount: Number(mrow.noncanonical_audit_count || 0),
     outsideScopeUnchanged: JSON.stringify(currentOutside) === JSON.stringify(state.outsideScopeBaseline)
   };
   if (details.completedWeekCount !== details.expectedWeekCount ||
@@ -194,6 +204,7 @@ function validateBalanceRollingReconciliation_(state) {
       details.coveredClientMonthCount !== details.expectedClientMonthCount ||
       details.duplicateLineCount || details.duplicateAuditCount ||
       details.duplicateMonthlyLineCount || details.duplicateMonthlyAuditCount ||
+      details.noncanonicalMonthlyLineCount || details.noncanonicalMonthlyAuditCount ||
       details.processedNoncanonicalCount || !details.outsideScopeUnchanged) {
     throw new Error('Balance Sheet rolling final validation failed: ' + JSON.stringify(details));
   }

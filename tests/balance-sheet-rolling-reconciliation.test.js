@@ -202,12 +202,15 @@ test('final validation requires audit coverage and unchanged out-of-scope rows',
     plan, expectedClientIds: ['a', 'b'], completedCount: 12, completedMonthCount: 3,
     createdAt: '2026-10-19T00:00:00.000Z', outsideScopeBaseline: baseline
   };
-  context.runBalanceBigQueryQuery_ = query => query.includes('AS actual_month_count') ? ({
+  let monthlySql = '';
+  let noncanonicalMonthlyAuditCount = '0';
+  context.runBalanceBigQueryQuery_ = query => query.includes('AS actual_month_count') ? ((monthlySql = query), {
     schema: { fields: [
       { name: 'actual_month_count' }, { name: 'duplicate_line_count' },
-      { name: 'covered_client_month_count' }, { name: 'duplicate_audit_count' }
+      { name: 'noncanonical_line_count' }, { name: 'covered_client_month_count' },
+      { name: 'duplicate_audit_count' }, { name: 'noncanonical_audit_count' }
     ] },
-    rows: [{ f: [{ v: '3' }, { v: '0' }, { v: '6' }, { v: '0' }] }]
+    rows: [{ f: [{ v: '3' }, { v: '0' }, { v: '0' }, { v: '6' }, { v: '0' }, { v: noncanonicalMonthlyAuditCount }] }]
   }) : ({
     schema: { fields: [
       { name: 'actual_line_week_count' }, { name: 'duplicate_line_count' },
@@ -218,6 +221,11 @@ test('final validation requires audit coverage and unchanged out-of-scope rows',
   });
   context.readBalanceRollingOutsideFingerprints_ = () => baseline;
   assert.equal(context.validateBalanceRollingReconciliation_(state).status, 'passed');
+  assert.match(monthlySql, /SnapshotDate IS DISTINCT FROM DATE_ADD/);
+  assert.match(monthlySql, /AsOfDate IS DISTINCT FROM LAST_DAY/);
+  noncanonicalMonthlyAuditCount = '1';
+  assert.throws(() => context.validateBalanceRollingReconciliation_(state), /final validation failed/);
+  noncanonicalMonthlyAuditCount = '0';
   context.readBalanceRollingOutsideFingerprints_ = () => ({ ...baseline, snapshots: { rowCount: 99, rowFingerprint: '9' } });
   assert.throws(() => context.validateBalanceRollingReconciliation_(state), /final validation failed/);
 });
