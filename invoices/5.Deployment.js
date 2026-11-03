@@ -149,6 +149,7 @@ function processInvoiceConfigurationDeployment() {
     if (!state) return { status: 'no_pending_deployment' };
     if (state.status === 'completed' || state.status === 'failed') {
       deleteInvoiceDeploymentRecoveryTriggers_();
+      queueDeferredInvoiceWeeklySheetRefresh_(state);
       return summarizeInvoiceDeploymentState_(state, false);
     }
     ensureInvoiceDeploymentRecoveryTrigger_();
@@ -872,6 +873,7 @@ function recoverInvoiceConfigurationDeployment() {
   const state = readInvoiceDeploymentState_();
   if (!state || !['pending', 'processing'].includes(state.status)) {
     deleteInvoiceDeploymentRecoveryTriggers_();
+    if (state) queueDeferredInvoiceWeeklySheetRefresh_(state);
     return { status: 'idle' };
   }
   const hasWorker = ScriptApp.getProjectTriggers().some(trigger =>

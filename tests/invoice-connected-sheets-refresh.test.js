@@ -85,3 +85,26 @@ test('Invoice weekly refresh remains queued when a configuration deployment is a
   assert.notEqual(next.operationId, active.operationId);
   assert.equal(next.currentStage, 'data_source_sheets');
 });
+
+test('Invoice recovery resumes a deferred refresh after a completed operation', () => {
+  const properties = new Map();
+  let refreshQueued = 0;
+  const context = vm.createContext({
+    PropertiesService: { getScriptProperties: () => ({
+      getProperty: key => properties.get(key) || null,
+      setProperty: (key, value) => properties.set(key, value)
+    }) }
+  });
+  const root = path.resolve(__dirname, '..');
+  for (const file of ['invoices/1.Config.js', 'invoices/5.Deployment.js']) {
+    vm.runInContext(fs.readFileSync(path.join(root, file), 'utf8'), context, { filename: file });
+  }
+  context.readInvoiceDeploymentState_ = () => ({
+    reportKey: 'invoices', operationId: 'completed-operation', status: 'completed',
+    weeklyRefreshRequestedAt: '2026-11-03T12:00:00Z'
+  });
+  context.deleteInvoiceDeploymentRecoveryTriggers_ = () => {};
+  context.queueInvoiceWeeklySheetRefresh_ = () => { refreshQueued++; return { status: 'queued' }; };
+  assert.equal(context.recoverInvoiceConfigurationDeployment().status, 'idle');
+  assert.equal(refreshQueued, 1);
+});
