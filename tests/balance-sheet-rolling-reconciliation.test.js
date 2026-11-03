@@ -266,8 +266,8 @@ test('configuration deployment uses a canonical weekly range instead of today', 
 test('an active Balance Sheet rolling plan is resumed without changing its window', () => {
   const context = loadBalanceContext();
   const current = {
-    planVersion: '2026-balance-rolling-v1', status: 'pending',
-    plan: context.buildBalanceRollingReconciliationPlan_('2026-10-12'), weekIndex: 7
+    planVersion: '2026-balance-rolling-v2', status: 'pending',
+    plan: context.buildBalanceRollingReconciliationPlan_('2026-10-12'), jobIndex: 7
   };
   let scheduled = 0;
   context.validateBalanceRollingPreflight_ = () => ({});
@@ -278,9 +278,19 @@ test('an active Balance Sheet rolling plan is resumed without changing its windo
   };
   const result = context.startBalanceRollingReconciliation('2026-10-19');
   assert.equal(result, current);
-  assert.equal(result.weekIndex, 7);
+  assert.equal(result.jobIndex, 7);
   assert.equal(result.plan.endWeek, '2026-10-05');
   assert.equal(scheduled, 1);
+});
+
+test('an older active Balance Sheet plan cannot be overwritten', () => {
+  const context = loadBalanceContext();
+  context.validateBalanceRollingPreflight_ = () => ({});
+  context.readBalanceRollingState_ = () => ({
+    planVersion: '2026-balance-rolling-v1', status: 'running', weekIndex: 7
+  });
+  assert.throws(() => context.startBalanceRollingReconciliation('2026-10-19'),
+    /earlier Balance Sheet reconciliation is still active/);
 });
 
 test('full productive Balance Sheet rolling state stays below Script Properties limit', () => {
@@ -290,7 +300,7 @@ test('full productive Balance Sheet rolling state stays below Script Properties 
     String(index).padStart(8, '0') + '-aaaa-bbbb-cccc-' + String(index).padStart(12, '0'));
   const state = {
     operationId: 'x'.repeat(36), report: 'balance_sheet',
-    planVersion: '2026-balance-rolling-v1', status: 'pending', currentStage: 'bigquery',
+    planVersion: '2026-balance-rolling-v2', status: 'pending', currentStage: 'bigquery',
     weekIndex: 11, plan, expectedClientIds: ids, currentClientIds: ids,
     completedCount: 11, retriedClientCount: 20,
     configurationVersion: 'v'.repeat(100), configurationHash: 'h'.repeat(64),

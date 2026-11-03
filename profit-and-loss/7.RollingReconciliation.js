@@ -269,6 +269,10 @@ function startPnlRollingReconciliation(referenceIsoDate) {
   const loaded = validatePnlRollingPreflight_();
   const plan = buildPnlRollingReconciliationPlan_(referenceIsoDate);
   const current = readPnlRollingState_();
+  if (current && ['pending', 'running'].includes(current.status) &&
+      current.planVersion !== PNL_ROLLING_RECONCILIATION.planVersion) {
+    throw new Error('An earlier P&L reconciliation is still active; finish it before starting the monthly plan.');
+  }
   if (current && current.planVersion === PNL_ROLLING_RECONCILIATION.planVersion &&
       ['pending', 'running'].includes(current.status)) {
     replacePnlRollingSchedule_(PNL_ROLLING_RECONCILIATION.continuationDelayMs, {

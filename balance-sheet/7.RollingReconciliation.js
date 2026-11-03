@@ -7,7 +7,7 @@
  ***********************/
 
 const BALANCE_ROLLING_RECONCILIATION = {
-  planVersion: '2026-balance-rolling-v1',
+  planVersion: '2026-balance-rolling-v2',
   weekCount: 12,
   statePropertyKey: 'QBO_BALANCE_ROLLING_RECONCILIATION',
   workerHandler: 'processBalanceRollingReconciliation',
@@ -270,6 +270,10 @@ function validateBalanceRollingPreflight_() {
 function startBalanceRollingReconciliation(referenceIsoDate) {
   const loaded = validateBalanceRollingPreflight_();
   const current = readBalanceRollingState_();
+  if (current && ['pending', 'running'].includes(current.status) &&
+      current.planVersion !== BALANCE_ROLLING_RECONCILIATION.planVersion) {
+    throw new Error('An earlier Balance Sheet reconciliation is still active; finish it before starting the monthly plan.');
+  }
   if (current && current.planVersion === BALANCE_ROLLING_RECONCILIATION.planVersion &&
       ['pending', 'running'].includes(current.status)) {
     replaceBalanceRollingSchedule_(BALANCE_ROLLING_RECONCILIATION.continuationDelayMs, {
