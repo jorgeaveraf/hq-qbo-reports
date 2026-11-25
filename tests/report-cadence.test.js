@@ -191,10 +191,8 @@ test('cadence deployments preserve weekly views and add monthly views', () => {
   assert.match(monthlyBalance, /COALESCE\(SnapshotType, 'WEEKLY'\) = 'MONTHLY'/);
 
   const balanceSchemaStatements = balance.buildBalanceCadenceSchemaStatements_().join('\n');
-  assert.match(balanceSchemaStatements,
-    /ALTER TABLE `qbo-gateway-reporting\.raw\.balance_sheet_snapshots` SET OPTIONS \(partition_expiration_days = NULL\)/);
-  assert.match(balanceSchemaStatements,
-    /ALTER TABLE `qbo-gateway-reporting\.intermediate\.balance_sheet_audit` SET OPTIONS \(partition_expiration_days = NULL\)/);
+  assert.doesNotMatch(balanceSchemaStatements, /partition_expiration_days/);
+  assert.match(weeklyBalance, /mart\.mart_balance_sheet/);
 });
 
 test('Balance Sheet replacement is atomic and scoped by cadence', () => {

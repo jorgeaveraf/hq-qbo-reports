@@ -146,7 +146,7 @@ const INVOICE_CONNECTED_SHEETS_CONFIG = {
 };
 
 const BQ_CONFIG = {
-  projectId: 'qbo-gateway-reporting', rawDatasetId: 'raw', snapshotsTableId: 'invoice_snapshots'
+  projectId: 'qbo-gateway-reporting', rawDatasetId: 'raw', martDatasetId: 'mart', snapshotsTableId: 'invoice_snapshots'
 };
 
 const INVOICE_SOURCE_FIELDS = {

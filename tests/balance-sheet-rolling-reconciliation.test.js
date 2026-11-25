@@ -123,6 +123,7 @@ test('a successful Balance Sheet subset uses client replacement and preserves ot
     return { state: 'DONE' };
   };
   context.verifyBalanceSheetSnapshotPartition_ = () => ({ status: 'passed' });
+  context.verifyBalanceSheetMartScope_ = () => ({ status: 'passed' });
   context.executeBalanceSheetBigQuerySnapshot_(null, {
     clientIds: ['missing-client'], forceClientScope: true, returnPartialResult: true
   });

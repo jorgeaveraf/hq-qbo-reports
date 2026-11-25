@@ -7,36 +7,9 @@ function snapshotJournalEntriesToBigQuery() {
 }
 
 function executeJournalBigQuerySnapshot_(loadedEntityConfiguration, rangeOverride) {
-  Logger.log('--- JOURNAL BIGQUERY SNAPSHOT START ---');
-  const schemaValidation = validateJournalBigQuerySchema_();
-  const result = buildJournalSnapshot_(loadedEntityConfiguration, rangeOverride);
-  const loadResult = replaceJournalSnapshotPartition_(result.range, result.lineRows);
-  const verification = verifyJournalSnapshotPartition_(result.range.snapshotWeek, result.lineRows.length);
-
-  const executionResult = {
-    entityConfiguration: result.entityConfiguration,
-    schemaValidation,
-    period: result.range,
-    clientCount: result.clientCount,
-    transactionCount: result.transactionCount,
-    sourceRowCount: result.lineRows.length,
-    totals: result.totals,
-    loadResult,
-    verification
-  };
-
-  Logger.log(JSON.stringify(executionResult, null, 2));
-  Logger.log('--- JOURNAL BIGQUERY SNAPSHOT END ---');
-
-  return {
-    entityConfiguration: result.entityConfiguration,
-    period: result.range,
-    clientCount: result.clientCount,
-    transactionCount: result.transactionCount,
-    rowCount: result.lineRows.length,
-    jobId: loadResult.jobId,
-    verification
-  };
+  throw new Error(
+    'Legacy Journal Entries snapshot replacement is disabled. Use snapshotJournalEntriesToBigQuery for incremental mart reconciliation.'
+  );
 }
 
 /***********************
@@ -2509,11 +2482,34 @@ function buildJournalStaleClientsDeleteQuery_(snapshotWeek, clientIds) {
     throw new Error('At least one configured Journal Entries client is required for stale-row cleanup.');
   }
   return [
-    'DELETE FROM `' + JOURNAL_BIGQUERY_TABLE + '`',
+    'DELETE FROM `' + JOURNAL_MART_TABLE + '`',
     "WHERE SnapshotWeek = DATE '" + escapeJournalBigQueryString_(snapshotWeek) + "'",
     '  AND ClientId NOT IN (' + ids.map(clientId =>
       "'" + escapeJournalBigQueryString_(clientId) + "'").join(', ') + ')'
   ].join('\n');
+}
+
+// Raw is an append-only capture. Mart alone replaces the reconciled
+// client/week scope, including a valid capture with zero Journal lines.
+function buildJournalMartClientReconcileQuery_(snapshotWeek, clientId, loadedAt, rowCount) {
+  const week = escapeJournalBigQueryString_(snapshotWeek);
+  const id = escapeJournalBigQueryString_(clientId);
+  const capturedAt = escapeJournalBigQueryString_(loadedAt);
+  const lines = [
+    'BEGIN TRANSACTION;',
+    'DELETE FROM `' + JOURNAL_MART_TABLE + '`',
+    "WHERE SnapshotWeek = DATE '" + week + "' AND ClientId = '" + id + "';"
+  ];
+  if (Number(rowCount) > 0) {
+    lines.push(
+      'INSERT INTO `' + JOURNAL_MART_TABLE + '`',
+      'SELECT * FROM `' + JOURNAL_BIGQUERY_TABLE + '`',
+      "WHERE SnapshotWeek = DATE '" + week + "' AND ClientId = '" + id + "'",
+      "  AND LoadedAt = TIMESTAMP('" + capturedAt + "');"
+    );
+  }
+  lines.push('COMMIT TRANSACTION;');
+  return lines.join('\n');
 }
 
 function waitForBigQueryJob_(jobReference, timeoutMs) {
@@ -2597,7 +2593,7 @@ function verifyJournalSnapshotPartitionDetailed_(
       "  COUNT(DISTINCT CONCAT(ClientId, '|', TransactionId)) AS transaction_count,",
       '  CAST(ROUND(COALESCE(SUM(DebitAmount), 0) * 100) AS INT64) AS debit_cents,',
       '  CAST(ROUND(COALESCE(SUM(CreditAmount), 0) * 100) AS INT64) AS credit_cents',
-      'FROM `' + JOURNAL_BIGQUERY_TABLE + '`',
+      'FROM `' + JOURNAL_MART_TABLE + '`',
       "WHERE SnapshotWeek = DATE '" + normalizedSnapshotWeek + "'",
       scopedClientIds.length
         ? '  AND ClientId IN (' + scopedClientIds.map(clientId =>

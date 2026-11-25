@@ -141,6 +141,18 @@ function processPnlConfigurationDeployment_(targetReportKey) {
       return superseded;
     }
 
+    if (stageResult && stageResult.status === 'pending') {
+      current.stages[claimedStage].status = 'pending';
+      current.stages[claimedStage].attempt = 0;
+      current.status = 'pending';
+      current.currentStage = claimedStage;
+      current.updatedAt = new Date().toISOString();
+      persistPnlDeploymentState_(current, claimedDefinition);
+      updatePnlDeploymentReceipt_(current, claimedDefinition);
+      ensurePnlDeploymentWorkerTrigger_(PNL_OPERATIONAL_DEPLOYMENT.nextStageDelayMs);
+      return summarizePnlDeploymentState_(current, false);
+    }
+
     const completedAt = new Date().toISOString();
     current.stages[claimedStage].status = 'completed';
     current.stages[claimedStage].completedAt = completedAt;
@@ -260,10 +272,14 @@ function executePnlDeploymentStage_(stage, state) {
     return executeProfitAndLossVariantSnapshot_(definition.variantKey, loaded);
   }
   if (stage === 'data_source_sheets') {
-    return refreshPnlConnectedSheetsStage_('data_source_sheets', state.reportKey);
+    const result = advancePnlConnectedSheetsStage_(state, stage, state.reportKey);
+    persistPnlDeploymentState_(state, definition);
+    return result || { status: 'pending' };
   }
   if (stage === 'extracts') {
-    return refreshPnlConnectedSheetsStage_('extracts', state.reportKey);
+    const result = advancePnlConnectedSheetsStage_(state, stage, state.reportKey);
+    persistPnlDeploymentState_(state, definition);
+    return result || { status: 'pending' };
   }
   throw new Error('Unsupported P&L deployment stage: ' + stage);
 }
@@ -278,12 +294,21 @@ function refreshPnlConnectedSheetsPipeline_(spreadsheetOverride, reportKey) {
   };
 }
 
-function refreshPnlConnectedSheetsStage_(stage, reportKey, spreadsheetOverride) {
+function refreshPnlConnectedSheetsStage_(stage, reportKey, spreadsheetOverride, progress) {
+  const resumable = progress !== undefined;
   const spreadsheet = spreadsheetOverride || getPnlReportSpreadsheet_();
   SpreadsheetApp.enableBigQueryExecution();
   const targets = getPnlConnectedSheetTargets_(spreadsheet, stage, reportKey);
-  targets.forEach(target => target.refresh());
-  spreadsheet.waitForAllDataExecutionsCompletion(PNL_CONNECTED_SHEETS_CONFIG.timeoutSeconds);
+  const startedAt = progress && progress.startedAt || new Date().toISOString();
+  const baselineRefreshedAt = progress && progress.baselineRefreshedAt ||
+    Object.fromEntries(targets.map(target => {
+      const time = target.getStatus().getLastRefreshedTime();
+      return [target.name, time ? time.toISOString() : null];
+    }));
+  if (!progress || !progress.startedAt) {
+    targets.forEach(target => target.refresh());
+    spreadsheet.waitForAllDataExecutionsCompletion(PNL_CONNECTED_SHEETS_CONFIG.timeoutSeconds);
+  }
 
   const executions = targets.map(target => {
     const status = target.getStatus();
@@ -304,10 +329,21 @@ function refreshPnlConnectedSheetsStage_(stage, reportKey, spreadsheetOverride) 
   });
 
   const failures = executions.filter(execution =>
-    execution.state !== 'SUCCESS' || execution.errorCode !== 'NONE' || execution.truncated
+    (execution.state !== 'SUCCESS' && !(resumable && execution.state === 'RUNNING')) ||
+    execution.errorCode !== 'NONE' || execution.truncated
   );
   if (failures.length) {
     throw new Error('P&L Connected Sheets stage failed: ' + JSON.stringify({ reportKey, stage, failures }));
+  }
+  const pending = resumable ? executions.filter(execution =>
+    execution.state === 'RUNNING' || !execution.lastRefreshedAt ||
+    (baselineRefreshedAt[execution.name] &&
+      execution.lastRefreshedAt <= baselineRefreshedAt[execution.name])) : [];
+  if (pending.length) {
+    if (Date.now() - Date.parse(startedAt) >= 30 * 60 * 1000) {
+      throw new Error('P&L Connected Sheets stage timed out: ' + stage);
+    }
+    return { status: 'pending', stage, startedAt, baselineRefreshedAt };
   }
 
   const result = {
@@ -317,6 +353,21 @@ function refreshPnlConnectedSheetsStage_(stage, reportKey, spreadsheetOverride) 
   Logger.log(JSON.stringify({
     event: (reportKey || 'pnl') + '_connected_sheets_stage_completed', ...result
   }));
+  return result;
+}
+
+function advancePnlConnectedSheetsStage_(state, stage, reportKey) {
+  const progress = state.connectedSheetRefresh && state.connectedSheetRefresh.stage === stage
+    ? state.connectedSheetRefresh : {};
+  const result = refreshPnlConnectedSheetsStage_(stage, reportKey || null, null, progress);
+  if (result.status === 'pending') {
+    state.connectedSheetRefresh = {
+      stage, startedAt: result.startedAt, baselineRefreshedAt: result.baselineRefreshedAt
+    };
+    state.stageAttempts = 0;
+    return null;
+  }
+  state.connectedSheetRefresh = null;
   return result;
 }
 

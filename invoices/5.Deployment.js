@@ -471,7 +471,8 @@ function getInvoiceConsumptionDeploymentPlan() {
     modifiesBigQuery: false,
     schemaChanges: [
       'ALTER TABLE `qbo-gateway-reporting.raw.invoice_snapshots` ADD COLUMN IF NOT EXISTS PrivateNote STRING',
-      'ALTER TABLE `qbo-gateway-reporting.raw.invoice_snapshots` ADD COLUMN IF NOT EXISTS IsVoided BOOL'
+      'ALTER TABLE `qbo-gateway-reporting.raw.invoice_snapshots` ADD COLUMN IF NOT EXISTS IsVoided BOOL',
+      'ALTER TABLE `qbo-gateway-reporting.mart.mart_invoice` ADD COLUMN IF NOT EXISTS IsVisible BOOL'
     ],
     views: [
       {
@@ -493,11 +494,27 @@ function getInvoiceConsumptionDeploymentPlan() {
 function deployInvoiceConsumptionSchemaAndViews() {
   const plan = getInvoiceConsumptionDeploymentPlan();
   plan.schemaChanges.forEach(sql => runBigQuerySingleRowQuery_(sql));
+  // Backfill before the views switch. All existing weeks remain represented in mart.
+  runBigQuerySingleRowQuery_(buildInvoiceMartVisibilityBackfillSql_());
   plan.views.forEach(view => runBigQuerySingleRowQuery_(view.sql));
   const verification = verifyInvoiceConsumptionViews_();
   const result = { status: 'completed', verification: verification };
   Logger.log(JSON.stringify({ event: 'invoice_consumption_schema_and_views_deployed', ...result }));
   return result;
+}
+
+function buildInvoiceMartVisibilityBackfillSql_() {
+  return [
+    'UPDATE `qbo-gateway-reporting.mart.mart_invoice` AS invoices',
+    'SET IsVisible = NOT EXISTS (',
+    '  SELECT 1 FROM `qbo-gateway-reporting.raw.invoice_snapshots` AS voided_headers',
+    '  WHERE voided_headers.SnapshotWeek = invoices.SnapshotWeek',
+    '    AND voided_headers.ClientId = invoices.ClientId',
+    '    AND voided_headers.InvoiceId = invoices.InvoiceId',
+    "    AND voided_headers.RecordType = 'HEADER'",
+    '    AND COALESCE(voided_headers.IsVoided, FALSE)',
+    ') WHERE invoices.IsVisible IS NULL'
+  ].join('\n');
 }
 
 function buildInvoiceViewColumns_(alias) {
@@ -560,8 +577,8 @@ function buildInvoiceHistoryViewSql_() {
     'CREATE OR REPLACE VIEW `qbo-gateway-reporting.views.vw_invoice_reports` AS',
     'SELECT',
     ...buildInvoiceViewColumns_('invoices'),
-    'FROM `qbo-gateway-reporting.raw.invoice_snapshots` AS invoices',
-    'WHERE ' + buildInvoiceActiveHierarchyPredicate_('invoices').join('\n'),
+    'FROM `qbo-gateway-reporting.mart.mart_invoice` AS invoices',
+    'WHERE invoices.IsVisible',
     'ORDER BY',
     '  invoices.SnapshotWeek DESC,',
     '  invoices.SnapshotDate DESC,',
@@ -577,14 +594,14 @@ function buildInvoiceLatestViewSql_() {
     'CREATE OR REPLACE VIEW `qbo-gateway-reporting.views.vw_latest_invoice_reports` AS',
     'WITH latest_snapshot AS (',
     '  SELECT MAX(SnapshotWeek) AS SnapshotWeek',
-    '  FROM `qbo-gateway-reporting.raw.invoice_snapshots`',
+    '  FROM `qbo-gateway-reporting.mart.mart_invoice`',
     ')',
     'SELECT',
     ...buildInvoiceViewColumns_('invoices'),
-    'FROM `qbo-gateway-reporting.raw.invoice_snapshots` AS invoices',
+    'FROM `qbo-gateway-reporting.mart.mart_invoice` AS invoices',
     'INNER JOIN latest_snapshot',
     '  ON invoices.SnapshotWeek = latest_snapshot.SnapshotWeek',
-    'WHERE ' + buildInvoiceActiveHierarchyPredicate_('invoices').join('\n'),
+    'WHERE invoices.IsVisible',
     'ORDER BY',
     '  invoices.SnapshotWeek DESC,',
     '  invoices.SnapshotDate DESC,',
@@ -607,7 +624,7 @@ function verifyInvoiceConsumptionViews_() {
     '  WHERE ' + buildInvoiceActiveHierarchyPredicate_('invoices').join('\n'),
     '), latest_snapshot AS (',
     '  SELECT MAX(SnapshotWeek) AS SnapshotWeek',
-    '  FROM `qbo-gateway-reporting.raw.invoice_snapshots`',
+    '  FROM `qbo-gateway-reporting.mart.mart_invoice`',
     '), voided_invoice_keys AS (',
     '  SELECT DISTINCT SnapshotWeek, ClientId, InvoiceId',
     '  FROM `qbo-gateway-reporting.raw.invoice_snapshots`',
@@ -615,11 +632,12 @@ function verifyInvoiceConsumptionViews_() {
     ')',
     'SELECT',
     '  (SELECT COUNT(*) FROM metadata) = 2 AS views_exist,',
-    "  (SELECT COUNTIF(REGEXP_CONTAINS(REGEXP_REPLACE(LOWER(view_definition), r'\\s+', ''), r'coalesce\\(voided_headers.isvoided,false\\)')) FROM metadata) = 2 AS exclude_voided,",
+    "  (SELECT COUNTIF(STRPOS(LOWER(view_definition), 'invoices.isvisible') > 0 AND STRPOS(LOWER(view_definition), 'voided_headers') = 0 AND STRPOS(LOWER(view_definition), '.raw.') = 0) FROM metadata) = 2 AS exclude_voided,",
     '  (SELECT COUNT(*) FROM `qbo-gateway-reporting.views.vw_invoice_reports`) AS history_actual_rows,',
     '  (SELECT COUNT(*) FROM active_raw) AS history_expected_rows,',
     '  (SELECT COUNT(*) FROM `qbo-gateway-reporting.views.vw_latest_invoice_reports`) AS latest_actual_rows,',
     '  (SELECT COUNT(*) FROM active_raw, latest_snapshot WHERE active_raw.SnapshotWeek = latest_snapshot.SnapshotWeek) AS latest_expected_rows,',
+    '  (SELECT COUNT(*) FROM `qbo-gateway-reporting.mart.mart_invoice` WHERE IsVisible IS NULL) AS unresolved_mart_rows,',
     '  (SELECT COUNT(*)',
     '   FROM `qbo-gateway-reporting.views.vw_invoice_reports` AS visible',
     '   INNER JOIN voided_invoice_keys USING (SnapshotWeek, ClientId, InvoiceId)) AS visible_voided_rows',
@@ -632,14 +650,16 @@ function verifyInvoiceConsumptionViews_() {
     historyExpectedRows: Number(result.history_expected_rows || 0),
     latestActualRows: Number(result.latest_actual_rows || 0),
     latestExpectedRows: Number(result.latest_expected_rows || 0),
-    visibleVoidedRows: Number(result.visible_voided_rows || 0)
+    visibleVoidedRows: Number(result.visible_voided_rows || 0),
+    unresolvedMartRows: Number(result.unresolved_mart_rows || 0)
   };
   if (
     !verification.viewsExist ||
     !verification.excludeVoided ||
     verification.historyActualRows !== verification.historyExpectedRows ||
     verification.latestActualRows !== verification.latestExpectedRows ||
-    verification.visibleVoidedRows !== 0
+    verification.visibleVoidedRows !== 0 ||
+    verification.unresolvedMartRows !== 0
   ) {
     throw new Error('Invoice consumption view validation failed: ' + JSON.stringify(verification));
   }

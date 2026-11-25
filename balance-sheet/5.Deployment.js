@@ -115,6 +115,17 @@ function processBalanceConfigurationDeployment() {
     }));
     const result = executeBalanceDeploymentStage_(stage,  state);
     state = readBalanceDeploymentState_();
+    if (result.status === 'pending') {
+      state.stages[stage].status = 'pending';
+      state.stages[stage].attempts = 0;
+      state.status = 'pending';
+      state.currentStage = stage;
+      state.updatedAt = new Date().toISOString();
+      persistBalanceDeploymentState_(state);
+      updateBalanceDeploymentReceipt_(state);
+      scheduleBalanceDeploymentWorker_(BALANCE_OPERATIONAL_DEPLOYMENT.nextStageDelayMs);
+      return summarizeBalanceDeploymentState_(state);
+    }
     const completedAt = new Date().toISOString();
     state.stages[stage].status = 'completed';
     state.stages[stage].completedAt = completedAt;
@@ -194,16 +205,29 @@ function executeBalanceDeploymentStage_(stage,  state) {
       asOfDate: range.asOfDate,
       requireAsOfDateMatch: true
     });
-  } if (stage === 'data_source_sheets' || stage === 'extracts') return refreshBalanceConnectedSheetsStage_(stage);
+  } if (stage === 'data_source_sheets' || stage === 'extracts') {
+    const result = advanceBalanceConnectedSheetsStage_(state, stage);
+    persistBalanceDeploymentState_(state);
+    return result || { status: 'pending' };
+  }
   throw new Error('Unsupported Balance Sheet deployment stage: ' + stage);
 }
 
-function refreshBalanceConnectedSheetsStage_(stage,  spreadsheetOverride) {
+function refreshBalanceConnectedSheetsStage_(stage, spreadsheetOverride, progress) {
+  const resumable = progress !== undefined;
   const spreadsheet = spreadsheetOverride || getBalanceReportSpreadsheet_();
   SpreadsheetApp.enableBigQueryExecution();
   const targets = getBalanceConnectedSheetTargets_(spreadsheet,  stage);
-  targets.forEach(target => target.refresh());
-  spreadsheet.waitForAllDataExecutionsCompletion(BALANCE_SHEET_REFRESH_CONFIG.timeoutSeconds);
+  const startedAt = progress && progress.startedAt || new Date().toISOString();
+  const baselineRefreshedAt = progress && progress.baselineRefreshedAt ||
+    Object.fromEntries(targets.map(target => {
+      const time = target.getStatus().getLastRefreshedTime();
+      return [target.name, time ? time.toISOString() : null];
+    }));
+  if (!progress || !progress.startedAt) {
+    targets.forEach(target => target.refresh());
+    spreadsheet.waitForAllDataExecutionsCompletion(BALANCE_SHEET_REFRESH_CONFIG.timeoutSeconds);
+  }
   const executions = targets.map(target => {
     const status = target.getStatus(),
     executionTime = status.getLastExecutionTime(),
@@ -219,11 +243,22 @@ function refreshBalanceConnectedSheetsStage_(stage,  spreadsheetOverride) {
       truncated: status.isTruncated() === true
     };
   });
-  const failures = executions.filter(item => item.state !== 'SUCCESS' || item.errorCode !== 'NONE' || item.truncated);
+  const failures = executions.filter(item =>
+    item.errorCode !== 'NONE' || item.truncated ||
+    (item.state !== 'SUCCESS' && !(resumable && item.state === 'RUNNING'))
+  );
   if (failures.length) throw new Error('Balance Sheet Connected Sheets stage failed: ' + JSON.stringify({
     stage,
     failures
   }));
+  const pending = resumable ? executions.filter(item => item.state === 'RUNNING' || !item.lastRefreshedAt ||
+    (baselineRefreshedAt[item.name] && item.lastRefreshedAt <= baselineRefreshedAt[item.name])) : [];
+  if (pending.length) {
+    if (Date.now() - Date.parse(startedAt) >= 30 * 60 * 1000) {
+      throw new Error('Balance Sheet Connected Sheets stage timed out: ' + stage);
+    }
+    return { status: 'pending', stage, startedAt, baselineRefreshedAt };
+  }
   const result = {
     status: 'passed',
     stage,
@@ -234,6 +269,21 @@ function refreshBalanceConnectedSheetsStage_(stage,  spreadsheetOverride) {
     event: 'balance_sheet_connected_sheets_stage_completed',
     ...result
   }));
+  return result;
+}
+
+function advanceBalanceConnectedSheetsStage_(state, stage) {
+  const progress = state.connectedSheetRefresh && state.connectedSheetRefresh.stage === stage
+    ? state.connectedSheetRefresh : {};
+  const result = refreshBalanceConnectedSheetsStage_(stage, null, progress);
+  if (result.status === 'pending') {
+    state.connectedSheetRefresh = {
+      stage, startedAt: result.startedAt, baselineRefreshedAt: result.baselineRefreshedAt
+    };
+    state.stageAttempts = 0;
+    return null;
+  }
+  state.connectedSheetRefresh = null;
   return result;
 }
 

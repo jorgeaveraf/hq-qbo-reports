@@ -18,6 +18,7 @@ const AGING_ROLLING_RECONCILIATION = {
   childPollDelayMs: 60000,
   failureRetryDelayMs: 60000,
   watchdogDelayMs: 14 * 60 * 1000,
+  extractWaitLimitMs: 30 * 60 * 1000,
   maxJobRetries: 3,
   maxStateBytes: 8500
 };
@@ -82,7 +83,7 @@ function readAgingRollingOutsideFingerprint_(plan) {
   const result = runAgingBigQueryQuery_([
     'SELECT COUNT(*) AS row_count,',
     "  COALESCE(CAST(BIT_XOR(FARM_FINGERPRINT(TO_JSON_STRING(t))) AS STRING), '0') AS row_fingerprint",
-    'FROM `' + AGING_BIGQUERY_TABLE + '` t',
+    'FROM `' + AGING_MART_TABLE + '` t',
     'WHERE ' + buildAgingRollingCanonicalDatePredicate_(plan, true)
   ].join('\n'));
   const row = readAgingRollingScalarRow_(result);
@@ -130,7 +131,7 @@ function validateAgingRollingReconciliation_(state) {
     "  COUNTIF(bucket != CASE WHEN days_overdue IS NULL OR days_overdue <= 0 THEN 'Current'",
     "    WHEN days_overdue <= 30 THEN '1–30' WHEN days_overdue <= 60 THEN '31–60'",
     "    WHEN days_overdue <= 90 THEN '61–90' ELSE '91+' END) AS invalid_bucket_count",
-    'FROM `' + AGING_BIGQUERY_TABLE + '` t',
+    'FROM `' + AGING_MART_TABLE + '` t',
     'WHERE ' + buildAgingRollingCanonicalDatePredicate_(plan, false)
   ].join('\n'));
   const row = readAgingRollingScalarRow_(result);
@@ -232,6 +233,50 @@ function recoverAgingRollingReconciliation() {
   if (hasWorker && !stale) return { status: 'scheduled' };
   Logger.log(JSON.stringify({ event: 'aging_rolling_recovery_started', hasWorker, stale }));
   return processAgingRollingReconciliation();
+}
+
+/** Resume only the extract that was still RUNNING when the rolling worker stopped. */
+function resumeFailedAgingRollingExtract() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) throw new Error('AR/AP rolling state is busy.');
+  try {
+    const state = readAgingRollingState_();
+    if (!state || state.status !== 'failed' || state.currentStage !== 'extracts' ||
+        !state.finalValidation || state.finalValidation.status !== 'passed' ||
+        !state.dataSourceSheets || state.dataSourceSheets.status !== 'passed') {
+      throw new Error('No validated AR/AP rolling extract is eligible for recovery.');
+    }
+    const prefix = 'Aging Connected Sheets stage failed: ';
+    if (!String(state.lastError || '').startsWith(prefix)) {
+      throw new Error('AR/AP rolling failure was not a Connected Sheets status check.');
+    }
+    const reported = JSON.parse(state.lastError.slice(prefix.length));
+    if (reported.stage !== 'extracts' || !reported.failures ||
+        !reported.failures.length || reported.failures.some(item =>
+          item.state !== 'RUNNING' || item.errorCode !== 'NONE' || item.truncated)) {
+      throw new Error('AR/AP rolling extract has a terminal failure; it cannot be resumed.');
+    }
+    const baselineRefreshedAt = {};
+    reported.failures.forEach(item => {
+      baselineRefreshedAt[item.name] = item.lastRefreshedAt || null;
+    });
+    state.extractRefresh = {
+      startedAt: state.updatedAt,
+      baselineRefreshedAt
+    };
+    state.status = 'pending';
+    state.lastError = null;
+    state.updatedAt = new Date().toISOString();
+    persistAgingRollingState_(state);
+    ensureAgingRollingRecoveryTrigger_();
+    replaceAgingRollingSchedule_(AGING_ROLLING_RECONCILIATION.continuationDelayMs, {
+      reason: 'resume_failed_extract'
+    });
+    Logger.log(JSON.stringify({ event: 'aging_rolling_extract_resumed', operationId: state.operationId }));
+    return { status: state.status, currentStage: state.currentStage, operationId: state.operationId };
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function replaceAgingRollingSchedule_(delayMs, options) {
@@ -441,10 +486,30 @@ function processAgingRollingReconciliation() {
       state.dataSourceSheets = refreshAgingConnectedSheetsStage_('data_source_sheets');
       state.currentStage = 'extracts';
     } else if (state.currentStage === 'extracts') {
-      state.extracts = refreshAgingConnectedSheetsStage_('extracts');
-      state.currentStage = 'completed';
-      state.status = 'completed';
-      state.completedAt = new Date().toISOString();
+      const existing = state.extractRefresh;
+      const result = refreshAgingConnectedSheetsStage_('extracts', null, {
+        allowPending: true,
+        refresh: !existing,
+        startedAt: existing && existing.startedAt,
+        baselineRefreshedAt: existing && existing.baselineRefreshedAt
+      });
+      if (result.status === 'pending') {
+        state.extractRefresh = {
+          startedAt: result.startedAt,
+          baselineRefreshedAt: result.baselineRefreshedAt
+        };
+        if (Date.now() - Date.parse(result.startedAt) >=
+            AGING_ROLLING_RECONCILIATION.extractWaitLimitMs) {
+          throw new Error('AR/AP rolling extract did not finish within the wait limit: ' +
+            result.pendingNames.join(','));
+        }
+      } else {
+        state.extracts = result;
+        state.extractRefresh = null;
+        state.currentStage = 'completed';
+        state.status = 'completed';
+        state.completedAt = new Date().toISOString();
+      }
     } else {
       throw new Error('Unsupported AR/AP rolling stage: ' + state.currentStage);
     }

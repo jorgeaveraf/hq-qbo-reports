@@ -100,6 +100,25 @@ function executeInvoiceIncidentBackfillPeriod_(period, state) {
   };
 }
 
+function advanceInvoiceBackfillConnectedSheetsStage_(state, stage) {
+  const existing = state.connectedSheetRefresh && state.connectedSheetRefresh.stage === stage
+    ? state.connectedSheetRefresh : null;
+  const startedAt = existing ? existing.startedAt : new Date().toISOString();
+  const stageState = { refreshRequestedAt: startedAt, refreshIssuedAt: existing ? startedAt : null };
+  const operation = { operationId: null, stages: { [stage]: stageState } };
+  const result = refreshInvoiceConnectedSheetsStage_(stage, null, operation);
+  if (result.status === 'pending') {
+    if (Date.now() - Date.parse(startedAt) >= 30 * 60 * 1000) {
+      throw new Error('Invoice Connected Sheets stage timed out: ' + stage);
+    }
+    state.connectedSheetRefresh = { stage, startedAt };
+    state.stageAttempts = 0;
+    return null;
+  }
+  state.connectedSheetRefresh = null;
+  return result;
+}
+
 function processInvoiceSeptemberIncidentBackfill() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
@@ -124,15 +143,21 @@ function processInvoiceSeptemberIncidentBackfill() {
       state.stageAttempts = 0;
       if (state.periodIndex >= state.periods.length) state.currentStage = 'data_source_sheets';
     } else if (state.currentStage === 'data_source_sheets') {
-      state.dataSourceSheets = refreshInvoiceConnectedSheetsStage_('data_source_sheets');
-      state.currentStage = 'extracts';
-      state.stageAttempts = 0;
+      const refresh = advanceInvoiceBackfillConnectedSheetsStage_(state, 'data_source_sheets');
+      if (refresh) {
+        state.dataSourceSheets = refresh;
+        state.currentStage = 'extracts';
+        state.stageAttempts = 0;
+      }
     } else if (state.currentStage === 'extracts') {
-      state.extracts = refreshInvoiceConnectedSheetsStage_('extracts');
-      state.currentStage = 'completed';
-      state.status = 'completed';
-      state.completedAt = new Date().toISOString();
-      state.stageAttempts = 0;
+      const refresh = advanceInvoiceBackfillConnectedSheetsStage_(state, 'extracts');
+      if (refresh) {
+        state.extracts = refresh;
+        state.currentStage = 'completed';
+        state.status = 'completed';
+        state.completedAt = new Date().toISOString();
+        state.stageAttempts = 0;
+      }
     } else {
       throw new Error('Unsupported Invoice incident backfill stage: ' + state.currentStage);
     }
@@ -452,17 +477,21 @@ function processInvoiceWeeklyHistoryBackfill2026() {
       state.currentStage = 'data_source_sheets';
       state.stageAttempts = 0;
     } else if (state.currentStage === 'data_source_sheets') {
-      refreshInvoiceConnectedSheetsStage_('data_source_sheets');
-      state.dataSourceSheets = { status: 'completed' };
-      state.currentStage = 'extracts';
-      state.stageAttempts = 0;
+      const refresh = advanceInvoiceBackfillConnectedSheetsStage_(state, 'data_source_sheets');
+      if (refresh) {
+        state.dataSourceSheets = { status: 'completed' };
+        state.currentStage = 'extracts';
+        state.stageAttempts = 0;
+      }
     } else if (state.currentStage === 'extracts') {
-      refreshInvoiceConnectedSheetsStage_('extracts');
-      state.extracts = { status: 'completed' };
-      state.currentStage = 'completed';
-      state.status = 'completed';
-      state.completedAt = new Date().toISOString();
-      state.stageAttempts = 0;
+      const refresh = advanceInvoiceBackfillConnectedSheetsStage_(state, 'extracts');
+      if (refresh) {
+        state.extracts = { status: 'completed' };
+        state.currentStage = 'completed';
+        state.status = 'completed';
+        state.completedAt = new Date().toISOString();
+        state.stageAttempts = 0;
+      }
     } else {
       throw new Error('Unsupported Invoice weekly history stage: ' + state.currentStage);
     }

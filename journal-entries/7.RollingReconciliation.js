@@ -73,7 +73,7 @@ function readJournalRollingOutsideFingerprint_(plan) {
     'SELECT COUNT(*) AS row_count,',
     '  COUNT(DISTINCT idempotency_key) AS distinct_key_count,',
     "  COALESCE(CAST(BIT_XOR(FARM_FINGERPRINT(TO_JSON_STRING(t))) AS STRING), '0') AS row_fingerprint",
-    'FROM `' + JOURNAL_BIGQUERY_TABLE + '` t',
+    'FROM `' + JOURNAL_MART_TABLE + '` t',
     "WHERE SnapshotWeek < DATE '" + plan.startWeek + "'",
     "   OR SnapshotWeek > DATE '" + plan.endWeek + "'"
   ].join('\n'));
@@ -95,7 +95,7 @@ function validateJournalRollingReconciliation_(state) {
   const result = runBigQueryQuery_([
     'WITH window_rows AS (',
     '  SELECT *',
-    '  FROM `' + JOURNAL_BIGQUERY_TABLE + '`',
+    '  FROM `' + JOURNAL_MART_TABLE + '`',
     "  WHERE SnapshotWeek BETWEEN DATE '" + plan.startWeek + "' AND DATE '" + plan.endWeek + "'",
     '), imbalanced AS (',
     '  SELECT SnapshotWeek, ClientId',
@@ -408,15 +408,21 @@ function processJournalRollingReconciliation() {
       state.currentStage = 'data_source_sheets';
       state.stageAttempts = 0;
     } else if (state.currentStage === 'data_source_sheets') {
-      state.dataSourceSheets = refreshJournalConnectedSheetsStage_('data_source_sheets');
-      state.currentStage = 'extracts';
-      state.stageAttempts = 0;
+      const refresh = advanceJournalConnectedSheetsStage_(state, 'data_source_sheets');
+      if (refresh) {
+        state.dataSourceSheets = refresh;
+        state.currentStage = 'extracts';
+        state.stageAttempts = 0;
+      }
     } else if (state.currentStage === 'extracts') {
-      state.extracts = refreshJournalConnectedSheetsStage_('extracts');
-      state.currentStage = 'completed';
-      state.status = 'completed';
-      state.completedAt = new Date().toISOString();
-      state.stageAttempts = 0;
+      const refresh = advanceJournalConnectedSheetsStage_(state, 'extracts');
+      if (refresh) {
+        state.extracts = refresh;
+        state.currentStage = 'completed';
+        state.status = 'completed';
+        state.completedAt = new Date().toISOString();
+        state.stageAttempts = 0;
+      }
     } else {
       throw new Error('Unsupported Journal Entries rolling stage: ' + state.currentStage);
     }

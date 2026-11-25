@@ -19,7 +19,7 @@ test('invoice consumption deployment plan is read-only and preserves both existi
   context.runBigQuerySingleRowQuery_ = () => { queryCount++; };
   const plan = context.getInvoiceConsumptionDeploymentPlan();
   assert.equal(plan.modifiesBigQuery, false);
-  assert.equal(plan.schemaChanges.length, 2);
+  assert.equal(plan.schemaChanges.length, 3);
   assert.equal(plan.views.length, 2);
   assert.equal(queryCount, 0);
   assert.deepEqual(
@@ -27,10 +27,9 @@ test('invoice consumption deployment plan is read-only and preserves both existi
     ['vw_invoice_reports', 'vw_latest_invoice_reports']
   );
   plan.views.forEach(view => {
-    assert.match(view.sql, /NOT EXISTS/);
-    assert.match(view.sql, /voided_headers\.RecordType = 'HEADER'/);
-    assert.match(view.sql, /COALESCE\(voided_headers\.IsVoided, FALSE\)/);
-    assert.match(view.sql, /invoices\.LoadedAt/);
+    assert.match(view.sql, /`qbo-gateway-reporting\.mart\.mart_invoice`/);
+    assert.match(view.sql, /WHERE invoices\.IsVisible/);
+    assert.doesNotMatch(view.sql, /`qbo-gateway-reporting\.raw\.invoice_snapshots`/);
     assert.doesNotMatch(view.sql, /invoices\.PrivateNote/);
   });
 });

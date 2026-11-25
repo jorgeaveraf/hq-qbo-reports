@@ -114,6 +114,29 @@ function advanceAgingIncidentBackfillSnapshot_(state) {
   return { waiting: false };
 }
 
+function advanceAgingBackfillConnectedSheetsStage_(state, stage) {
+  const existing = state.connectedSheetRefresh && state.connectedSheetRefresh.stage === stage
+    ? state.connectedSheetRefresh : null;
+  const result = refreshAgingConnectedSheetsStage_(stage, null, {
+    allowPending: true,
+    refresh: !existing,
+    startedAt: existing && existing.startedAt,
+    baselineRefreshedAt: existing && existing.baselineRefreshedAt
+  });
+  if (result.status === 'pending') {
+    if (Date.now() - Date.parse(result.startedAt) >= 30 * 60 * 1000) {
+      throw new Error('AR/AP Connected Sheets stage timed out: ' + stage);
+    }
+    state.connectedSheetRefresh = {
+      stage, startedAt: result.startedAt, baselineRefreshedAt: result.baselineRefreshedAt
+    };
+    state.stageAttempts = 0;
+    return null;
+  }
+  state.connectedSheetRefresh = null;
+  return result;
+}
+
 function processAgingSeptemberIncidentBackfill() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
@@ -143,15 +166,21 @@ function processAgingSeptemberIncidentBackfill() {
       }
       if (state.snapshotIndex >= state.snapshotDates.length) state.currentStage = 'data_source_sheets';
     } else if (state.currentStage === 'data_source_sheets') {
-      state.dataSourceSheets = refreshAgingConnectedSheetsStage_('data_source_sheets');
-      state.currentStage = 'extracts';
-      state.stageAttempts = 0;
+      const refresh = advanceAgingBackfillConnectedSheetsStage_(state, 'data_source_sheets');
+      if (refresh) {
+        state.dataSourceSheets = refresh;
+        state.currentStage = 'extracts';
+        state.stageAttempts = 0;
+      }
     } else if (state.currentStage === 'extracts') {
-      state.extracts = refreshAgingConnectedSheetsStage_('extracts');
-      state.currentStage = 'completed';
-      state.status = 'completed';
-      state.completedAt = new Date().toISOString();
-      state.stageAttempts = 0;
+      const refresh = advanceAgingBackfillConnectedSheetsStage_(state, 'extracts');
+      if (refresh) {
+        state.extracts = refresh;
+        state.currentStage = 'completed';
+        state.status = 'completed';
+        state.completedAt = new Date().toISOString();
+        state.stageAttempts = 0;
+      }
     } else {
       throw new Error('Unsupported AR/AP incident backfill stage: ' + state.currentStage);
     }

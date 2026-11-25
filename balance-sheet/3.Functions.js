@@ -1382,6 +1382,7 @@ function executeBalanceSheetBigQuerySnapshot_(loadedEntityConfigurationOverride,
     useClientScope ? snapshot.successfulClientIds : null,
     snapshot.snapshotType
   );
+  const martVerification = verifyBalanceSheetMartScope_(snapshot, useClientScope ? snapshot.successfulClientIds : null);
   const result = {
     status: hasClientFailures ? 'completed_with_entity_errors' : 'completed',
     entityConfiguration: snapshot.entityConfiguration,
@@ -1396,7 +1397,8 @@ function executeBalanceSheetBigQuerySnapshot_(loadedEntityConfigurationOverride,
     successfulClientIds: snapshot.successfulClientIds,
     clientFailures: snapshot.clientFailures,
     loadResult,
-    verification
+    verification,
+    martVerification
   };
   if (hasClientFailures && settings.returnPartialResult !== true) {
     Logger.log(JSON.stringify(result, null, 2));
@@ -1472,13 +1474,11 @@ function validateBalanceSheetBigQuerySchema_() {
   const snapshotMismatch =
     missingSnapshotColumns.length ||
     snapshotPartitionField !== BALANCE_BIGQUERY_PARTITION_FIELD ||
-    snapshotPartitionType !== 'DAY' ||
-    snapshotPartitionExpirationMs > 0;
+    snapshotPartitionType !== 'DAY';
   const auditMismatch =
     missingAuditColumns.length ||
     auditPartitionField !== BALANCE_BIGQUERY_PARTITION_FIELD ||
-    auditPartitionType !== 'DAY' ||
-    auditPartitionExpirationMs > 0;
+    auditPartitionType !== 'DAY';
 
   if (snapshotMismatch || auditMismatch) {
     throw new Error('Balance Sheet BigQuery schema mismatch: ' + JSON.stringify({
@@ -1490,7 +1490,6 @@ function validateBalanceSheetBigQuerySchema_() {
           expectedType: 'DAY',
           actualField: snapshotPartitionField,
           actualType: snapshotPartitionType,
-          expectedExpirationMs: 0,
           actualExpirationMs: snapshotPartitionExpirationMs
         }
       },
@@ -1502,7 +1501,6 @@ function validateBalanceSheetBigQuerySchema_() {
           expectedType: 'DAY',
           actualField: auditPartitionField,
           actualType: auditPartitionType,
-          expectedExpirationMs: 0,
           actualExpirationMs: auditPartitionExpirationMs
         }
       }
@@ -1587,6 +1585,39 @@ function buildBalanceAtomicReplaceSql_(targetTable, stagingTable, columns, snaps
   ].join('\n');
 }
 
+function buildBalanceLatestRefreshSql_(successfulClientIds) {
+  const ids = successfulClientIds === null ? [] : Array.from(new Set(
+    (successfulClientIds || []).map(id => String(id || '').trim()).filter(Boolean)
+  ));
+  const clientScope = ids.length ? 'ClientId IN (' + buildBalanceClientScopeSql_(ids) + ')' : 'TRUE';
+  const snapshotsTable = BQ_CONFIG.projectId + '.mart.mart_balance_sheet';
+  return [
+    'CREATE TEMP TABLE latest_balance_rows AS',
+    'SELECT ClientId, NormalizedCategory, SnapshotDate, LoadedAt, MetricName, AccountPath',
+    'FROM `' + snapshotsTable + '`',
+    'WHERE ' + clientScope,
+    '  AND IsKeyMetric = TRUE',
+    "  AND COALESCE(SnapshotType, 'WEEKLY') = 'WEEKLY'",
+    '  AND EXTRACT(DAYOFWEEK FROM SnapshotWeek) = 2',
+    '  AND SnapshotDate = DATE_ADD(SnapshotWeek, INTERVAL 7 DAY)',
+    '  AND AsOfDate = DATE_ADD(SnapshotWeek, INTERVAL 6 DAY)',
+    'QUALIFY ROW_NUMBER() OVER (',
+    '    PARTITION BY ClientId, NormalizedCategory',
+    '    ORDER BY SnapshotDate DESC, LoadedAt DESC',
+    '  ) = 1;',
+    'UPDATE `' + snapshotsTable + '` SET IsLatestKeyMetric = FALSE WHERE ' + clientScope + ';',
+    'UPDATE `' + snapshotsTable + '` AS target',
+    'SET IsLatestKeyMetric = TRUE',
+    'FROM latest_balance_rows AS latest',
+    'WHERE ' + clientScope.replace(/\bClientId\b/g, 'target.ClientId'),
+    '  AND TO_JSON_STRING(STRUCT(target.ClientId, target.NormalizedCategory, target.SnapshotDate,',
+    '    target.LoadedAt, target.MetricName, target.AccountPath)) =',
+    '  TO_JSON_STRING(STRUCT(latest.ClientId, latest.NormalizedCategory, latest.SnapshotDate,',
+    '    latest.LoadedAt, latest.MetricName, latest.AccountPath));',
+    'DROP TABLE latest_balance_rows;'
+  ].join('\n');
+}
+
 function replaceBalanceSheetSnapshotScope_(snapshot, successfulClientIds) {
   const snapshotDate = String(snapshot && snapshot.snapshotDate || '').trim();
   const snapshotWeek = String(snapshot && snapshot.snapshotWeek || '').trim();
@@ -1634,10 +1665,16 @@ function replaceBalanceSheetSnapshotScope_(snapshot, successfulClientIds) {
     const clientScope = ids.length ? buildBalanceClientScopeSql_(ids) : null;
     const snapshotStageTable = [BQ_CONFIG.projectId, BQ_CONFIG.snapshotsDatasetId, snapshotStage].join('.');
     const auditStageTable = [BQ_CONFIG.projectId, BQ_CONFIG.auditDatasetId, auditStage].join('.');
-    const snapshotResult = runBalanceBigQueryQuery_(buildBalanceAtomicReplaceSql_(
-      BALANCE_SNAPSHOT_TABLE, snapshotStageTable, BS_EXPORT_COLUMNS, snapshotDate,
-      snapshotWeek, asOfDate, snapshotType, clientScope
-    ), BQ_CONFIG.snapshotsDatasetId);
+    const martTable = [BQ_CONFIG.projectId, 'mart', 'mart_balance_sheet'].join('.');
+    const snapshotResult = runBalanceBigQueryQuery_([
+      'BEGIN TRANSACTION;',
+      buildBalanceAtomicReplaceSql_(BALANCE_SNAPSHOT_TABLE, snapshotStageTable, BS_EXPORT_COLUMNS,
+        snapshotDate, snapshotWeek, asOfDate, snapshotType, clientScope) + ';',
+      buildBalanceAtomicReplaceSql_(martTable, snapshotStageTable, BS_EXPORT_COLUMNS,
+        snapshotDate, snapshotWeek, asOfDate, snapshotType, clientScope) + ';',
+      buildBalanceLatestRefreshSql_(successfulClientIds),
+      'COMMIT TRANSACTION;'
+    ].join('\n'), BQ_CONFIG.snapshotsDatasetId);
     const auditResult = runBalanceBigQueryQuery_(buildBalanceAtomicReplaceSql_(
       BALANCE_AUDIT_TABLE, auditStageTable, auditColumns, snapshotDate,
       snapshotWeek, asOfDate, snapshotType, clientScope
@@ -1824,6 +1861,37 @@ function waitForBalanceBigQueryJob_(jobReference, timeoutMs, datasetId) {
   return job;
 }
 
+function verifyBalanceSheetMartScope_(snapshot, clientIds) {
+  const date = String(snapshot.snapshotDate);
+  const week = String(snapshot.snapshotWeek);
+  const asOf = String(snapshot.requestedAsOfDate);
+  const type = normalizeBalanceSnapshotType_(snapshot.snapshotType);
+  const ids = Array.from(new Set((clientIds || []).map(id => String(id || '').trim()).filter(Boolean)));
+  const filter = [
+    "SnapshotDate = DATE '" + date + "'",
+    "SnapshotWeek = DATE '" + week + "'",
+    "AsOfDate = DATE '" + asOf + "'",
+    "COALESCE(SnapshotType, 'WEEKLY') = '" + type + "'"
+  ];
+  if (ids.length) filter.push('ClientId IN (' + buildBalanceClientScopeSql_(ids) + ')');
+  const where = filter.join(' AND ');
+  const martTable = [BQ_CONFIG.projectId, 'mart', 'mart_balance_sheet'].join('.');
+  const query = [
+    'WITH r AS (SELECT * FROM \u0060' + BALANCE_SNAPSHOT_TABLE + '\u0060 WHERE ' + where + '),',
+    'm AS (SELECT * EXCEPT(IsLatestKeyMetric) FROM \u0060' + martTable + '\u0060 WHERE ' + where + ')',
+    'SELECT (SELECT COUNT(*) FROM r) AS raw_count, (SELECT COUNT(*) FROM m) AS mart_count,',
+    '(SELECT COUNT(*) FROM (SELECT * FROM r EXCEPT DISTINCT SELECT * FROM m)) AS raw_only,',
+    '(SELECT COUNT(*) FROM (SELECT * FROM m EXCEPT DISTINCT SELECT * FROM r)) AS mart_only'
+  ].join('\n');
+  const result = runBalanceBigQueryQuery_(query, BQ_CONFIG.snapshotsDatasetId);
+  const values = result.rows && result.rows.length ? result.rows[0].f : [];
+  const counts = values.map(value => Number(value && value.v || 0));
+  if (counts.length !== 4 || counts[0] !== counts[1] || counts[2] !== 0 || counts[3] !== 0) {
+    throw new Error('Balance Sheet raw/mart parity failed: ' + JSON.stringify(counts));
+  }
+  return { status: 'passed', rawCount: counts[0], martCount: counts[1], rawOnly: counts[2], martOnly: counts[3] };
+}
+
 function verifyBalanceSheetSnapshotPartition_(snapshotDate, snapshotWeek, asOfDate,
     expectedRowCount, clientIds, snapshotType) {
   const normalizedType = normalizeBalanceSnapshotType_(snapshotType || BALANCE_SNAPSHOT_TYPE_WEEKLY);
@@ -1978,7 +2046,7 @@ function resolveBalanceSnapshotRange_(event, referenceIsoDate) {
 }
 
 function buildBalanceMetricsViewSql_(viewName, snapshotType, latestOnly) {
-  const source = BQ_CONFIG.projectId + '.' + BQ_CONFIG.snapshotsDatasetId + '.' + BQ_CONFIG.snapshotsTableId;
+  const source = BQ_CONFIG.projectId + '.mart.mart_balance_sheet';
   const canonicalWeeklyPredicates = snapshotType === BALANCE_SNAPSHOT_TYPE_WEEKLY ? [
     '    AND EXTRACT(DAYOFWEEK FROM SnapshotWeek) = 2',
     '    AND SnapshotDate = DATE_ADD(SnapshotWeek, INTERVAL 7 DAY)',
@@ -1987,21 +2055,11 @@ function buildBalanceMetricsViewSql_(viewName, snapshotType, latestOnly) {
   if (latestOnly) {
     return [
       'CREATE OR REPLACE VIEW `' + BQ_CONFIG.projectId + '.views.' + viewName + '` AS',
-      'WITH ranked AS (',
-      '  SELECT *, ROW_NUMBER() OVER (',
-      '    PARTITION BY ClientId, NormalizedCategory',
-      '    ORDER BY SnapshotDate DESC, LoadedAt DESC',
-      '  ) AS rn',
-      '  FROM `' + source + '`',
-      '  WHERE IsKeyMetric = TRUE',
-      "    AND COALESCE(SnapshotType, 'WEEKLY') = '" + snapshotType + "'",
-      ...canonicalWeeklyPredicates,
-      ')',
       'SELECT SnapshotWeek, SnapshotDate, Entity, ClientName, ClientId, AsOfDate,',
       '  MetricName, NormalizedCategory, AccountName, AccountPath, Amount, Currency, Source, LoadedAt,',
       '  SnapshotType',
-      'FROM ranked',
-      'WHERE rn = 1',
+      'FROM `' + source + '`',
+      'WHERE IsLatestKeyMetric = TRUE',
       'ORDER BY Entity ASC, ClientName ASC, NormalizedCategory ASC'
     ].join('\n');
   }
@@ -2024,10 +2082,8 @@ function buildBalanceCadenceSchemaStatements_() {
   return [
     'ALTER TABLE `' + snapshotTable + '` ADD COLUMN IF NOT EXISTS SnapshotType STRING;',
     "UPDATE `" + snapshotTable + "` SET SnapshotType = 'WEEKLY' WHERE SnapshotType IS NULL;",
-    'ALTER TABLE `' + snapshotTable + '` SET OPTIONS (partition_expiration_days = NULL);',
     'ALTER TABLE `' + auditTable + '` ADD COLUMN IF NOT EXISTS SnapshotType STRING;',
     "UPDATE `" + auditTable + "` SET SnapshotType = 'WEEKLY' WHERE SnapshotType IS NULL;",
-    'ALTER TABLE `' + auditTable + '` SET OPTIONS (partition_expiration_days = NULL);',
     buildBalanceMetricsViewSql_('vw_weekly_balance_sheet_metrics', BALANCE_SNAPSHOT_TYPE_WEEKLY, false) + ';',
     buildBalanceMetricsViewSql_('vw_latest_balance_sheet_metrics', BALANCE_SNAPSHOT_TYPE_WEEKLY, true) + ';',
     buildBalanceMetricsViewSql_('vw_monthly_balance_sheet_metrics', BALANCE_SNAPSHOT_TYPE_MONTHLY, false) + ';'

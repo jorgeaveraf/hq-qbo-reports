@@ -464,19 +464,21 @@ function processPnlRollingReconciliation() {
       state.currentStage = 'data_source_sheets';
       state.stageAttempts = 0;
     } else if (state.currentStage === 'data_source_sheets') {
-      state.dataSourceSheets = summarizePnlRollingSheetRefresh_(
-        refreshPnlConnectedSheetsStage_('data_source_sheets')
-      );
-      state.currentStage = 'extracts';
-      state.stageAttempts = 0;
+      const refresh = advancePnlConnectedSheetsStage_(state, 'data_source_sheets');
+      if (refresh) {
+        state.dataSourceSheets = summarizePnlRollingSheetRefresh_(refresh);
+        state.currentStage = 'extracts';
+        state.stageAttempts = 0;
+      }
     } else if (state.currentStage === 'extracts') {
-      state.extracts = summarizePnlRollingSheetRefresh_(
-        refreshPnlConnectedSheetsStage_('extracts')
-      );
-      state.currentStage = 'completed';
-      state.status = 'completed';
-      state.completedAt = new Date().toISOString();
-      state.stageAttempts = 0;
+      const refresh = advancePnlConnectedSheetsStage_(state, 'extracts');
+      if (refresh) {
+        state.extracts = summarizePnlRollingSheetRefresh_(refresh);
+        state.currentStage = 'completed';
+        state.status = 'completed';
+        state.completedAt = new Date().toISOString();
+        state.stageAttempts = 0;
+      }
     } else {
       throw new Error('Unsupported P&L rolling reconciliation stage: ' + state.currentStage);
     }

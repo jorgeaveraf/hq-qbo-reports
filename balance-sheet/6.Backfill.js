@@ -149,15 +149,21 @@ function processBalanceSeptemberIncidentBackfill() {
       state.stageAttempts = 0;
       if (state.jobIndex >= state.jobs.length) state.currentStage = 'data_source_sheets';
     } else if (state.currentStage === 'data_source_sheets') {
-      state.dataSourceSheets = refreshBalanceConnectedSheetsStage_('data_source_sheets');
-      state.currentStage = 'extracts';
-      state.stageAttempts = 0;
+      const refresh = advanceBalanceConnectedSheetsStage_(state, 'data_source_sheets');
+      if (refresh) {
+        state.dataSourceSheets = refresh;
+        state.currentStage = 'extracts';
+        state.stageAttempts = 0;
+      }
     } else if (state.currentStage === 'extracts') {
-      state.extracts = refreshBalanceConnectedSheetsStage_('extracts');
-      state.currentStage = 'completed';
-      state.status = 'completed';
-      state.completedAt = new Date().toISOString();
-      state.stageAttempts = 0;
+      const refresh = advanceBalanceConnectedSheetsStage_(state, 'extracts');
+      if (refresh) {
+        state.extracts = refresh;
+        state.currentStage = 'completed';
+        state.status = 'completed';
+        state.completedAt = new Date().toISOString();
+        state.stageAttempts = 0;
+      }
     } else {
       throw new Error('Unsupported Balance Sheet incident backfill stage: ' + state.currentStage);
     }
@@ -478,17 +484,21 @@ function processBalanceWeeklyHistoryBackfill2026() {
       state.currentStage = 'data_source_sheets';
       state.stageAttempts = 0;
     } else if (state.currentStage === 'data_source_sheets') {
-      refreshBalanceConnectedSheetsStage_('data_source_sheets');
-      state.dataSourceSheets = { status: 'completed' };
-      state.currentStage = 'extracts';
-      state.stageAttempts = 0;
+      const refresh = advanceBalanceConnectedSheetsStage_(state, 'data_source_sheets');
+      if (refresh) {
+        state.dataSourceSheets = { status: 'completed' };
+        state.currentStage = 'extracts';
+        state.stageAttempts = 0;
+      }
     } else if (state.currentStage === 'extracts') {
-      refreshBalanceConnectedSheetsStage_('extracts');
-      state.extracts = { status: 'completed' };
-      state.currentStage = 'completed';
-      state.status = 'completed';
-      state.completedAt = new Date().toISOString();
-      state.stageAttempts = 0;
+      const refresh = advanceBalanceConnectedSheetsStage_(state, 'extracts');
+      if (refresh) {
+        state.extracts = { status: 'completed' };
+        state.currentStage = 'completed';
+        state.status = 'completed';
+        state.completedAt = new Date().toISOString();
+        state.stageAttempts = 0;
+      }
     } else {
       throw new Error('Unsupported Balance Sheet weekly history stage: ' + state.currentStage);
     }

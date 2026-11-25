@@ -293,49 +293,43 @@ test('rejects invoice rows outside the rolling plan before writing', () => {
   assert.equal(writeCalled, false);
 });
 
-test('does not refresh Connected Sheets when rolling validation fails', () => {
+test('weekly entry point starts the resumable Invoice worker', () => {
   const context = loadInvoicesContext();
-  let refreshCount = 0;
   let released = false;
   context.LockService = { getScriptLock: () => ({
     tryLock: () => true, releaseLock: () => { released = true; }
   }) };
-  context.executeInvoiceRollingBigQuerySnapshot_ = () => {
-    throw new Error('invoice rolling validation failed');
-  };
-  context.queueInvoiceWeeklySheetRefresh_ = () => { refreshCount++; };
-  assert.throws(() => context.snapshotInvoicesToBigQuery(), /rolling validation failed/);
-  assert.equal(refreshCount, 0);
+  let started = 0;
+  context.startInvoiceRollingReconciliation = () => { started++; return { status: 'pending' }; };
+  const result = context.snapshotInvoicesToBigQuery();
+  assert.equal(started, 1);
+  assert.equal(result.status, 'pending');
   assert.equal(released, true);
 });
 
-test('queues Connected Sheets after successful rolling validation', () => {
+test('does not refresh Connected Sheets before the worker reaches refresh stage', () => {
   const context = loadInvoicesContext();
   let refreshCount = 0;
   context.LockService = { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) };
-  context.executeInvoiceRollingBigQuerySnapshot_ = () => ({ status: 'completed' });
-  context.verifyInvoiceConsumptionViews_ = () => ({ status: 'passed' });
+  context.startInvoiceRollingReconciliation = () => ({ status: 'pending' });
   context.queueInvoiceWeeklySheetRefresh_ = () => {
     refreshCount++;
     return { status: 'queued' };
   };
   const result = context.snapshotInvoicesToBigQuery();
-  assert.equal(refreshCount, 1);
-  assert.equal(result.connectedSheets.status, 'queued');
-  assert.equal(result.consumptionViews.status, 'passed');
+  assert.equal(refreshCount, 0);
+  assert.equal(result.status, 'pending');
 });
 
-test('does not refresh Connected Sheets when consumption-view validation fails', () => {
+test('releases the entry-point lock when starting the worker fails', () => {
   const context = loadInvoicesContext();
-  let refreshCount = 0;
-  context.LockService = { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) };
-  context.executeInvoiceRollingBigQuerySnapshot_ = () => ({ status: 'completed' });
-  context.verifyInvoiceConsumptionViews_ = () => {
-    throw new Error('Invoice consumption view validation failed');
-  };
-  context.queueInvoiceWeeklySheetRefresh_ = () => { refreshCount++; };
-  assert.throws(() => context.snapshotInvoicesToBigQuery(), /consumption view validation failed/);
-  assert.equal(refreshCount, 0);
+  let released = false;
+  context.LockService = { getScriptLock: () => ({
+    tryLock: () => true, releaseLock: () => { released = true; }
+  }) };
+  context.startInvoiceRollingReconciliation = () => { throw new Error('preflight failed'); };
+  assert.throws(() => context.snapshotInvoicesToBigQuery(), /preflight failed/);
+  assert.equal(released, true);
 });
 
 test('final validation rejects cross-week duplicate invoice identities and fingerprint drift', () => {

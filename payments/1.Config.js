@@ -132,6 +132,7 @@ const PAYMENT_BOOLEAN_COLUMNS = PAYMENT_BIGQUERY_SCHEMA.filter(field => field.ty
 const PAYMENT_BIGQUERY_PARTITION_FIELD = 'SnapshotWeek';
 const PAYMENT_BIGQUERY_CLUSTER_FIELDS = ['Entity', 'ClientId', 'PaymentId', 'RecordType'];
 const PAYMENT_BIGQUERY_TABLE = [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, BQ_CONFIG.snapshotsTableId].join('.');
+const PAYMENT_BIGQUERY_MART_TABLE = [BQ_CONFIG.projectId, 'mart', 'mart_payment'].join('.');
 const PAYMENT_RECORD_TYPES = { header: 'HEADER', line: 'LINE' };
 const PAYMENT_LINE_SIGN_BY_TXN_TYPE = {
   Invoice: 1,

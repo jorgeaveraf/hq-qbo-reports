@@ -126,15 +126,21 @@ function processPnlSeptemberIncidentBackfill() {
       state.stageAttempts = 0;
       if (state.jobIndex >= state.jobs.length) state.currentStage = 'data_source_sheets';
     } else if (state.currentStage === 'data_source_sheets') {
-      state.dataSourceSheets = refreshPnlConnectedSheetsStage_('data_source_sheets');
-      state.currentStage = 'extracts';
-      state.stageAttempts = 0;
+      const refresh = advancePnlConnectedSheetsStage_(state, 'data_source_sheets');
+      if (refresh) {
+        state.dataSourceSheets = refresh;
+        state.currentStage = 'extracts';
+        state.stageAttempts = 0;
+      }
     } else if (state.currentStage === 'extracts') {
-      state.extracts = refreshPnlConnectedSheetsStage_('extracts');
-      state.currentStage = 'completed';
-      state.status = 'completed';
-      state.completedAt = new Date().toISOString();
-      state.stageAttempts = 0;
+      const refresh = advancePnlConnectedSheetsStage_(state, 'extracts');
+      if (refresh) {
+        state.extracts = refresh;
+        state.currentStage = 'completed';
+        state.status = 'completed';
+        state.completedAt = new Date().toISOString();
+        state.stageAttempts = 0;
+      }
     } else {
       throw new Error('Unsupported P&L incident backfill stage: ' + state.currentStage);
     }
@@ -493,17 +499,21 @@ function processPnlWeeklyHistoryBackfill2026() {
       state.currentStage = 'data_source_sheets';
       state.stageAttempts = 0;
     } else if (state.currentStage === 'data_source_sheets') {
-      refreshPnlConnectedSheetsStage_('data_source_sheets');
-      state.dataSourceSheets = { status: 'completed' };
-      state.currentStage = 'extracts';
-      state.stageAttempts = 0;
+      const refresh = advancePnlConnectedSheetsStage_(state, 'data_source_sheets');
+      if (refresh) {
+        state.dataSourceSheets = { status: 'completed' };
+        state.currentStage = 'extracts';
+        state.stageAttempts = 0;
+      }
     } else if (state.currentStage === 'extracts') {
-      refreshPnlConnectedSheetsStage_('extracts');
-      state.extracts = { status: 'completed' };
-      state.currentStage = 'completed';
-      state.status = 'completed';
-      state.completedAt = new Date().toISOString();
-      state.stageAttempts = 0;
+      const refresh = advancePnlConnectedSheetsStage_(state, 'extracts');
+      if (refresh) {
+        state.extracts = { status: 'completed' };
+        state.currentStage = 'completed';
+        state.status = 'completed';
+        state.completedAt = new Date().toISOString();
+        state.stageAttempts = 0;
+      }
     } else {
       throw new Error('Unsupported P&L weekly history stage: ' + state.currentStage);
     }

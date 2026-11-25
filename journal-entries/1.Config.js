@@ -133,6 +133,7 @@ const JOURNAL_NUMERIC_COLUMNS = JOURNAL_BIGQUERY_SCHEMA.filter(field => field.ty
 const JOURNAL_BIGQUERY_PARTITION_FIELD = 'SnapshotWeek';
 const JOURNAL_BIGQUERY_CLUSTER_FIELDS = ['Entity', 'ClientId', 'TransactionDate', 'TransactionType'];
 const JOURNAL_BIGQUERY_TABLE = [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, BQ_CONFIG.snapshotsTableId].join('.');
+const JOURNAL_MART_TABLE = [BQ_CONFIG.projectId, 'mart', 'mart_journal_entry'].join('.');
 const JOURNAL_BALANCE_TOLERANCE_CENTS = 1;
 
 const JE_SHEET_REFRESH_CONFIG = {

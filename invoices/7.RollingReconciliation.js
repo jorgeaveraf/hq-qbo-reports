@@ -263,6 +263,7 @@ function executeInvoiceRollingBigQuerySnapshot_(loadedEntityConfiguration, optio
     result.successfulClientIds,
     outsideWindowBefore
   );
+  const martVerification = verifyInvoiceMartScope_(result.plan.periods.map(period => period.snapshotWeek), result.successfulClientIds);
   const baselinePersistence = persistInvoiceSchemaBaselineUpdates_(result.schemaBaselineUpdates);
   const executionResult = {
     status: hasClientFailures ? 'completed_with_entity_errors' : 'completed',
@@ -281,7 +282,8 @@ function executeInvoiceRollingBigQuerySnapshot_(loadedEntityConfiguration, optio
     successfulClientIds: result.successfulClientIds,
     clientFailures: result.clientFailures,
     loadResult: loadResult,
-    verification: verification
+    verification: verification,
+    martVerification: martVerification
   };
   Logger.log(JSON.stringify(executionResult, null, 2));
   Logger.log('--- INVOICE ROLLING BIGQUERY SNAPSHOT END ---');
@@ -383,6 +385,11 @@ function replaceInvoiceSnapshotRangeClients_(plan, rows, successfulClientIds) {
         'FROM `' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId].join('.') + '`;'
       );
     }
+    const martReference = [BQ_CONFIG.projectId, BQ_CONFIG.martDatasetId, BQ_CONFIG.snapshotsTableId].join('.');
+    statements.push('DELETE FROM `' + martReference + '`', 'WHERE SnapshotWeek IN (' + weekScopeSql + ')', '  AND ClientId IN (' + buildInvoiceClientScopeSql_(ids) + ');');
+    if (prepared.length) {
+        statements.push(buildInvoiceMartInsertSql_('invoices.SnapshotWeek IN (' + weekScopeSql + ') AND invoices.ClientId IN (' + buildInvoiceClientScopeSql_(ids) + ')'));
+    }
     statements.push('COMMIT TRANSACTION;');
     const queryResult = runBigQuerySingleRowQuery_(statements.join('\n'));
     return {
@@ -425,7 +432,7 @@ function invoiceUtf8ByteLength_(value) {
   return bytes;
 }
 
-function loadInvoiceRollingStagingChunks_(preparedRows, stagingTableId, token, maxChunkBytesOverride) {
+function loadInvoiceRollingStagingChunks_(preparedRows, stagingTableId, token, maxChunkBytesOverride, appendToExisting) {
   const maxChunkBytes = Number(maxChunkBytesOverride || INVOICE_CONFIG.maxStagingChunkBytes);
   if (!Number.isInteger(maxChunkBytes) || maxChunkBytes < 1024) {
     throw new Error('Invoice staging chunk size must be an integer of at least 1024 bytes.');
@@ -452,8 +459,10 @@ function loadInvoiceRollingStagingChunks_(preparedRows, stagingTableId, token, m
           tableId: stagingTableId
         },
         sourceFormat: 'NEWLINE_DELIMITED_JSON',
-        createDisposition: chunkNumber === 1 ? 'CREATE_IF_NEEDED' : 'CREATE_NEVER',
-        writeDisposition: chunkNumber === 1 ? 'WRITE_TRUNCATE' : 'WRITE_APPEND',
+        createDisposition: appendToExisting ? 'CREATE_NEVER' :
+          (chunkNumber === 1 ? 'CREATE_IF_NEEDED' : 'CREATE_NEVER'),
+        writeDisposition: appendToExisting ? 'WRITE_APPEND' :
+          (chunkNumber === 1 ? 'WRITE_TRUNCATE' : 'WRITE_APPEND'),
         autodetect: false,
         ignoreUnknownValues: false,
         maxBadRecords: 0,
@@ -571,5 +580,301 @@ function verifyInvoiceRollingSnapshot_(plan, rows, successfulClientIds, outsideW
     outsideWindowFingerprint: outsideWindowAfter,
     periodVerifications: periodVerifications
   };
+}
+
+/* A rolling run stages one client/week at a time and publishes all 12 weeks
+ * in one BigQuery transaction. A stopped Apps Script execution repeats only
+ * its current unit; the staged scope is replaced before that retry. */
+const INVOICE_ROLLING_WORKER = {
+  stateKey: 'QBO_INVOICE_ROLLING_WORKER_V1',
+  handler: 'processInvoiceRollingReconciliation',
+  recoveryHandler: 'recoverInvoiceRollingReconciliation',
+  continuationDelayMs: 5000,
+  stagingBudgetMs: 240000,
+  maxAttempts: 3,
+  maxStateBytes: 8500
+};
+
+function readInvoiceRollingWorkerState_() {
+  const value = PropertiesService.getScriptProperties().getProperty(INVOICE_ROLLING_WORKER.stateKey);
+  return value ? JSON.parse(value) : null;
+}
+
+function getInvoiceRollingReconciliationStatus() {
+  const state = readInvoiceRollingWorkerState_();
+  if (!state) return { status: 'not_started' };
+  return {
+    operationId: state.operationId,
+    status: state.status,
+    currentStage: state.currentStage,
+    completedJobs: state.completedJobs,
+    totalJobs: state.plan.periods.length * state.clientIds.length,
+    expectedRowCount: state.expectedRowCount,
+    lastResult: state.lastResult,
+    lastError: state.lastError,
+    updatedAt: state.updatedAt,
+    completedAt: state.completedAt
+  };
+}
+
+function persistInvoiceRollingWorkerState_(state) {
+  const value = JSON.stringify(state);
+  if (invoiceUtf8ByteLength_(value) > INVOICE_ROLLING_WORKER.maxStateBytes) {
+    throw new Error('Invoice rolling worker state exceeds Script Properties capacity.');
+  }
+  PropertiesService.getScriptProperties().setProperty(INVOICE_ROLLING_WORKER.stateKey, value);
+}
+
+function deleteInvoiceRollingWorkerTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === INVOICE_ROLLING_WORKER.handler)
+    .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+}
+
+function scheduleInvoiceRollingWorker_(delayMs) {
+  deleteInvoiceRollingWorkerTriggers_();
+  ScriptApp.newTrigger(INVOICE_ROLLING_WORKER.handler).timeBased().after(delayMs).create();
+}
+
+function ensureInvoiceRollingRecoveryTrigger_() {
+  if (ScriptApp.getProjectTriggers().some(trigger =>
+      trigger.getHandlerFunction() === INVOICE_ROLLING_WORKER.recoveryHandler)) return;
+  ScriptApp.newTrigger(INVOICE_ROLLING_WORKER.recoveryHandler).timeBased().everyMinutes(10).create();
+}
+
+function deleteInvoiceRollingRecoveryTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === INVOICE_ROLLING_WORKER.recoveryHandler)
+    .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+}
+
+function recoverInvoiceRollingReconciliation() {
+  const state = readInvoiceRollingWorkerState_();
+  if (!state || !['pending', 'running'].includes(state.status)) {
+    deleteInvoiceRollingWorkerTriggers_();
+    deleteInvoiceRollingRecoveryTriggers_();
+    return { status: 'idle' };
+  }
+  const ageMs = Date.now() - Date.parse(state.updatedAt);
+  const hasWorker = ScriptApp.getProjectTriggers().some(trigger =>
+    trigger.getHandlerFunction() === INVOICE_ROLLING_WORKER.handler);
+  if (!hasWorker && (state.status === 'pending' || ageMs > 25 * 60000)) {
+    scheduleInvoiceRollingWorker_(INVOICE_ROLLING_WORKER.continuationDelayMs);
+    return { status: 'rescheduled', operationId: state.operationId };
+  }
+  return { status: 'waiting', operationId: state.operationId };
+}
+
+function createInvoiceRollingStage_(tableId) {
+  BigQuery.Tables.insert({
+    tableReference: {
+      projectId: BQ_CONFIG.projectId,
+      datasetId: BQ_CONFIG.rawDatasetId,
+      tableId: tableId
+    },
+    schema: { fields: INVOICE_BIGQUERY_SCHEMA },
+    expirationTime: String(Date.now() + 7 * 86400000)
+  }, BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId);
+}
+
+function startInvoiceRollingReconciliation(referenceIsoDate) {
+  const current = readInvoiceRollingWorkerState_();
+  if (current && ['pending', 'running'].includes(current.status)) {
+    ensureInvoiceRollingRecoveryTrigger_();
+    recoverInvoiceRollingReconciliation();
+    return current;
+  }
+  const deployment = readInvoiceDeploymentState_();
+  if (deployment && ['pending', 'processing'].includes(deployment.status)) {
+    throw new Error('Invoice configuration deployment is still active.');
+  }
+  validateInvoiceBigQuerySchema_();
+  const loaded = loadInvoiceEntityConfiguration_();
+  const clientsById = fetchClients_(loaded);
+  const clientIds = Object.keys(clientsById).sort();
+  if (!clientIds.length) throw new Error('Invoice rolling reconciliation has no authorized clients.');
+  const plan = getInvoiceRollingSnapshotPlan_(referenceIsoDate);
+  const operationId = Utilities.getUuid().replace(/-/g, '');
+  const stageTableId = 'invoice_rolling_stage_' + operationId;
+  const now = new Date().toISOString();
+  const state = {
+    operationId: operationId, status: 'pending', currentStage: 'staging',
+    plan: plan, clientIds: clientIds, jobIndex: 0, completedJobs: 0,
+    expectedRowCount: 0, expectedInvoiceCount: 0,
+    configurationHash: loaded.configuration.configuration_hash,
+    stageTableId: stageTableId,
+    outsideWindowBefore: readInvoiceOutsideWindowFingerprint_(plan),
+    attempts: 0, lastError: null, lastResult: null,
+    createdAt: now, updatedAt: now, completedAt: null
+  };
+  createInvoiceRollingStage_(stageTableId);
+  persistInvoiceRollingWorkerState_(state);
+  ensureInvoiceRollingRecoveryTrigger_();
+  scheduleInvoiceRollingWorker_(INVOICE_ROLLING_WORKER.continuationDelayMs);
+  return state;
+}
+
+function stageInvoiceRollingJob_(state) {
+  const weekIndex = Math.floor(state.jobIndex / state.clientIds.length);
+  const clientIndex = state.jobIndex % state.clientIds.length;
+  const period = state.plan.periods[weekIndex];
+  const clientId = state.clientIds[clientIndex];
+  if (!period || !clientId) throw new Error('Invoice rolling worker job index is outside its plan.');
+  const loaded = loadInvoiceEntityConfiguration_();
+  if (loaded.configuration.configuration_hash !== state.configurationHash) {
+    throw new Error('Invoice entity configuration changed during rolling reconciliation.');
+  }
+  const client = fetchClients_(loaded)[clientId];
+  if (!client) throw new Error('Invoice rolling client is no longer authorized: ' + clientId);
+  const oneWeek = getInvoiceRollingSnapshotPlan_(period.snapshotDate, 1);
+  const startedAt = Date.now();
+  const snapshot = buildInvoiceRollingClientSnapshot_(client, oneWeek, new Date().toISOString());
+  validateInvoiceRollingSnapshotRows_(oneWeek, snapshot.rows, [clientId]);
+  const stage = '`' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, state.stageTableId].join('.') + '`';
+  runBigQuerySingleRowQuery_([
+    'DELETE FROM ' + stage,
+    "WHERE SnapshotWeek = DATE '" + period.snapshotWeek + "'",
+    'AND ClientId IN (' + buildInvoiceClientScopeSql_([clientId]) + ')'
+  ].join('\n'));
+  const prepared = buildInvoiceBigQueryRows_(snapshot.rows);
+  if (prepared.length) {
+    const token = Utilities.getUuid().replace(/-/g, '');
+    loadInvoiceRollingStagingChunks_(prepared, state.stageTableId, token, null, true);
+  }
+  persistInvoiceSchemaBaselineUpdates_(snapshot.schemaBaselineUpdate ? [snapshot.schemaBaselineUpdate] : []);
+  state.expectedRowCount += prepared.length;
+  state.expectedInvoiceCount += snapshot.invoiceCount;
+  state.completedJobs += 1;
+  state.jobIndex += 1;
+  state.lastResult = {
+    snapshotWeek: period.snapshotWeek, clientId: clientId,
+    sourceInvoiceCount: snapshot.sourceInvoiceCount,
+    rowCount: prepared.length, durationMs: Date.now() - startedAt
+  };
+  Logger.log(JSON.stringify({ event: 'invoice_rolling_job_staged', ...state.lastResult }));
+  if (state.jobIndex === state.plan.periods.length * state.clientIds.length) {
+    state.currentStage = 'publish';
+  }
+}
+
+function publishInvoiceRollingStage_(state) {
+  const loaded = loadInvoiceEntityConfiguration_();
+  if (loaded.configuration.configuration_hash !== state.configurationHash) {
+    throw new Error('Invoice entity configuration changed before rolling publication.');
+  }
+  const stage = '`' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, state.stageTableId].join('.') + '`';
+  const raw = '`' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, BQ_CONFIG.snapshotsTableId].join('.') + '`';
+  const mart = '`' + [BQ_CONFIG.projectId, BQ_CONFIG.martDatasetId, 'mart_invoice'].join('.') + '`';
+  const weeks = state.plan.periods.map(period => "DATE '" + period.snapshotWeek + "'").join(', ');
+  const ids = buildInvoiceClientScopeSql_(state.clientIds);
+  const scope = 'SnapshotWeek IN (' + weeks + ') AND ClientId IN (' + ids + ')';
+  const stageMetrics = runBigQuerySingleRowQuery_([
+    'SELECT COUNT(*) AS row_count, COUNT(DISTINCT idempotency_key) AS distinct_key_count,',
+    "COUNTIF(SnapshotWeek NOT IN (" + weeks + ") OR ClientId NOT IN (" + ids + ")) AS out_of_scope_count",
+    'FROM ' + stage
+  ].join('\n'));
+  if (Number(stageMetrics.row_count) !== state.expectedRowCount ||
+      Number(stageMetrics.distinct_key_count) !== state.expectedRowCount ||
+      Number(stageMetrics.out_of_scope_count) !== 0) {
+    throw new Error('Invoice rolling stage failed row, key or scope validation: ' + JSON.stringify(stageMetrics));
+  }
+  const duplicates = runBigQuerySingleRowQuery_([
+    'SELECT COUNT(*) AS duplicate_invoice_week_count FROM (',
+    'SELECT ClientId, InvoiceId FROM ' + stage,
+    "WHERE RecordType = 'HEADER' GROUP BY ClientId, InvoiceId",
+    'HAVING COUNT(DISTINCT SnapshotWeek) > 1)'
+  ].join('\n'));
+  if (Number(duplicates.duplicate_invoice_week_count) !== 0) {
+    throw new Error('Invoice rolling stage assigned an invoice to multiple weeks.');
+  }
+  const columns = INVOICE_EXPORT_COLUMNS.map(column => '`' + column + '`').join(', ');
+  runBigQuerySingleRowQuery_([
+    'BEGIN TRANSACTION;',
+    'DELETE FROM ' + raw + ' WHERE ' + scope + ';',
+    'INSERT INTO ' + raw + ' (' + columns + ') SELECT ' + columns + ' FROM ' + stage + ';',
+    'DELETE FROM ' + mart + ' WHERE ' + scope + ';',
+    buildInvoiceMartInsertSql_(
+      'invoices.SnapshotWeek IN (' + weeks + ') AND invoices.ClientId IN (' + ids + ')'
+    ),
+    'COMMIT TRANSACTION;'
+  ].join('\n'));
+  state.currentStage = 'validation';
+  state.lastResult = { status: 'published', rowCount: state.expectedRowCount };
+}
+
+function validatePublishedInvoiceRollingStage_(state) {
+  const raw = '`' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, BQ_CONFIG.snapshotsTableId].join('.') + '`';
+  const weeks = state.plan.periods.map(period => "DATE '" + period.snapshotWeek + "'").join(', ');
+  const scope = 'SnapshotWeek IN (' + weeks + ') AND ClientId IN (' + buildInvoiceClientScopeSql_(state.clientIds) + ')';
+  const result = runBigQuerySingleRowQuery_('SELECT COUNT(*) AS row_count FROM ' + raw + ' WHERE ' + scope);
+  if (Number(result.row_count) !== state.expectedRowCount) {
+    throw new Error('Invoice rolling published row count differs from staged count.');
+  }
+  const mart = verifyInvoiceMartScope_(state.plan.snapshotWeeks, state.clientIds);
+  const outside = readInvoiceOutsideWindowFingerprint_(state.plan);
+  if (JSON.stringify(outside) !== JSON.stringify(state.outsideWindowBefore)) {
+    throw new Error('Invoice rolling publication changed rows outside the planned window.');
+  }
+  state.lastResult = { status: 'validated', rowCount: state.expectedRowCount, mart: mart.status };
+  state.currentStage = 'refresh';
+}
+
+function processInvoiceRollingReconciliation() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) return { status: 'deferred_lock_busy' };
+  try {
+    deleteInvoiceRollingWorkerTriggers_();
+    const state = readInvoiceRollingWorkerState_();
+    if (!state || ['completed', 'failed'].includes(state.status)) return state || { status: 'idle' };
+    state.status = 'running';
+    state.attempts += 1;
+    state.updatedAt = new Date().toISOString();
+    persistInvoiceRollingWorkerState_(state);
+    try {
+      if (state.currentStage === 'staging') {
+        const deadline = Date.now() + INVOICE_ROLLING_WORKER.stagingBudgetMs;
+        do {
+          stageInvoiceRollingJob_(state);
+          // A restarted execution retries only the current client/week.
+          state.attempts = 0;
+          state.lastError = null;
+          state.updatedAt = new Date().toISOString();
+          persistInvoiceRollingWorkerState_(state);
+        } while (state.currentStage === 'staging' && Date.now() < deadline);
+      }
+      else if (state.currentStage === 'publish') publishInvoiceRollingStage_(state);
+      else if (state.currentStage === 'validation') validatePublishedInvoiceRollingStage_(state);
+      else if (state.currentStage === 'refresh') {
+        const views = verifyInvoiceConsumptionViews_();
+        const refresh = queueInvoiceWeeklySheetRefresh_({ status: 'completed' }, views);
+        state.lastResult = { status: 'refresh_queued', result: refresh.status };
+        state.currentStage = 'completed';
+        state.completedAt = new Date().toISOString();
+      } else throw new Error('Unsupported Invoice rolling stage: ' + state.currentStage);
+      state.attempts = 0;
+      state.lastError = null;
+      state.status = state.currentStage === 'completed' ? 'completed' : 'pending';
+      state.updatedAt = new Date().toISOString();
+      persistInvoiceRollingWorkerState_(state);
+      if (state.status === 'completed') {
+        deleteInvoiceRollingRecoveryTriggers_();
+        try { BigQuery.Tables.remove(BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, state.stageTableId); }
+        catch (error) { Logger.log('Invoice rolling stage cleanup failed: ' + String(error)); }
+      } else scheduleInvoiceRollingWorker_(INVOICE_ROLLING_WORKER.continuationDelayMs);
+      return state;
+    } catch (error) {
+      state.lastError = String(error && error.message || error).slice(0, 1200);
+      state.status = state.attempts >= INVOICE_ROLLING_WORKER.maxAttempts ? 'failed' : 'pending';
+      state.updatedAt = new Date().toISOString();
+      persistInvoiceRollingWorkerState_(state);
+      if (state.status === 'failed') deleteInvoiceRollingRecoveryTriggers_();
+      else scheduleInvoiceRollingWorker_(60000);
+      Logger.log(JSON.stringify({ event: 'invoice_rolling_worker_failed', stage: state.currentStage,
+        jobIndex: state.jobIndex, attempts: state.attempts, error: state.lastError }));
+      throw error;
+    }
+  } finally {
+    lock.releaseLock();
+  }
 }
 

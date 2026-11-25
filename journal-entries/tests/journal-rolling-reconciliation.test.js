@@ -84,7 +84,18 @@ test('subset checkpoint never schedules stale cleanup outside the requested clie
   assert.equal(checkpoint.scope_mode, 'subset');
   assert.equal(checkpoint.stale_cleanup_job_id, null);
   assert.equal(checkpoint.stale_cleanup_completed, true);
-  assert.match(context.buildJournalClientDeleteQuery_('2026-10-12', 'missing'), /ClientId = 'missing'/);
+  const reconcile = context.buildJournalMartClientReconcileQuery_(
+    '2026-10-12', 'missing', '2026-10-19T00:00:00.000Z', 2
+  );
+  assert.match(reconcile, /BEGIN TRANSACTION/);
+  assert.match(reconcile, /DELETE FROM `qbo-gateway-reporting\.mart\.mart_journal_entry`/);
+  assert.match(reconcile, /INSERT INTO `qbo-gateway-reporting\.mart\.mart_journal_entry`/);
+  assert.match(reconcile, /LoadedAt = TIMESTAMP\('2026-10-19T00:00:00.000Z'\)/);
+  assert.match(reconcile, /COMMIT TRANSACTION/);
+  const empty = context.buildJournalMartClientReconcileQuery_(
+    '2026-10-12', 'missing', '2026-10-19T00:00:00.000Z', 0
+  );
+  assert.doesNotMatch(empty, /INSERT INTO/);
 });
 
 test('rolling retry requests only failed clients and leaves successful clients out of retry scope', () => {

@@ -1744,6 +1744,7 @@ function buildPnlClientScopeSql_(clientIds) {
 
 function replacePnlSnapshotScope_(range, rows, variant, successfulClientIds) {
   const contract = getPnlBigQueryContract_(variant);
+  const martTableName = [BQ_CONFIG.projectId, 'mart', 'mart_' + BQ_CONFIG.snapshotsTableIds[contract.variant].replace(/_snapshots$/, '')].join('.');
   const snapshotWeek = String(range && range.snapshotWeek || '').trim();
   const snapshotType = normalizePnlSnapshotType_(range && range.snapshotType || PNL_SNAPSHOT_TYPE_WEEKLY);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotWeek)) throw new Error('Invalid P&L SnapshotWeek: ' + snapshotWeek);
@@ -1784,24 +1785,28 @@ function replacePnlSnapshotScope_(range, rows, variant, successfulClientIds) {
       }, BQ_CONFIG.projectId, blob);
       waitForPnlBigQueryJob_(inserted.jobReference, 120000);
     }
+    const scopeWhere = "WHERE SnapshotWeek = DATE '" + snapshotWeek + "'" +
+      " AND COALESCE(SnapshotType, 'WEEKLY') = '" + snapshotType + "'" +
+      (ids.length ? ' AND ClientId IN (' + buildPnlClientScopeSql_(ids) + ')' : '');
     const statements = [
       'BEGIN TRANSACTION;',
-      'DELETE FROM `' + contract.tableName + '`',
-      "WHERE SnapshotWeek = DATE '" + snapshotWeek + "'",
-      "  AND COALESCE(SnapshotType, 'WEEKLY') = '" + snapshotType + "'" +
-        (ids.length ? ' AND ClientId IN (' + buildPnlClientScopeSql_(ids) + ')' : '') + ';'
+      'DELETE FROM `' + contract.tableName + '` ' + scopeWhere + ';',
+      'DELETE FROM `' + martTableName + '` ' + scopeWhere + ';'
     ];
     if (prepared.length) {
       const columns = PNL_EXPORT_COLUMNS[contract.variant].map(column => '`' + column + '`').join(', ');
-      statements.push('INSERT INTO `' + contract.tableName + '` (' + columns + ')', 'SELECT ' + columns,
-        'FROM `' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId].join('.') + '`;');
+      const stage = [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId].join('.');
+      [contract.tableName, martTableName].forEach(destination => {
+        statements.push('INSERT INTO `' + destination + '` (' + columns + ')',
+          'SELECT ' + columns + ' FROM `' + stage + '`;');
+      });
     }
     statements.push('COMMIT TRANSACTION;');
     const queryResult = runPnlBigQueryQuery_(statements.join('\n'));
     return {
       mode: ids.length ? 'successful_clients_replace' : 'snapshot_type_replace',
       variant: contract.variant, jobId: queryResult.jobReference && queryResult.jobReference.jobId || null,
-      destinationTable: contract.tableName, snapshotWeek: snapshotWeek, snapshotType: snapshotType,
+      destinationTable: contract.tableName, martTable: martTableName, snapshotWeek: snapshotWeek, snapshotType: snapshotType,
       successfulClientCount: ids.length || null, rowCount: prepared.length, state: 'DONE'
     };
   } finally {
@@ -1944,6 +1949,38 @@ function updateProfitAndLossSheetExport() {
   }
 }
 
+function verifyPnlMartParity_(snapshotWeek, snapshotType, variant, clientIds) {
+  const contract = getPnlBigQueryContract_(variant);
+  const martTableName = [BQ_CONFIG.projectId, 'mart', 'mart_' + BQ_CONFIG.snapshotsTableIds[contract.variant].replace(/_snapshots$/, '')].join('.');
+  const normalizedType = normalizePnlSnapshotType_(snapshotType || PNL_SNAPSHOT_TYPE_WEEKLY);
+  const ids = Array.from(new Set((clientIds || []).map(id => String(id || '').trim()).filter(Boolean)));
+  const scope = "WHERE SnapshotWeek = DATE '" + snapshotWeek + "'" +
+    " AND COALESCE(SnapshotType, 'WEEKLY') = '" + normalizedType + "'" +
+    (ids.length ? ' AND ClientId IN (' + buildPnlClientScopeSql_(ids) + ')' : '');
+  const sql = [
+    'WITH raw_scope AS (SELECT * FROM `' + contract.tableName + '` ' + scope + '),',
+    'mart_scope AS (SELECT * FROM `' + martTableName + '` ' + scope + ')',
+    'SELECT',
+    '  (SELECT COUNT(*) FROM raw_scope) AS raw_count,',
+    '  (SELECT COUNT(*) FROM mart_scope) AS mart_count,',
+    '  (SELECT COUNT(*) FROM (SELECT * FROM raw_scope EXCEPT DISTINCT SELECT * FROM mart_scope)) AS raw_only,',
+    '  (SELECT COUNT(*) FROM (SELECT * FROM mart_scope EXCEPT DISTINCT SELECT * FROM raw_scope)) AS mart_only'
+  ].join('\n');
+  const result = runPnlBigQueryQuery_(sql);
+  const values = result.rows && result.rows.length ? result.rows[0].f : [];
+  const rawCount = Number(values[0] ? values[0].v : 0);
+  const martCount = Number(values[1] ? values[1].v : 0);
+  const rawOnly = Number(values[2] ? values[2].v : 0);
+  const martOnly = Number(values[3] ? values[3].v : 0);
+  if (rawCount !== martCount || rawOnly || martOnly) {
+    throw new Error('P&L mart parity verification failed. ' + JSON.stringify({
+      variant: contract.variant, snapshotWeek: snapshotWeek, snapshotType: normalizedType,
+      rawCount: rawCount, martCount: martCount, rawOnly: rawOnly, martOnly: martOnly
+    }));
+  }
+  return { status: 'passed', table: martTableName, rowCount: martCount };
+}
+
 function loadPnlVariantSnapshot_(snapshot, options) {
   const settings = options || {};
   const hasClientFailures = Array.isArray(snapshot.clientFailures) && snapshot.clientFailures.length > 0;
@@ -1956,13 +1993,17 @@ function loadPnlVariantSnapshot_(snapshot, options) {
     useClientScope ? snapshot.successfulClientIds : null,
     snapshot.range.snapshotType
   );
+  const martVerification = verifyPnlMartParity_(
+    snapshot.range.snapshotWeek, snapshot.range.snapshotType, snapshot.variant,
+    useClientScope ? snapshot.successfulClientIds : null
+  );
   return {
     variant: snapshot.variant, rowCount: snapshot.rowCount, clientResults: snapshot.clientResults,
     validation: snapshot.validation, reconciliation: snapshot.reconciliation,
     entityConfiguration: snapshot.entityConfiguration || null,
     successfulClientIds: snapshot.successfulClientIds || [],
     clientFailures: snapshot.clientFailures || [],
-    loadResult: loadResult, verification: verification
+    loadResult: loadResult, verification: verification, martVerification: martVerification
   };
 }
 
@@ -2241,15 +2282,16 @@ function buildPnlReportViewSql_(viewName, tableId, snapshotType, byClass, latest
     'SnapshotType'
   ];
   const where = ["COALESCE(SnapshotType, 'WEEKLY') = '" + snapshotType + "'"];
+  const martTableName = BQ_CONFIG.projectId + '.mart.mart_' + tableId.replace(/_snapshots$/, '');
   if (latestOnly) {
     where.push('SnapshotWeek = (SELECT MAX(SnapshotWeek) FROM `' +
-      BQ_CONFIG.projectId + '.' + BQ_CONFIG.rawDatasetId + '.' + tableId +
+      martTableName +
       "` WHERE COALESCE(SnapshotType, 'WEEKLY') = '" + snapshotType + "')");
   }
   return [
     'CREATE OR REPLACE VIEW `' + BQ_CONFIG.projectId + '.views.' + viewName + '` AS',
     'SELECT', '  ' + columns.join(',\n  '),
-    'FROM `' + BQ_CONFIG.projectId + '.' + BQ_CONFIG.rawDatasetId + '.' + tableId + '`',
+    'FROM `' + martTableName + '`',
     'WHERE ' + where.join('\n  AND '),
     'ORDER BY SnapshotWeek DESC, SnapshotDate DESC, Entity ASC, ClientName ASC, ClientId ASC,',
     '  RecordGroupOrder ASC, RecordOrder ASC'

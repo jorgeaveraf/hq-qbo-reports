@@ -553,6 +553,11 @@ function executePaymentBackfillClient_(state, client) {
     rowCount: snapshot.rows.length,
     paymentCount: snapshot.paymentCount
   });
+  const martScope = "ClientId = '" + escapePaymentBackfillBigQueryString_(client.id) + "'" +
+    " AND TxnDate >= DATE '" + plan.startDate + "'" +
+    " AND TxnDate <= DATE '" + plan.horizonDate + "'";
+  syncPaymentMartScope_(martScope);
+  verifyPaymentMartScope_(martScope);
   return {
     clientId: client.id,
     clientName: client.name,

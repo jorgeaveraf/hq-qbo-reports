@@ -66,7 +66,7 @@ function getJournalBackfillCoverage_() {
     "  FORMAT_DATE('%F', MIN(SnapshotWeek)) AS oldest_snapshot_week,",
     "  FORMAT_DATE('%F', MAX(SnapshotWeek)) AS newest_snapshot_week,",
     '  COUNT(DISTINCT SnapshotWeek) AS partition_count',
-    'FROM `' + JOURNAL_BIGQUERY_TABLE + '`'
+    'FROM `' + JOURNAL_MART_TABLE + '`'
   ].join('\n')));
 }
 
@@ -123,7 +123,7 @@ function countJournalBackfillPartitionRows_(snapshotWeek) {
   if (!normalized) throw new Error('Invalid Journal Entries backfill SnapshotWeek.');
   const result = runBigQueryQuery_([
     'SELECT COUNT(*) AS row_count',
-    'FROM `' + JOURNAL_BIGQUERY_TABLE + '`',
+    'FROM `' + JOURNAL_MART_TABLE + '`',
     "WHERE SnapshotWeek = DATE '" + escapeJournalBigQueryString_(normalized) + "'"
   ].join('\n'));
   return Number(
@@ -714,15 +714,21 @@ function processJournalSeptemberIncidentBackfill() {
       }
       if (state.periodIndex >= state.periods.length) state.currentStage = 'data_source_sheets';
     } else if (state.currentStage === 'data_source_sheets') {
-      state.dataSourceSheets = refreshJournalConnectedSheetsStage_('data_source_sheets');
-      state.currentStage = 'extracts';
-      state.stageAttempts = 0;
+      const refresh = advanceJournalConnectedSheetsStage_(state, 'data_source_sheets');
+      if (refresh) {
+        state.dataSourceSheets = refresh;
+        state.currentStage = 'extracts';
+        state.stageAttempts = 0;
+      }
     } else if (state.currentStage === 'extracts') {
-      state.extracts = refreshJournalConnectedSheetsStage_('extracts');
-      state.currentStage = 'completed';
-      state.status = 'completed';
-      state.completedAt = new Date().toISOString();
-      state.stageAttempts = 0;
+      const refresh = advanceJournalConnectedSheetsStage_(state, 'extracts');
+      if (refresh) {
+        state.extracts = refresh;
+        state.currentStage = 'completed';
+        state.status = 'completed';
+        state.completedAt = new Date().toISOString();
+        state.stageAttempts = 0;
+      }
     } else {
       throw new Error('Unsupported Journal incident repair stage: ' + state.currentStage);
     }
