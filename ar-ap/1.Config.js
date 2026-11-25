@@ -40,6 +40,23 @@ const AGING_DIRECT_EXPORT_CONFIG = {
   lockWaitMs: 5000
 };
 
+const AGING_REFRESH_COMMAND = {
+  envelopeContractType: 'qbo_report_refresh_envelope',
+  envelopeContractVersion: '1.0',
+  payloadContractType: 'qbo_report_refresh_command',
+  payloadContractVersion: '1.0',
+  reportKey: 'aging',
+  secretProperty: 'QBO_AGING_REFRESH_COMMAND_SECRET',
+  stateProperty: 'QBO_AGING_REFRESH_LATEST_RUN',
+  workerHandler: 'runQueuedAgingRefresh',
+  maxAgeSeconds: 600,
+  futureToleranceSeconds: 120,
+  triggerDelayMs: 1000,
+  lockWaitMs: 5000,
+  queuedStaleMs: 30 * 60 * 1000,
+  runningStaleMs: 10 * 60 * 1000
+};
+
 const AGING_ENTITY_CONTROL = {
   reportKey: 'aging',
   spreadsheetIdProperty: 'QBO_CONTROL_SPREADSHEET_ID',

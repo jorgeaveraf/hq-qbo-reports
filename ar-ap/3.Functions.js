@@ -416,8 +416,21 @@ function buildAgingEntityConfigurationSummary_(selection) {
 
 function doPost(e) {
   let response;
+  let rejectionEvent = 'aging_entity_configuration_push_rejected';
   try {
-    response = handleAgingEntityConfigurationPush_(e);
+    const rawBody = String(e && e.postData && e.postData.contents || '').trim();
+    let envelope = null;
+    try {
+      envelope = rawBody ? JSON.parse(rawBody) : null;
+    } catch (ignored) {
+      // Preserve the configuration-push handler's existing validation response.
+    }
+    if (envelope && envelope.contract_type === AGING_REFRESH_COMMAND.envelopeContractType) {
+      rejectionEvent = 'aging_refresh_command_rejected';
+      response = handleAgingRefreshCommand_(envelope);
+    } else {
+      response = handleAgingEntityConfigurationPush_(e);
+    }
   } catch (error) {
     response = {
       success: false,
@@ -425,7 +438,7 @@ function doPost(e) {
       reportKey: AGING_ENTITY_CONTROL.reportKey,
       error: error.message
     };
-    Logger.log(JSON.stringify({ event: 'aging_entity_configuration_push_rejected', error: error.message }));
+    Logger.log(JSON.stringify({ event: rejectionEvent, error: error.message }));
   }
   return createAgingJsonResponse_(response);
 }
