@@ -139,7 +139,8 @@ test('Journal continuation skips a failed entity, processes later entities, then
   };
   const context = load('journal-entries/5.Deployment.js', {
     JOURNAL_OPERATIONAL_DEPLOYMENT: { maxClientsPerExecution: 50, executionBudgetMs: 999999 },
-    JOURNAL_BIGQUERY_TABLE: 'p.d.t'
+    JOURNAL_BIGQUERY_TABLE: 'p.d.t',
+    JOURNAL_MART_TABLE: 'p.mart.mart_journal_entry'
   });
   context.readJournalBigQueryCheckpoint_ = () => checkpoint;
   context.journalBigQueryCheckpointMatchesState_ = () => true;
@@ -176,6 +177,7 @@ test('AR/AP continuation skips a failed entity, processes later entities, then s
     clients_with_rows_count: 0, report_row_counts: { AR: 0, AP: 0 }, row_count: 0,
     unique_row_count: 0, open_amount_cents: { AR: 0, AP: 0 }, partition_initialized: true,
     stale_cleanup_job_id: 'cleanup', stale_cleanup_completed: true,
+    mart_stale_cleanup_completed: true, mart_latest_completed: true,
     current_client: null, successful_client_ids: [], client_failures: [],
     verification: { status: 'passed' }, entity_configuration: {}, schema_validation: {}
   };
@@ -186,6 +188,11 @@ test('AR/AP continuation skips a failed entity, processes later entities, then s
   context.agingBigQueryCheckpointMatchesState_ = () => true;
   context.agingExecutionBudgetReached_ = () => false;
   context.persistAgingBigQueryCheckpoint_ = () => {};
+  context.buildAgingBigQueryJobId_ = () => 'verification-job';
+  context.buildAgingMartVerificationQuery_ = () => 'SELECT 1';
+  context.ensureAgingBigQueryQueryJob_ = () => ({ done: true });
+  context.getAgingBigQueryQueryResult_ = () => ({ done: true, result: {} });
+  context.parseAgingVerificationResult_ = () => ({ status: 'passed' });
   const processed = [];
   context.processAgingBigQueryCheckpointClient_ = cp => {
     const client = cp.clients[cp.next_client_index];

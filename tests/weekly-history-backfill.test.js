@@ -236,6 +236,7 @@ test('P&L subset load preserves clients already present in the partition', () =>
     status: 'passed', expectedRowCount: count, actualRowCount: count,
     missingKeyCount: 0, uniqueKeyCount: count
   });
+  pnl.verifyPnlMartParity_ = () => ({ status: 'passed' });
   pnl.loadPnlVariantSnapshot_({
     range: { snapshotWeek: '2026-07-20', snapshotType: 'WEEKLY' },
     rows: [{ ClientId: 'missing-c' }], rowCount: 1, variant: 'normal',
@@ -268,6 +269,7 @@ test('Invoice subset execution preserves clients already present in the partitio
     return { state: 'DONE' };
   };
   invoices.verifyInvoiceSnapshotPartition_ = () => ({ status: 'passed' });
+  invoices.verifyInvoiceMartScope_ = () => ({ status: 'passed' });
   invoices.persistInvoiceSchemaBaselineUpdates_ = () => ({ status: 'unchanged' });
   invoices.executeInvoiceBigQuerySnapshot_({}, {
     range: { snapshotWeek: '2026-07-20' }, clientIds: ['missing-c']

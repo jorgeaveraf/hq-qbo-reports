@@ -141,6 +141,7 @@ const AGING_BIGQUERY_SCHEMA = [
 
 const AGING_BIGQUERY_COLUMNS = AGING_BIGQUERY_SCHEMA.map(field => field.name);
 const AGING_BIGQUERY_TABLE = [BQ_CONFIG.projectId, BQ_CONFIG.datasetId, BQ_CONFIG.tableId].join('.');
+const AGING_MART_TABLE = [BQ_CONFIG.projectId, 'mart', 'mart_aging'].join('.');
 
 const AGING_SHEET_REFRESH_CONFIG = {
   sourceSheets: [],

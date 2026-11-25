@@ -2713,14 +2713,7 @@ function snapshotInvoicesToBigQuery() {
   }
 
   try {
-    const snapshotResult = executeInvoiceRollingBigQuerySnapshot_();
-    const consumptionViews = verifyInvoiceConsumptionViews_();
-    const connectedSheets = refreshInvoiceConnectedSheetsPipeline_();
-    return {
-      ...snapshotResult,
-      consumptionViews: consumptionViews,
-      connectedSheets: connectedSheets
-    };
+    return startInvoiceRollingReconciliation();
   } finally {
     lock.releaseLock();
   }
@@ -2749,6 +2742,7 @@ function executeInvoiceBigQuerySnapshot_(loadedEntityConfiguration, options) {
     hierarchyValidation,
     useClientScope ? result.successfulClientIds : null
   );
+  const martVerification = verifyInvoiceMartScope_([result.range.snapshotWeek], useClientScope ? result.successfulClientIds : null);
   const baselinePersistence = persistInvoiceSchemaBaselineUpdates_(
     result.schemaBaselineUpdates
   );
@@ -2768,7 +2762,8 @@ function executeInvoiceBigQuerySnapshot_(loadedEntityConfiguration, options) {
     successfulClientIds: result.successfulClientIds,
     clientFailures: result.clientFailures,
     loadResult: loadResult,
-    verification: verification
+    verification: verification,
+    martVerification: martVerification
   };
 
   Logger.log(JSON.stringify(executionResult, null, 2));
@@ -2793,6 +2788,26 @@ function buildInvoiceClientScopeSql_(clientIds) {
   const ids = Array.from(new Set((clientIds || []).map(id => String(id || '').trim()).filter(Boolean)));
   if (!ids.length) throw new Error('At least one successful Invoice client is required.');
   return ids.map(id => "'" + escapeInvoiceBigQueryString_(id) + "'").join(', ');
+}
+
+// Materialize the invoice hierarchy decision in mart. Raw keeps every row.
+function buildInvoiceMartInsertSql_(scopeWhere) {
+  const raw = [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, BQ_CONFIG.snapshotsTableId].join('.');
+  const mart = [BQ_CONFIG.projectId, BQ_CONFIG.martDatasetId, 'mart_invoice'].join('.');
+  const columns = INVOICE_EXPORT_COLUMNS.map(column => '`' + column + '`').join(', ');
+  const selected = INVOICE_EXPORT_COLUMNS.map(column => 'invoices.`' + column + '`').join(', ');
+  return [
+    'INSERT INTO `' + mart + '` (' + columns + ', IsVisible)',
+    'SELECT ' + selected + ',',
+    '  NOT EXISTS (SELECT 1 FROM `' + raw + '` AS voided_headers',
+    '    WHERE voided_headers.SnapshotWeek = invoices.SnapshotWeek',
+    '      AND voided_headers.ClientId = invoices.ClientId',
+    '      AND voided_headers.InvoiceId = invoices.InvoiceId',
+    "      AND voided_headers.RecordType = 'HEADER'",
+    '      AND COALESCE(voided_headers.IsVoided, FALSE)) AS IsVisible',
+    'FROM `' + raw + '` AS invoices',
+    'WHERE ' + scopeWhere + ';'
+  ].join('\n');
 }
 
 function replaceInvoiceSnapshotClients_(range, rows, successfulClientIds) {
@@ -2835,6 +2850,11 @@ function replaceInvoiceSnapshotClients_(range, rows, successfulClientIds) {
       const columns = INVOICE_EXPORT_COLUMNS.map(column => '`' + column + '`').join(', ');
       statements.push('INSERT INTO `' + tableReference + '` (' + columns + ')', 'SELECT ' + columns,
         'FROM `' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId].join('.') + '`;');
+    }
+    const martReference = [BQ_CONFIG.projectId, BQ_CONFIG.martDatasetId, 'mart_invoice'].join('.');
+    statements.push('DELETE FROM `' + martReference + '`', "WHERE SnapshotWeek = DATE '" + snapshotWeek + "'", '  AND ClientId IN (' + buildInvoiceClientScopeSql_(ids) + ');');
+    if (prepared.length) {
+      statements.push(buildInvoiceMartInsertSql_("invoices.SnapshotWeek = DATE '" + snapshotWeek + "' AND invoices.ClientId IN (" + buildInvoiceClientScopeSql_(ids) + ')'));
     }
     statements.push('COMMIT TRANSACTION;');
     runBigQuerySingleRowQuery_(statements.join('\n'));
@@ -2884,6 +2904,7 @@ function replaceInvoiceSnapshotPartition_(range, rows) {
   };
   const insertedJob = BigQuery.Jobs.insert(job, BQ_CONFIG.projectId, blob);
   const completedJob = waitForBigQueryJob_(insertedJob.jobReference, 120000);
+  syncInvoiceMartPartition_(snapshotWeek);
   return {
     mode: 'partition_replace', jobId: completedJob.jobReference.jobId,
     destinationTable: [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, destinationTableId].join('.'),
@@ -3058,6 +3079,10 @@ function runBigQuerySingleRowQuery_(query) {
     );
   }
 
+  if (result.errors && result.errors.length) {
+    throw new Error('Invoice BigQuery query failed: ' + JSON.stringify(result.errors));
+  }
+
   if (!result.rows || !result.rows.length) return {};
 
   const fields = result.schema && Array.isArray(result.schema.fields)
@@ -3085,8 +3110,47 @@ function clearEmptyInvoicePartition_(snapshotWeek) {
     Utilities.sleep(500);
     result = BigQuery.Jobs.getQueryResults(BQ_CONFIG.projectId, result.jobReference.jobId);
   }
+  syncInvoiceMartPartition_(snapshotWeek);
   return {
     mode: 'empty_partition_clear', jobId: result.jobReference.jobId, destinationTable: tableReference,
     snapshotWeek: snapshotWeek, rowCount: 0, state: 'DONE'
   };
+}
+
+function syncInvoiceMartPartition_(snapshotWeek) {
+  const raw = [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, BQ_CONFIG.snapshotsTableId].join('.');
+  const mart = [BQ_CONFIG.projectId, BQ_CONFIG.martDatasetId, 'mart_invoice'].join('.');
+  const q = String.fromCharCode(96);
+  const week = "DATE '" + snapshotWeek + "'";
+  runBigQuerySingleRowQuery_([
+    'BEGIN TRANSACTION;',
+    'DELETE FROM ' + q + mart + q + ' WHERE SnapshotWeek = ' + week + ';',
+    buildInvoiceMartInsertSql_('invoices.SnapshotWeek = ' + week),
+    'COMMIT TRANSACTION;'
+  ].join('\n'));
+}
+
+function verifyInvoiceMartScope_(weeks, clientIds) {
+  const weekSql = (weeks || []).map(week => "DATE '" + String(week) + "'").join(', ');
+  if (!weekSql) throw new Error('Invoice mart verification requires a week scope.');
+  const ids = Array.from(new Set((clientIds || []).map(id => String(id || '').trim()).filter(Boolean)));
+  const where = 'SnapshotWeek IN (' + weekSql + ')' + (ids.length ? ' AND ClientId IN (' + buildInvoiceClientScopeSql_(ids) + ')' : '');
+  const raw = [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, BQ_CONFIG.snapshotsTableId].join('.');
+  const mart = [BQ_CONFIG.projectId, BQ_CONFIG.martDatasetId, 'mart_invoice'].join('.');
+  const q = String.fromCharCode(96);
+  const result = runBigQuerySingleRowQuery_([
+    'WITH r AS (SELECT * FROM ' + q + raw + q + ' WHERE ' + where + '),',
+    'm AS (SELECT * EXCEPT(IsVisible) FROM ' + q + mart + q + ' WHERE ' + where + ')',
+    'SELECT',
+    '  (SELECT COUNT(*) FROM r) AS raw_count,',
+    '  (SELECT COUNT(*) FROM m) AS mart_count,',
+    '  (SELECT COUNT(*) FROM (SELECT * FROM r EXCEPT DISTINCT SELECT * FROM m)) AS raw_only,',
+    '  (SELECT COUNT(*) FROM (SELECT * FROM m EXCEPT DISTINCT SELECT * FROM r)) AS mart_only,' ,
+    '  (SELECT COUNT(*) FROM ' + q + mart + q + ' AS invoices WHERE ' + where + ' AND IsVisible) AS visible_count,' ,
+    '  (SELECT COUNT(*) FROM r AS invoices WHERE NOT EXISTS (SELECT 1 FROM r AS voided_headers WHERE voided_headers.SnapshotWeek = invoices.SnapshotWeek AND voided_headers.ClientId = invoices.ClientId AND voided_headers.InvoiceId = invoices.InvoiceId AND voided_headers.RecordType = \'HEADER\' AND COALESCE(voided_headers.IsVoided, FALSE))) AS expected_visible_count'
+  ].join('\n'));
+  if (Number(result.raw_count) !== Number(result.mart_count) || Number(result.raw_only) !== 0 || Number(result.mart_only) !== 0 || Number(result.visible_count) !== Number(result.expected_visible_count)) {
+    throw new Error('Invoice raw/mart scope mismatch: ' + JSON.stringify(result));
+  }
+  return { status: 'passed', rawCount: Number(result.raw_count), martCount: Number(result.mart_count), weeks: weeks.length, clientCount: ids.length };
 }

@@ -1353,7 +1353,7 @@ function queryAgingSnapshotExportRows_(snapshotDate) {
       currency,
       source,
       client_id
-    FROM \`${AGING_BIGQUERY_TABLE}\`
+    FROM \`${AGING_MART_TABLE}\`
     WHERE snapshot_date = @snapshot_date
   `;
   const request = {
@@ -1874,6 +1874,39 @@ function buildAgingClientDeleteQuery_(snapshotDate, clientId) {
   );
 }
 
+function buildAgingMartClientSyncQuery_(snapshotDate, clientId) {
+  const date = escapeAgingBigQueryString_(snapshotDate);
+  const id = escapeAgingBigQueryString_(clientId);
+  return [
+    'BEGIN TRANSACTION;',
+    'DELETE FROM `' + AGING_MART_TABLE + '`',
+    "WHERE snapshot_date = DATE '" + date + "' AND client_id = '" + id + "';",
+    'INSERT INTO `' + AGING_MART_TABLE + '` (' + AGING_BIGQUERY_COLUMNS.join(', ') + ')',
+    'SELECT ' + AGING_BIGQUERY_COLUMNS.join(', '),
+    'FROM `' + AGING_BIGQUERY_TABLE + '`',
+    "WHERE snapshot_date = DATE '" + date + "' AND client_id = '" + id + "';",
+    'COMMIT TRANSACTION;'
+  ].join('\n');
+}
+
+function buildAgingMartStaleClientsDeleteQuery_(snapshotDate, clientIds) {
+  return buildAgingStaleClientsDeleteQuery_(snapshotDate, clientIds)
+    .replace('`' + AGING_BIGQUERY_TABLE + '`', '`' + AGING_MART_TABLE + '`');
+}
+
+function buildAgingMartLatestRefreshQuery_() {
+  return [
+    'UPDATE `' + AGING_MART_TABLE + '` AS target',
+    'SET IsLatest = (target.snapshot_date = latest.snapshot_date)',
+    'FROM (',
+    '  SELECT entity, report_type, MAX(snapshot_date) AS snapshot_date',
+    '  FROM `' + AGING_MART_TABLE + '`',
+    '  GROUP BY entity, report_type',
+    ') AS latest',
+    'WHERE target.entity = latest.entity AND target.report_type = latest.report_type'
+  ].join('\n');
+}
+
 function buildAgingVerificationQuery_(snapshotDate, clientIds) {
   const scopedClientIds = Array.from(new Set(
     (clientIds || []).map(clientId => String(clientId || '').trim()).filter(Boolean)
@@ -1896,6 +1929,11 @@ function buildAgingVerificationQuery_(snapshotDate, clientIds) {
         "'" + escapeAgingBigQueryString_(clientId) + "'").join(', ') + ')'
       : null
   ].filter(line => line !== null).join('\n');
+}
+
+function buildAgingMartVerificationQuery_(snapshotDate, clientIds) {
+  return buildAgingVerificationQuery_(snapshotDate, clientIds)
+    .replace('`' + AGING_BIGQUERY_TABLE + '`', '`' + AGING_MART_TABLE + '`');
 }
 
 function buildAgingStaleClientsDeleteQuery_(snapshotDate, clientIds) {

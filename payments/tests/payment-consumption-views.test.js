@@ -14,7 +14,7 @@ function loadContext() {
   return context;
 }
 
-test('consumption views expose the linked document number as column T without changing raw storage', () => {
+test('consumption views retain their names and columns while reading the consolidated mart', () => {
   const context = loadContext();
   const plan = context.getPaymentConsumptionViewPlan();
 
@@ -28,7 +28,7 @@ test('consumption views expose the linked document number as column T without ch
 
   for (const view of [accumulated, latest]) {
     assert.equal(view.preservesRawVoidedRows, true);
-    assert.match(view.sql, /FROM `qbo-gateway-reporting\.raw\.payment_snapshots`/);
+    assert.match(view.sql, /FROM `qbo-gateway-reporting\.mart\.mart_payment`/);
     assert.match(
       view.sql,
       /LineAmountSigned,\n  LinkedTxnType,\n  LinkedTxnReferenceNumber,\n  LinkedTxnOpenBalance,/
@@ -39,10 +39,10 @@ test('consumption views expose the linked document number as column T without ch
   assert.match(accumulated.sql, /CREATE OR REPLACE VIEW `qbo-gateway-reporting\.views\.vw_payment_reports_accumulated`/);
   assert.doesNotMatch(accumulated.sql, /COALESCE\(IsVoided, FALSE\) = FALSE/);
   assert.match(latest.sql, /CREATE OR REPLACE VIEW `qbo-gateway-reporting\.views\.vw_payment_report_latest`/);
-  assert.match(latest.sql, /COALESCE\(IsVoided, FALSE\) = FALSE/);
+  assert.match(latest.sql, /WHERE IsLatest = TRUE/);
 });
 
-test('consumption view verification passes only for the filtered latest partition', () => {
+test('consumption view verification passes for the filtered consolidated mart', () => {
   const context = loadContext();
   context.runBigQueryQuery_ = sql => {
     assert.match(sql, /INFORMATION_SCHEMA\.VIEWS/);
@@ -67,7 +67,7 @@ test('consumption view verification passes only for the filtered latest partitio
 
   const result = context.verifyPaymentConsumptionViews_();
   assert.equal(result.status, 'passed');
-  assert.equal(result.latestExcludesVoided, true);
+  assert.equal(result.latestIsMartProjection, true);
   assert.equal(result.documentNumberIsColumnT, true);
   assert.equal(result.accumulatedActualRowCount, 100);
   assert.equal(result.voidedRowCount, 0);

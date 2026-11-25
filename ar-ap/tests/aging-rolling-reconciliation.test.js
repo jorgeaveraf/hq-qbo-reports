@@ -274,6 +274,8 @@ test('a final-validation failure blocks every Connected Sheets refresh', () => {
   install(context, 'readAgingRollingState_', () => state);
   install(context, 'persistAgingRollingState_', () => 100);
   install(context, 'deleteAgingRollingTriggers_', () => {});
+  install(context, 'ensureAgingRollingRecoveryTrigger_', () => {});
+  install(context, 'deleteAgingRollingRecoveryTriggers_', () => {});
   install(context, 'replaceAgingRollingSchedule_', () => {});
   install(context, 'validateAgingRollingReconciliation_', () => {
     throw new Error('validation failed');
@@ -286,6 +288,108 @@ test('a final-validation failure blocks every Connected Sheets refresh', () => {
   assert.throws(() => context.processAgingRollingReconciliation(), /validation failed/);
   assert.equal(refreshCount, 0);
   assert.equal(state.status, 'failed');
+});
+
+test('a running extract is polled without starting a second refresh', () => {
+  const context = loadContext();
+  let refreshCount = 0;
+  let state = 'RUNNING';
+  let refreshedAt = new Date('2026-11-10T22:34:43.166Z');
+  const target = {
+    name: 'AR/AP_accumulated', type: 'extract',
+    refresh: () => { refreshCount++; },
+    getStatus: () => ({
+      getExecutionState: () => state,
+      getErrorCode: () => 'NONE',
+      getErrorMessage: () => null,
+      getLastExecutionTime: () => state === 'SUCCESS' ? refreshedAt : null,
+      getLastRefreshedTime: () => refreshedAt,
+      isTruncated: () => false
+    })
+  };
+  context.SpreadsheetApp = { enableBigQueryExecution: () => {} };
+  install(context, 'getAgingConnectedSheetTargets_', () => [target]);
+  const spreadsheet = { waitForAllDataExecutionsCompletion: () => {} };
+  const first = context.refreshAgingConnectedSheetsStage_(
+    'extracts', spreadsheet, { allowPending: true }
+  );
+  assert.equal(first.status, 'pending');
+  assert.equal(refreshCount, 1);
+
+  const stillRunning = context.refreshAgingConnectedSheetsStage_(
+    'extracts', spreadsheet, { allowPending: true, refresh: false,
+      startedAt: first.startedAt, baselineRefreshedAt: first.baselineRefreshedAt }
+  );
+  assert.equal(stillRunning.status, 'pending');
+  assert.equal(refreshCount, 1);
+
+  state = 'SUCCESS';
+  refreshedAt = new Date('2026-11-15T09:40:00Z');
+  const completed = context.refreshAgingConnectedSheetsStage_(
+    'extracts', spreadsheet, { allowPending: true, refresh: false,
+      startedAt: first.startedAt, baselineRefreshedAt: first.baselineRefreshedAt }
+  );
+  assert.equal(completed.status, 'passed');
+  assert.equal(refreshCount, 1);
+});
+
+test('rolling worker preserves the extract stage while it is pending', () => {
+  const context = loadContext();
+  const state = {
+    status: 'pending', currentStage: 'extracts', updatedAt: null,
+    extractRefresh: null
+  };
+  const calls = [];
+  context.LockService = { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) };
+  install(context, 'readAgingRollingState_', () => state);
+  install(context, 'persistAgingRollingState_', () => 100);
+  install(context, 'deleteAgingRollingTriggers_', () => {});
+  install(context, 'ensureAgingRollingRecoveryTrigger_', () => {});
+  install(context, 'deleteAgingRollingRecoveryTriggers_', () => {});
+  install(context, 'replaceAgingRollingSchedule_', () => {});
+  install(context, 'refreshAgingConnectedSheetsStage_', (stage, sheet, options) => {
+    calls.push(options.refresh);
+    return calls.length === 1
+      ? { status: 'pending', startedAt: new Date().toISOString(),
+          baselineRefreshedAt: { 'AR/AP_accumulated': '2026-11-10T22:34:43.166Z' },
+          pendingNames: ['AR/AP_accumulated'] }
+      : { status: 'passed', stage: 'extracts' };
+  });
+
+  context.processAgingRollingReconciliation();
+  assert.equal(state.currentStage, 'extracts');
+  assert.equal(state.status, 'pending');
+  context.processAgingRollingReconciliation();
+  assert.equal(state.currentStage, 'completed');
+  assert.equal(state.status, 'completed');
+  assert.deepEqual(calls, [true, false]);
+});
+
+test('the failed running extract can resume without returning to BigQuery', () => {
+  const context = loadContext();
+  const state = {
+    operationId: 'original-operation', status: 'failed', currentStage: 'extracts',
+    finalValidation: { status: 'passed' }, dataSourceSheets: { status: 'passed' },
+    updatedAt: '2026-11-15T09:38:34Z',
+    lastError: 'Aging Connected Sheets stage failed: ' + JSON.stringify({
+      stage: 'extracts', failures: [{ name: 'AR/AP_accumulated', state: 'RUNNING',
+        errorCode: 'NONE', truncated: false,
+        lastRefreshedAt: '2026-11-10T22:34:43.166Z' }]
+    })
+  };
+  let scheduled = false;
+  context.LockService = { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) };
+  install(context, 'readAgingRollingState_', () => state);
+  install(context, 'persistAgingRollingState_', () => 100);
+  install(context, 'ensureAgingRollingRecoveryTrigger_', () => {});
+  install(context, 'replaceAgingRollingSchedule_', () => { scheduled = true; });
+
+  const resumed = context.resumeFailedAgingRollingExtract();
+  assert.equal(resumed.operationId, 'original-operation');
+  assert.equal(state.status, 'pending');
+  assert.equal(state.currentStage, 'extracts');
+  assert.equal(state.extractRefresh.startedAt, '2026-11-15T09:38:34Z');
+  assert.equal(scheduled, true);
 });
 
 test('productive rolling state stays below the Script Property safety limit', () => {

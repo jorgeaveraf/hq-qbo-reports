@@ -158,6 +158,7 @@ test('replaces only the planned weeks and successful clients in one transaction'
   assert.match(query, /ClientId IN \('client-a'\)/);
   assert.doesNotMatch(query, /client-b/);
   assert.doesNotMatch(query, /2026-07-20/);
+  assert.match(query, /UPDATE `[^`]+`\nSET IsLatest = [^;]+\nWHERE TRUE;/);
   assert.match(query, /COMMIT TRANSACTION;/);
   assert.equal(removedTable, 'payment_rolling_stage_12345678123412341234123456789abc');
 });

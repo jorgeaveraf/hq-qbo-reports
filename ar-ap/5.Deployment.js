@@ -484,6 +484,8 @@ function executeAgingBigQueryContinuationStage_(state) {
     );
   }
   checkpoint.stale_cleanup_completed = checkpoint.stale_cleanup_completed === true;
+  checkpoint.mart_stale_cleanup_completed = checkpoint.mart_stale_cleanup_completed === true;
+  checkpoint.mart_latest_completed = checkpoint.mart_latest_completed === true;
 
   Logger.log(JSON.stringify({
     event: 'aging_bigquery_continuation_started',
@@ -569,7 +571,47 @@ function executeAgingBigQueryContinuationStage_(state) {
   }
   if (checkpoint.is_client_subset) checkpoint.stale_cleanup_completed = true;
 
-  if (checkpoint.verification) {
+  if (!checkpoint.mart_stale_cleanup_completed && !checkpoint.is_client_subset) {
+    if (!checkpoint.mart_stale_cleanup_job_id) {
+      checkpoint.mart_stale_cleanup_job_id = buildAgingBigQueryJobId_(
+        checkpoint.operation_id, checkpoint.range.snapshotDate, 'mart_stale_cleanup', '', 0
+      );
+      persistAgingBigQueryCheckpoint_(checkpoint);
+    }
+    const martCleanup = ensureAgingBigQueryQueryJob_(
+      checkpoint.mart_stale_cleanup_job_id,
+      buildAgingMartStaleClientsDeleteQuery_(
+        checkpoint.range.snapshotDate,
+        checkpoint.clients.map(client => client.id)
+      )
+    );
+    if (!martCleanup.done) {
+      return yieldAgingBigQueryCheckpoint_(checkpoint, 'mart_stale_cleanup_pending');
+    }
+    checkpoint.mart_stale_cleanup_completed = true;
+    persistAgingBigQueryCheckpoint_(checkpoint);
+  }
+  if (checkpoint.is_client_subset) checkpoint.mart_stale_cleanup_completed = true;
+
+  if (!checkpoint.mart_latest_completed) {
+    if (!checkpoint.mart_latest_job_id) {
+      checkpoint.mart_latest_job_id = buildAgingBigQueryJobId_(
+        checkpoint.operation_id, checkpoint.range.snapshotDate, 'mart_latest_refresh', '', checkpoint.verification_generation
+      );
+      persistAgingBigQueryCheckpoint_(checkpoint);
+    }
+    const latestRefresh = ensureAgingBigQueryQueryJob_(
+      checkpoint.mart_latest_job_id,
+      buildAgingMartLatestRefreshQuery_()
+    );
+    if (!latestRefresh.done) {
+      return yieldAgingBigQueryCheckpoint_(checkpoint, 'mart_latest_refresh_pending');
+    }
+    checkpoint.mart_latest_completed = true;
+    persistAgingBigQueryCheckpoint_(checkpoint);
+  }
+
+  if (checkpoint.verification && checkpoint.mart_verification) {
     return buildAgingBigQueryCompletionResult_(checkpoint);
   }
 
@@ -580,12 +622,13 @@ function executeAgingBigQueryContinuationStage_(state) {
       expectedRowCount: 0,
       actualRowCount: null
     };
+    checkpoint.mart_verification = checkpoint.verification;
     checkpoint.updated_at = new Date().toISOString();
     persistAgingBigQueryCheckpoint_(checkpoint);
     return buildAgingBigQueryCompletionResult_(checkpoint);
   }
 
-  if (!checkpoint.verification_job_id) {
+  if (!checkpoint.verification && !checkpoint.verification_job_id) {
     checkpoint.verification_job_id = buildAgingBigQueryJobId_(
       checkpoint.operation_id,
       checkpoint.range.snapshotDate,
@@ -596,35 +639,71 @@ function executeAgingBigQueryContinuationStage_(state) {
     persistAgingBigQueryCheckpoint_(checkpoint);
   }
 
-  const verificationJob = ensureAgingBigQueryQueryJob_(
-    checkpoint.verification_job_id,
-    buildAgingVerificationQuery_(
+  if (!checkpoint.verification) {
+    const verificationJob = ensureAgingBigQueryQueryJob_(
+      checkpoint.verification_job_id,
+      buildAgingVerificationQuery_(
+        checkpoint.range.snapshotDate,
+        checkpoint.successful_client_ids
+      )
+    );
+
+    if (!verificationJob.done) {
+      return yieldAgingBigQueryCheckpoint_(
+        checkpoint,
+        'verification_job_pending'
+      );
+    }
+
+    const verificationQueryResult = getAgingBigQueryQueryResult_(
+      checkpoint.verification_job_id
+    );
+
+    if (!verificationQueryResult.done) {
+      return yieldAgingBigQueryCheckpoint_(
+        checkpoint,
+        'verification_results_pending'
+      );
+    }
+
+    checkpoint.verification = parseAgingVerificationResult_(
       checkpoint.range.snapshotDate,
-      checkpoint.successful_client_ids
+      verificationQueryResult.result,
+      {
+        rowCount: checkpoint.row_count,
+        uniqueRowCount: checkpoint.unique_row_count,
+        clientCount: checkpoint.clients_with_rows_count,
+        reportRowCounts: checkpoint.report_row_counts,
+        openAmountCents: checkpoint.open_amount_cents
+      }
+    );
+    checkpoint.updated_at = new Date().toISOString();
+    persistAgingBigQueryCheckpoint_(checkpoint);
+  }
+
+  if (!checkpoint.mart_verification_job_id) {
+    checkpoint.mart_verification_job_id = buildAgingBigQueryJobId_(
+      checkpoint.operation_id, checkpoint.range.snapshotDate,
+      'mart_verification', '', checkpoint.verification_generation
+    );
+    persistAgingBigQueryCheckpoint_(checkpoint);
+  }
+  const martVerificationJob = ensureAgingBigQueryQueryJob_(
+    checkpoint.mart_verification_job_id,
+    buildAgingMartVerificationQuery_(
+      checkpoint.range.snapshotDate, checkpoint.successful_client_ids
     )
   );
-
-  if (!verificationJob.done) {
-    return yieldAgingBigQueryCheckpoint_(
-      checkpoint,
-      'verification_job_pending'
-    );
+  if (!martVerificationJob.done) {
+    return yieldAgingBigQueryCheckpoint_(checkpoint, 'mart_verification_job_pending');
   }
-
-  const verificationQueryResult = getAgingBigQueryQueryResult_(
-    checkpoint.verification_job_id
-  );
-
-  if (!verificationQueryResult.done) {
-    return yieldAgingBigQueryCheckpoint_(
-      checkpoint,
-      'verification_results_pending'
-    );
+  const martVerificationResult = getAgingBigQueryQueryResult_(checkpoint.mart_verification_job_id);
+  if (!martVerificationResult.done) {
+    return yieldAgingBigQueryCheckpoint_(checkpoint, 'mart_verification_results_pending');
   }
-
-  checkpoint.verification = parseAgingVerificationResult_(
+  checkpoint.mart_verification = parseAgingVerificationResult_(
     checkpoint.range.snapshotDate,
-    verificationQueryResult.result,
+    martVerificationResult.result,
     {
       rowCount: checkpoint.row_count,
       uniqueRowCount: checkpoint.unique_row_count,
@@ -685,6 +764,10 @@ function initializeAgingBigQueryCheckpoint_(state) {
     client_failures: [],
     stale_cleanup_job_id: null,
     stale_cleanup_completed: false,
+    mart_stale_cleanup_job_id: null,
+    mart_stale_cleanup_completed: false,
+    mart_latest_job_id: null,
+    mart_latest_completed: false,
     continuation_count: 0,
     partition_initialized: false,
     partition_clear_generation: 0,
@@ -693,6 +776,8 @@ function initializeAgingBigQueryCheckpoint_(state) {
     verification_generation: 0,
     verification_job_id: null,
     verification: null,
+    mart_verification_job_id: null,
+    mart_verification: null,
     current_client: null,
     created_at: now,
     updated_at: now
@@ -744,6 +829,7 @@ function processAgingBigQueryCheckpointClient_(checkpoint, executionStartedAt) {
       report_reconciliation: clientSnapshot.reportReconciliation,
       delete_job_id: null,
       load_job_id: null,
+      mart_sync_job_id: null,
       prepared_at: new Date().toISOString()
     };
     checkpoint.current_client = currentClient;
@@ -844,6 +930,26 @@ function processAgingBigQueryCheckpointClient_(checkpoint, executionStartedAt) {
           loadResult.outputRows
       );
     }
+  }
+
+  if (!currentClient.mart_sync_job_id) {
+    currentClient.mart_sync_job_id = buildAgingBigQueryJobId_(
+      checkpoint.operation_id,
+      checkpoint.range.snapshotDate,
+      'mart_client_sync',
+      client.id,
+      currentClient.generation
+    );
+    persistAgingBigQueryCheckpoint_(checkpoint);
+  }
+  const martSync = ensureAgingBigQueryQueryJob_(
+    currentClient.mart_sync_job_id,
+    buildAgingMartClientSyncQuery_(checkpoint.range.snapshotDate, client.id)
+  );
+  if (!martSync.done) {
+    currentClient.phase = 'mart_syncing';
+    persistAgingBigQueryCheckpoint_(checkpoint);
+    return { status: 'yielded', reason: 'mart_client_sync_pending', checkpoint };
   }
 
   checkpoint.row_count += currentClient.row_count;
@@ -992,6 +1098,7 @@ function buildAgingBigQueryCompletionResult_(checkpoint) {
     },
     continuationCount: checkpoint.continuation_count,
     verification: checkpoint.verification,
+    martVerification: checkpoint.mart_verification,
     successfulClientIds: checkpoint.successful_client_ids,
     clientFailures: checkpoint.client_failures
   };
@@ -1081,6 +1188,11 @@ function prepareAgingBigQueryCheckpointForRetry_(operationId) {
 
   checkpoint.verification = null;
   checkpoint.verification_job_id = null;
+  checkpoint.mart_verification = null;
+  checkpoint.mart_verification_job_id = null;
+  checkpoint.verification_generation = Number(checkpoint.verification_generation || 0) + 1;
+  checkpoint.mart_latest_completed = false;
+  checkpoint.mart_latest_job_id = null;
 
   if (!checkpoint.partition_initialized) {
     checkpoint.partition_clear_generation =
@@ -1092,6 +1204,7 @@ function prepareAgingBigQueryCheckpointForRetry_(operationId) {
     checkpoint.current_client.phase = 'prepared';
     checkpoint.current_client.delete_job_id = null;
     checkpoint.current_client.load_job_id = null;
+    checkpoint.current_client.mart_sync_job_id = null;
   } else if (checkpoint.next_client_index >= checkpoint.clients.length) {
     deleteAgingBigQueryCheckpoint_(operationId);
     return null;
@@ -1102,14 +1215,23 @@ function prepareAgingBigQueryCheckpointForRetry_(operationId) {
   return checkpoint;
 }
 
-function refreshAgingConnectedSheetsStage_(stage, spreadsheetOverride) {
+function refreshAgingConnectedSheetsStage_(stage, spreadsheetOverride, options) {
+  const settings = options || {};
   const spreadsheet = spreadsheetOverride || getAgingReportSpreadsheet_();
   SpreadsheetApp.enableBigQueryExecution();
   const targets = getAgingConnectedSheetTargets_(spreadsheet, stage);
-  targets.forEach(target => target.refresh());
-  spreadsheet.waitForAllDataExecutionsCompletion(
-    AGING_SHEET_REFRESH_CONFIG.timeoutSeconds
-  );
+  const startedAt = settings.startedAt || new Date().toISOString();
+  const baselineRefreshedAt = settings.baselineRefreshedAt ||
+    (settings.allowPending ? Object.fromEntries(targets.map(target => {
+      const refreshed = target.getStatus().getLastRefreshedTime();
+      return [target.name, refreshed ? refreshed.toISOString() : null];
+    })) : null);
+  if (settings.refresh !== false) {
+    targets.forEach(target => target.refresh());
+    spreadsheet.waitForAllDataExecutionsCompletion(
+      AGING_SHEET_REFRESH_CONFIG.timeoutSeconds
+    );
+  }
 
   const executions = targets.map(target => {
     const status = target.getStatus();
@@ -1128,9 +1250,9 @@ function refreshAgingConnectedSheetsStage_(stage, spreadsheetOverride) {
   });
 
   const failures = executions.filter(item =>
-    item.state !== 'SUCCESS' ||
-    item.errorCode !== 'NONE' ||
-    item.truncated
+    item.errorCode !== 'NONE' || item.truncated ||
+    (item.state !== 'SUCCESS' &&
+      !(settings.allowPending && item.state === 'RUNNING'))
   );
 
   if (failures.length) {
@@ -1138,6 +1260,23 @@ function refreshAgingConnectedSheetsStage_(stage, spreadsheetOverride) {
       'Aging Connected Sheets stage failed: ' +
         JSON.stringify({ stage, failures })
     );
+  }
+
+  if (settings.allowPending) {
+    const pending = executions.filter(item =>
+      item.state === 'RUNNING' ||
+      !item.lastRefreshedAt ||
+      (baselineRefreshedAt[item.name] &&
+        item.lastRefreshedAt <= baselineRefreshedAt[item.name])
+    );
+    if (pending.length) {
+      const result = {
+        status: 'pending', stage, startedAt, baselineRefreshedAt,
+        pendingNames: pending.map(item => item.name)
+      };
+      Logger.log(JSON.stringify({ event: 'aging_connected_sheets_stage_pending', ...result }));
+      return result;
+    }
   }
 
   const result = {

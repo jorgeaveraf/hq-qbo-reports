@@ -1632,6 +1632,7 @@ function replacePaymentSnapshotPartition_(range, rows) {
   if (!insertedJob || !insertedJob.jobReference) throw new Error('BigQuery did not return a job reference for the Payments load.');
   const completedJob = waitForBigQueryJob_(insertedJob.jobReference, 120000);
   const outputRows = completedJob.statistics && completedJob.statistics.load && completedJob.statistics.load.outputRows !== undefined ? Number(completedJob.statistics.load.outputRows) : null;
+  syncPaymentMartScope_("SnapshotWeek = DATE '" + snapshotWeek + "'");
   return { mode: 'partition_replace', jobId: completedJob.jobReference.jobId, destinationTable: [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, destinationTableId].join('.'), snapshotWeek, partitionId, rowCount: rows.length, outputRows, payloadBytes: blob.getBytes().length, state: completedJob.status.state };
 }
 
@@ -1733,6 +1734,9 @@ function replacePaymentSnapshotClients_(range, rows, successfulClientIds) {
       'BEGIN TRANSACTION;',
       'DELETE FROM `' + PAYMENT_BIGQUERY_TABLE + '`',
       "WHERE SnapshotWeek = DATE '" + snapshotWeek + "'",
+      '  AND ClientId IN (' + clientScopeSql + ');',
+      'DELETE FROM `' + PAYMENT_BIGQUERY_MART_TABLE + '`',
+      "WHERE SnapshotWeek = DATE '" + snapshotWeek + "'",
       '  AND ClientId IN (' + clientScopeSql + ');'
     ];
     if (preparedRows.length) {
@@ -1740,10 +1744,13 @@ function replacePaymentSnapshotClients_(range, rows, successfulClientIds) {
       statements.push(
         'INSERT INTO `' + PAYMENT_BIGQUERY_TABLE + '` (' + columns + ')',
         'SELECT ' + columns,
+        'FROM `' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId].join('.') + '`;',
+        'INSERT INTO `' + PAYMENT_BIGQUERY_MART_TABLE + '` (' + columns + ')',
+        'SELECT ' + columns,
         'FROM `' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId].join('.') + '`;'
       );
     }
-    statements.push('COMMIT TRANSACTION;');
+    statements.push(...paymentLatestRefreshStatements_(), 'COMMIT TRANSACTION;');
     const queryResult = runBigQueryQuery_(statements.join('\n'));
     return {
       mode: 'successful_clients_replace',
@@ -1808,6 +1815,7 @@ function verifyPaymentSnapshotPartition_(snapshotWeek, expectedHierarchy) {
     throw new Error('Payments partition hierarchy mismatch. Expected=' + JSON.stringify(expected) + ', actual=' + JSON.stringify(actual));
   }
   if (actual.missingKeyCount !== 0 || actual.uniqueKeyCount !== actual.rowCount) throw new Error('Payments partition idempotency verification failed: ' + JSON.stringify(actual));
+  verifyPaymentMartScope_("SnapshotWeek = DATE '" + normalizedSnapshotWeek + "'");
   return { status: 'passed', snapshotWeek: normalizedSnapshotWeek, partitionId: normalizedSnapshotWeek.replace(/-/g, ''), expectedRowCount: Number(expected.rowCount), actualRowCount: actual.rowCount, paymentCount: actual.paymentCount, headerRowCount: actual.headerCount, lineRowCount: actual.lineCount, missingKeyCount: actual.missingKeyCount, uniqueKeyCount: actual.uniqueKeyCount };
 }
 
@@ -1856,6 +1864,7 @@ function verifyPaymentSnapshotClients_(snapshotWeek, successfulClientIds, expect
   if (actual.missingKeyCount !== 0 || actual.uniqueKeyCount !== actual.rowCount) {
     throw new Error('Payments successful-client idempotency verification failed: ' + JSON.stringify(actual));
   }
+  verifyPaymentMartScope_("SnapshotWeek = DATE '" + normalizedSnapshotWeek + "' AND ClientId IN (" + buildPaymentClientScopeSql_(normalizedClientIds) + ')');
   return {
     status: 'passed_successful_clients',
     snapshotWeek: normalizedSnapshotWeek,
@@ -1880,9 +1889,54 @@ function runBigQueryQuery_(query) {
   return result;
 }
 
+function paymentLatestRefreshStatements_() {
+  return [
+    'UPDATE `' + PAYMENT_BIGQUERY_MART_TABLE + '`',
+    'SET IsLatest = (SnapshotWeek = (SELECT MAX(SnapshotWeek) FROM `' + PAYMENT_BIGQUERY_MART_TABLE + '`))',
+    '  AND COALESCE(IsVoided, FALSE) = FALSE',
+    'WHERE TRUE;'
+  ];
+}
+
+function syncPaymentMartScope_(scopeSql) {
+  const query = [
+    'BEGIN TRANSACTION;',
+    'DELETE FROM `' + PAYMENT_BIGQUERY_MART_TABLE + '` WHERE ' + scopeSql + ';',
+    'INSERT INTO `' + PAYMENT_BIGQUERY_MART_TABLE + '`',
+    'SELECT *, FALSE AS IsLatest FROM `' + PAYMENT_BIGQUERY_TABLE + '` WHERE ' + scopeSql + ';',
+    ...paymentLatestRefreshStatements_(),
+    'COMMIT TRANSACTION;'
+  ].join('\n');
+  return runBigQueryQuery_(query);
+}
+
+function verifyPaymentMartScope_(scopeSql) {
+  const result = runBigQueryQuery_([
+    'SELECT',
+    '  (SELECT COUNT(*) FROM `' + PAYMENT_BIGQUERY_TABLE + '` WHERE ' + scopeSql + ') AS raw_count,',
+    '  (SELECT COUNT(*) FROM `' + PAYMENT_BIGQUERY_MART_TABLE + '` WHERE ' + scopeSql + ') AS mart_count,',
+    '  (SELECT COUNT(*) FROM (SELECT * FROM `' + PAYMENT_BIGQUERY_TABLE + '` WHERE ' + scopeSql + ' EXCEPT DISTINCT SELECT * EXCEPT(IsLatest) FROM `' + PAYMENT_BIGQUERY_MART_TABLE + '` WHERE ' + scopeSql + ')) AS raw_only,',
+    '  (SELECT COUNT(*) FROM (SELECT * EXCEPT(IsLatest) FROM `' + PAYMENT_BIGQUERY_MART_TABLE + '` WHERE ' + scopeSql + ' EXCEPT DISTINCT SELECT * FROM `' + PAYMENT_BIGQUERY_TABLE + '` WHERE ' + scopeSql + ')) AS mart_only'
+  ].join('\n'));
+  const cells = result.rows && result.rows.length ? result.rows[0].f : [];
+  const counts = cells.map(cell => Number(cell && cell.v || 0));
+  if (counts.length !== 4 || counts[0] !== counts[1] || counts[2] !== 0 || counts[3] !== 0) {
+    throw new Error('Payments mart differs from raw for scope ' + scopeSql + ': ' + JSON.stringify(counts));
+  }
+  return { rawCount: counts[0], martCount: counts[1] };
+}
+
 function clearEmptyPaymentPartition_(snapshotWeek) {
   const normalizedSnapshotWeek = String(snapshotWeek || '').trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedSnapshotWeek)) throw new Error('Invalid SnapshotWeek for empty Payments partition: ' + normalizedSnapshotWeek);
-  const result = runBigQueryQuery_(['DELETE FROM `' + PAYMENT_BIGQUERY_TABLE + '`', "WHERE SnapshotWeek = DATE '" + normalizedSnapshotWeek + "'"].join('\n'));
+  const result = runBigQueryQuery_([
+    'BEGIN TRANSACTION;',
+    'DELETE FROM `' + PAYMENT_BIGQUERY_TABLE + '`',
+    "WHERE SnapshotWeek = DATE '" + normalizedSnapshotWeek + "';",
+    'DELETE FROM `' + PAYMENT_BIGQUERY_MART_TABLE + '`',
+    "WHERE SnapshotWeek = DATE '" + normalizedSnapshotWeek + "';",
+    ...paymentLatestRefreshStatements_(),
+    'COMMIT TRANSACTION;'
+  ].join('\n'));
   return { mode: 'empty_partition_clear', jobId: result.jobReference.jobId, destinationTable: PAYMENT_BIGQUERY_TABLE, snapshotWeek: normalizedSnapshotWeek, rowCount: 0, state: 'DONE' };
 }

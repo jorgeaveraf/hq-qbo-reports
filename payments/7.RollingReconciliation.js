@@ -388,6 +388,9 @@ function replacePaymentSnapshotRangeClients_(plan, rows, successfulClientIds) {
       'BEGIN TRANSACTION;',
       'DELETE FROM `' + PAYMENT_BIGQUERY_TABLE + '`',
       'WHERE SnapshotWeek IN (' + weekScopeSql + ')',
+      '  AND ClientId IN (' + clientScopeSql + ');',
+      'DELETE FROM `' + PAYMENT_BIGQUERY_MART_TABLE + '`',
+      'WHERE SnapshotWeek IN (' + weekScopeSql + ')',
       '  AND ClientId IN (' + clientScopeSql + ');'
     ];
     if (preparedRows.length) {
@@ -395,10 +398,13 @@ function replacePaymentSnapshotRangeClients_(plan, rows, successfulClientIds) {
       statements.push(
         'INSERT INTO `' + PAYMENT_BIGQUERY_TABLE + '` (' + columns + ')',
         'SELECT ' + columns,
+        'FROM `' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId].join('.') + '`;',
+        'INSERT INTO `' + PAYMENT_BIGQUERY_MART_TABLE + '` (' + columns + ')',
+        'SELECT ' + columns,
         'FROM `' + [BQ_CONFIG.projectId, BQ_CONFIG.rawDatasetId, stagingTableId].join('.') + '`;'
       );
     }
-    statements.push('COMMIT TRANSACTION;');
+    statements.push(...paymentLatestRefreshStatements_(), 'COMMIT TRANSACTION;');
     const queryResult = runBigQueryQuery_(statements.join('\n'));
     return {
       mode: 'rolling_successful_clients_replace',

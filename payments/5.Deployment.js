@@ -312,7 +312,7 @@ function buildPaymentAccumulatedViewSql_() {
     '  idempotency_key,',
     '  ClientId,',
     '  LoadedAt',
-    'FROM `qbo-gateway-reporting.raw.payment_snapshots`',
+    'FROM `qbo-gateway-reporting.mart.mart_payment`',
     'ORDER BY',
     '  SnapshotWeek DESC,',
     '  Entity ASC,',
@@ -353,12 +353,8 @@ function buildPaymentLatestViewSql_() {
     '  idempotency_key,',
     '  ClientId,',
     '  LoadedAt',
-    'FROM `qbo-gateway-reporting.raw.payment_snapshots`',
-    'WHERE SnapshotWeek = (',
-    '  SELECT MAX(SnapshotWeek)',
-    '  FROM `qbo-gateway-reporting.raw.payment_snapshots`',
-    ')',
-    '  AND COALESCE(IsVoided, FALSE) = FALSE',
+    'FROM `qbo-gateway-reporting.mart.mart_payment`',
+    'WHERE IsLatest = TRUE',
     'ORDER BY',
     '  Entity ASC,',
     '  ClientName ASC,',
@@ -372,7 +368,7 @@ function buildPaymentLatestViewSql_() {
 
 /**
  * Blocks a Connected Sheets refresh unless the production view is the
- * versioned, non-voided projection of the latest raw weekly partition.
+ * projection of the physical reconciled Payments mart.
  */
 function verifyPaymentConsumptionViews_() {
   const result = runBigQueryQuery_([
@@ -387,19 +383,17 @@ function verifyPaymentConsumptionViews_() {
     "    AND column_name = 'LinkedTxnReferenceNumber'",
     '), expected AS (',
     '  SELECT MAX(SnapshotWeek) AS snapshot_week',
-    '  FROM `qbo-gateway-reporting.raw.payment_snapshots`',
+    '  FROM `qbo-gateway-reporting.mart.mart_payment`',
     ')',
     'SELECT',
     "  (SELECT COUNT(*) FROM metadata) = 2 AS views_exist,",
-    "  COALESCE((SELECT REGEXP_CONTAINS(REGEXP_REPLACE(LOWER(view_definition), r'\\s+', ''), r'coalesce\\(isvoided,false\\)=false') FROM metadata WHERE table_name = 'vw_payment_report_latest'), FALSE) AS latest_excludes_voided,",
+    "  COALESCE((SELECT STRPOS(LOWER(view_definition), 'mart.mart_payment') > 0 AND STRPOS(LOWER(view_definition), 'islatest') > 0 FROM metadata WHERE table_name = 'vw_payment_report_latest'), FALSE) AS latest_is_mart_projection,",
     "  (SELECT COUNTIF(ordinal_position = 20) FROM columns) = 2 AS document_number_is_column_t,",
     '  (SELECT COUNT(*) FROM `qbo-gateway-reporting.views.vw_payment_reports_accumulated`) AS accumulated_actual_row_count,',
-    '  (SELECT COUNT(*) FROM `qbo-gateway-reporting.raw.payment_snapshots`) AS accumulated_expected_row_count,',
+    '  (SELECT COUNT(*) FROM `qbo-gateway-reporting.mart.mart_payment`) AS accumulated_expected_row_count,',
     '  (SELECT COUNT(*) FROM `qbo-gateway-reporting.views.vw_payment_report_latest`) AS actual_row_count,',
     '  (SELECT COUNT(*)',
-    '   FROM `qbo-gateway-reporting.raw.payment_snapshots`, expected',
-    '   WHERE SnapshotWeek = expected.snapshot_week',
-    '     AND COALESCE(IsVoided, FALSE) = FALSE) AS expected_row_count,',
+    '   FROM `qbo-gateway-reporting.mart.mart_payment` WHERE IsLatest = TRUE) AS expected_row_count,',
     '  (SELECT COUNTIF(COALESCE(IsVoided, FALSE)) FROM `qbo-gateway-reporting.views.vw_payment_report_latest`) AS voided_row_count,',
     '  CAST((SELECT MAX(SnapshotWeek) FROM `qbo-gateway-reporting.views.vw_payment_report_latest`) AS STRING) AS actual_snapshot_week,',
     '  CAST((SELECT snapshot_week FROM expected) AS STRING) AS expected_snapshot_week'
@@ -408,7 +402,7 @@ function verifyPaymentConsumptionViews_() {
   const values = result.rows && result.rows.length ? result.rows[0].f : [];
   const verification = {
     viewsExist: String(values[0] && values[0].v) === 'true',
-    latestExcludesVoided: String(values[1] && values[1].v) === 'true',
+    latestIsMartProjection: String(values[1] && values[1].v) === 'true',
     documentNumberIsColumnT: String(values[2] && values[2].v) === 'true',
     accumulatedActualRowCount: Number(values[3] ? values[3].v : 0),
     accumulatedExpectedRowCount: Number(values[4] ? values[4].v : 0),
@@ -421,7 +415,7 @@ function verifyPaymentConsumptionViews_() {
 
   if (
     !verification.viewsExist ||
-    !verification.latestExcludesVoided ||
+    !verification.latestIsMartProjection ||
     !verification.documentNumberIsColumnT ||
     verification.accumulatedActualRowCount !== verification.accumulatedExpectedRowCount ||
     verification.actualRowCount !== verification.expectedRowCount ||

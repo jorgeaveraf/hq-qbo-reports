@@ -66,6 +66,23 @@ test('the deployment pipeline provisions and exports sheets around BigQuery', ()
   assert.equal(context.getNextAgingDeploymentStage_(state), 'output_sheet_export');
 });
 
+test('mart replaces only the loaded client and marks latest rows in the same table', () => {
+  const context = loadAgingContext();
+  const sync = context.buildAgingMartClientSyncQuery_('2026-11-08', 'client-1');
+  assert.match(sync, /BEGIN TRANSACTION;/);
+  assert.match(sync, /DELETE FROM `qbo-gateway-reporting\.mart\.mart_aging`/);
+  assert.match(sync, /INSERT INTO `qbo-gateway-reporting\.mart\.mart_aging`/);
+  assert.match(sync, /FROM `qbo-gateway-reporting\.raw\.aging_snapshots`/);
+  assert.match(sync, /snapshot_date = DATE '2026-11-08' AND client_id = 'client-1'/);
+  assert.match(sync, /COMMIT TRANSACTION;/);
+
+  const latest = context.buildAgingMartLatestRefreshQuery_();
+  assert.match(latest, /UPDATE `qbo-gateway-reporting\.mart\.mart_aging` AS target/);
+  assert.match(latest, /MAX\(snapshot_date\)/);
+  assert.match(latest, /SET IsLatest =/);
+  assert.doesNotMatch(latest, /CREATE OR REPLACE TABLE/);
+});
+
 test('sheet provisioning creates missing sheets, adds headers, and shows hidden sheets', () => {
   const context = loadAgingContext();
   const hidden = createSheet('hidden_alias', true);

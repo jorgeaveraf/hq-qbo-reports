@@ -474,6 +474,7 @@ function processJournalConfigurationDeployment() {
         current.stages[claimedStage];
 
       yieldedStage.status = 'pending';
+      if (stageResult.reason === 'connected_sheets_pending') yieldedStage.attempts = 0;
       yieldedStage.continuation_count =
         Number(
           stageResult.continuationCount ||
@@ -717,15 +718,15 @@ function executeJournalDeploymentStage_(
   }
 
   if (stage === 'data_source_sheets') {
-    return refreshJournalConnectedSheetsStage_(
-      'data_source_sheets'
-    );
+    const result = advanceJournalConnectedSheetsStage_(state, stage);
+    persistJournalDeploymentState_(state);
+    return result || { status: 'yielded', reason: 'connected_sheets_pending' };
   }
 
   if (stage === 'extracts') {
-    return refreshJournalConnectedSheetsStage_(
-      'extracts'
-    );
+    const result = advanceJournalConnectedSheetsStage_(state, stage);
+    persistJournalDeploymentState_(state);
+    return result || { status: 'yielded', reason: 'connected_sheets_pending' };
   }
 
   throw new Error(
@@ -950,8 +951,10 @@ function executeJournalBigQueryContinuationStage_(
     },
     loadResult: {
       mode:
-        'incremental_partition_rebuild',
+        'incremental_client_week_mart_reconciliation',
       destinationTable:
+        JOURNAL_MART_TABLE,
+      rawCaptureTable:
         JOURNAL_BIGQUERY_TABLE,
       snapshotWeek:
         checkpoint.period.snapshotWeek,
@@ -1146,9 +1149,9 @@ function processJournalBigQueryCheckpointClient_(
         clientSnapshot.debitCents,
       credit_cents:
         clientSnapshot.creditCents,
-      delete_job_id:
+      mart_job_id:
         buildJournalBigQueryJobId_(
-          'journal_delete_client',
+          'journal_reconcile_client',
           checkpoint.operation_id,
           checkpoint.period.snapshotWeek,
           client.id
@@ -1181,37 +1184,16 @@ function processJournalBigQueryCheckpointClient_(
 
   const current =
     checkpoint.current_client;
-  const deleteWasAlreadyComplete =
-    getJournalBigQueryJobIfExists_(
-      current.delete_job_id
+  // A checkpoint created by an older deployment may already have a raw load
+  // job. Reuse that capture and reconcile its exact LoadedAt into mart.
+  if (!current.mart_job_id) {
+    current.mart_job_id = buildJournalBigQueryJobId_(
+      'journal_reconcile_client',
+      checkpoint.operation_id,
+      checkpoint.period.snapshotWeek,
+      client.id
     );
-
-  const deleteResult =
-    ensureJournalBigQueryQueryJob_(
-      current.delete_job_id,
-      buildJournalClientDeleteQuery_(
-        checkpoint.period.snapshotWeek,
-        client.id
-      )
-    );
-
-  if (!deleteResult.done) {
-    return {
-      completed: false,
-      reason:
-        'waiting_for_client_delete_job',
-      checkpoint
-    };
-  }
-
-  if (!deleteWasAlreadyComplete) {
-    checkpoint.query_job_count =
-      Number(checkpoint.query_job_count || 0) + 1;
-    checkpoint.updated_at =
-      new Date().toISOString();
-    persistJournalBigQueryCheckpoint_(
-      checkpoint
-    );
+    persistJournalBigQueryCheckpoint_(checkpoint);
   }
 
   if (Number(current.row_count) > 0) {
@@ -1259,12 +1241,29 @@ function processJournalBigQueryCheckpointClient_(
         Number(checkpoint.load_job_count || 0) + 1;
     }
 
-    checkpoint.last_job_id =
-      current.load_job_id;
-  } else {
-    checkpoint.last_job_id =
-      current.delete_job_id;
   }
+
+  const existingMartJob = getJournalBigQueryJobIfExists_(current.mart_job_id);
+  const martResult = ensureJournalBigQueryQueryJob_(
+    current.mart_job_id,
+    buildJournalMartClientReconcileQuery_(
+      checkpoint.period.snapshotWeek,
+      client.id,
+      checkpoint.loaded_at,
+      current.row_count
+    )
+  );
+  if (!martResult.done) {
+    return {
+      completed: false,
+      reason: 'waiting_for_client_mart_reconciliation',
+      checkpoint
+    };
+  }
+  if (!existingMartJob) {
+    checkpoint.query_job_count = Number(checkpoint.query_job_count || 0) + 1;
+  }
+  checkpoint.last_job_id = current.mart_job_id;
 
   checkpoint.total_transaction_count +=
     Number(current.transaction_count || 0);
@@ -1626,35 +1625,33 @@ function prepareJournalBigQueryCheckpointForRetry_() {
   if (checkpoint.current_client) {
     const current =
       checkpoint.current_client;
-    const deleteJob =
+    if (!current.mart_job_id) {
+      current.mart_job_id = buildJournalBigQueryJobId_(
+        'journal_reconcile_client',
+        checkpoint.operation_id,
+        checkpoint.period.snapshotWeek,
+        current.client_id
+      );
+      updated = true;
+    }
+    const martJob =
       getJournalBigQueryJobIfExists_(
-        current.delete_job_id
+        current.mart_job_id
       );
 
     if (
-      deleteJob &&
-      deleteJob.status &&
-      deleteJob.status.state === 'DONE' &&
-      deleteJob.status.errorResult
+      martJob &&
+      martJob.status &&
+      martJob.status.state === 'DONE' &&
+      martJob.status.errorResult
     ) {
-      current.delete_job_id =
+      current.mart_job_id =
         buildJournalBigQueryJobId_(
-          'journal_delete_retry_' + generation,
+          'journal_reconcile_retry_' + generation,
           checkpoint.operation_id,
           checkpoint.period.snapshotWeek,
           current.client_id
         );
-
-      if (Number(current.row_count || 0) > 0) {
-        current.load_job_id =
-          buildJournalBigQueryJobId_(
-            'journal_load_retry_' + generation,
-            checkpoint.operation_id,
-            checkpoint.period.snapshotWeek,
-            current.client_id
-          );
-      }
-
       updated = true;
     } else if (current.load_job_id) {
       const loadJob =
@@ -1738,8 +1735,10 @@ function refreshJournalConnectedSheetsPipeline_(
 
 function refreshJournalConnectedSheetsStage_(
   stage,
-  spreadsheetOverride
+  spreadsheetOverride,
+  progress
 ) {
+  const resumable = progress !== undefined;
   const spreadsheet =
     spreadsheetOverride ||
     getJournalReportSpreadsheet_();
@@ -1752,11 +1751,16 @@ function refreshJournalConnectedSheetsStage_(
       stage
     );
 
-  targets.forEach(target => target.refresh());
-
-  spreadsheet.waitForAllDataExecutionsCompletion(
-    JE_SHEET_REFRESH_CONFIG.timeoutSeconds
-  );
+  const startedAt = progress && progress.startedAt || new Date().toISOString();
+  const baselineRefreshedAt = progress && progress.baselineRefreshedAt ||
+    Object.fromEntries(targets.map(target => {
+      const time = target.getStatus().getLastRefreshedTime();
+      return [target.name, time ? time.toISOString() : null];
+    }));
+  if (!progress || !progress.startedAt) {
+    targets.forEach(target => target.refresh());
+    spreadsheet.waitForAllDataExecutionsCompletion(JE_SHEET_REFRESH_CONFIG.timeoutSeconds);
+  }
 
   const executions = targets.map(target => {
     const status = target.getStatus();
@@ -1792,7 +1796,8 @@ function refreshJournalConnectedSheetsStage_(
 
   const failures = executions.filter(
     execution =>
-      execution.state !== 'SUCCESS' ||
+      (execution.state !== 'SUCCESS' && !(resumable && execution.state === 'RUNNING')) ||
+      execution.errorCode !== 'NONE' ||
       execution.truncated
   );
 
@@ -1804,6 +1809,16 @@ function refreshJournalConnectedSheetsStage_(
           failures
         })
     );
+  }
+  const pending = resumable ? executions.filter(execution =>
+    execution.state === 'RUNNING' || !execution.lastRefreshedAt ||
+    (baselineRefreshedAt[execution.name] &&
+      execution.lastRefreshedAt <= baselineRefreshedAt[execution.name])) : [];
+  if (pending.length) {
+    if (Date.now() - Date.parse(startedAt) >= 30 * 60 * 1000) {
+      throw new Error('Journal Entries Connected Sheets stage timed out: ' + stage);
+    }
+    return { status: 'pending', stage, startedAt, baselineRefreshedAt };
   }
 
   const result = {
@@ -1820,6 +1835,21 @@ function refreshJournalConnectedSheetsStage_(
     ...result
   }));
 
+  return result;
+}
+
+function advanceJournalConnectedSheetsStage_(state, stage) {
+  const progress = state.connectedSheetRefresh && state.connectedSheetRefresh.stage === stage
+    ? state.connectedSheetRefresh : {};
+  const result = refreshJournalConnectedSheetsStage_(stage, null, progress);
+  if (result.status === 'pending') {
+    state.connectedSheetRefresh = {
+      stage, startedAt: result.startedAt, baselineRefreshedAt: result.baselineRefreshedAt
+    };
+    state.stageAttempts = 0;
+    return null;
+  }
+  state.connectedSheetRefresh = null;
   return result;
 }
 

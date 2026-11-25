@@ -68,6 +68,7 @@ function queueInvoiceConfigurationDeployment_(pushPayload, configuration, option
   };
 
   persistInvoiceDeploymentState_(state);
+  ensureInvoiceDeploymentRecoveryTrigger_();
   scheduleInvoiceDeploymentWorker_(
     INVOICE_OPERATIONAL_DEPLOYMENT.initialDelayMs,
     state.currentStage,
@@ -87,6 +88,43 @@ function createInvoiceDeploymentStageState_() {
     lastAttempt: null,
     result: null
   };
+}
+
+function queueInvoiceWeeklySheetRefresh_(snapshotResult, consumptionViews) {
+  const current = readInvoiceDeploymentState_();
+  if (current && ['pending', 'processing'].includes(current.status)) {
+    current.weeklyRefreshRequestedAt = new Date().toISOString();
+    persistInvoiceDeploymentState_(current);
+    ensureInvoiceDeploymentRecoveryTrigger_();
+    return { status: 'queued_after_current', operationId: current.operationId };
+  }
+  const now = new Date().toISOString();
+  const state = {
+    schemaVersion: '1.0', operationId: Utilities.getUuid(),
+    operationKey: 'invoice_weekly_sheet_refresh|' + now,
+    reportKey: INVOICE_ENTITY_CONTROL.reportKey,
+    configurationVersion: null, configurationHash: null, configuration: null,
+    status: 'pending', currentStage: 'data_source_sheets',
+    attempts: { bigquery: 0, data_source_sheets: 0, extracts: 0 },
+    createdAt: now, updatedAt: now, completedAt: null,
+    lastError: null, lastAttempt: null, trigger: null,
+    stages: {
+      configuration: { status: 'completed', attempts: 0, startedAt: now, completedAt: now, error: null, result: null },
+      bigquery: { status: 'completed', attempts: 1, startedAt: now, completedAt: now, error: null,
+        result: { status: snapshotResult.status, consumptionViews: consumptionViews.status } },
+      data_source_sheets: createInvoiceDeploymentStageState_(),
+      extracts: createInvoiceDeploymentStageState_()
+    }
+  };
+  persistInvoiceDeploymentState_(state);
+  ensureInvoiceDeploymentRecoveryTrigger_();
+  scheduleInvoiceDeploymentWorker_(INVOICE_OPERATIONAL_DEPLOYMENT.nextStageDelayMs, state.currentStage, state.operationId);
+  return { status: 'queued', operationId: state.operationId };
+}
+
+function queueDeferredInvoiceWeeklySheetRefresh_(completedState) {
+  if (!completedState.weeklyRefreshRequestedAt) return null;
+  return queueInvoiceWeeklySheetRefresh_({ status: 'passed' }, { status: 'passed' });
 }
 
 function processInvoiceConfigurationDeployment() {
@@ -110,8 +148,11 @@ function processInvoiceConfigurationDeployment() {
     let state = readInvoiceDeploymentState_();
     if (!state) return { status: 'no_pending_deployment' };
     if (state.status === 'completed' || state.status === 'failed') {
+      deleteInvoiceDeploymentRecoveryTriggers_();
+      queueDeferredInvoiceWeeklySheetRefresh_(state);
       return summarizeInvoiceDeploymentState_(state, false);
     }
+    ensureInvoiceDeploymentRecoveryTrigger_();
 
     if (state.status === 'processing') {
       const stageState = state.stages && state.stages[state.currentStage];
@@ -151,6 +192,7 @@ function processInvoiceConfigurationDeployment() {
       state.trigger = null;
       persistInvoiceDeploymentState_(state);
       updateInvoiceDeploymentReceipt_(state);
+      queueDeferredInvoiceWeeklySheetRefresh_(state);
       return summarizeInvoiceDeploymentState_(state, false);
     }
 
@@ -162,6 +204,9 @@ function processInvoiceConfigurationDeployment() {
     stageState.completedAt = null;
     stageState.error = null;
     stageState.lastAttempt = null;
+    if (claimedStage === 'data_source_sheets' || claimedStage === 'extracts') {
+      stageState.refreshRequestedAt = stageState.refreshRequestedAt || now;
+    }
     state.attempts[claimedStage] = stageState.attempts;
     state.status = 'processing';
     state.currentStage = claimedStage;
@@ -203,6 +248,16 @@ function processInvoiceConfigurationDeployment() {
 
     const completedAt = new Date().toISOString();
     const completedStage = current.stages[claimedStage];
+    if (stageResult.status === 'pending') {
+      completedStage.status = 'pending';
+      completedStage.attempts = Math.max(0, Number(completedStage.attempts || 0) - 1);
+      current.attempts[claimedStage] = completedStage.attempts;
+      current.status = 'pending';
+      current.updatedAt = completedAt;
+      persistInvoiceDeploymentState_(current);
+      scheduleInvoiceDeploymentWorker_(INVOICE_OPERATIONAL_DEPLOYMENT.busyRetryDelayMs, claimedStage, current.operationId);
+      return summarizeInvoiceDeploymentState_(current, false);
+    }
     completedStage.status = 'completed';
     completedStage.completedAt = completedAt;
     completedStage.error = null;
@@ -237,6 +292,8 @@ function processInvoiceConfigurationDeployment() {
       persistInvoiceDeploymentState_(current);
       updateInvoiceDeploymentReceipt_(current);
       deleteInvoiceDeploymentWorkerTriggers_();
+      deleteInvoiceDeploymentRecoveryTriggers_();
+      queueDeferredInvoiceWeeklySheetRefresh_(current);
     }
 
     const result = summarizeInvoiceDeploymentState_(current, false);
@@ -294,6 +351,8 @@ function processInvoiceConfigurationDeployment() {
         );
       } else {
         deleteInvoiceDeploymentWorkerTriggers_();
+        deleteInvoiceDeploymentRecoveryTriggers_();
+        queueDeferredInvoiceWeeklySheetRefresh_(current);
       }
     }
 
@@ -343,10 +402,10 @@ function executeInvoiceDeploymentStage_(stage, state) {
   }
 
   if (stage === 'data_source_sheets') {
-    return refreshInvoiceConnectedSheetsStage_('data_source_sheets');
+    return refreshInvoiceConnectedSheetsStage_('data_source_sheets', null, state);
   }
   if (stage === 'extracts') {
-    return refreshInvoiceConnectedSheetsStage_('extracts');
+    return refreshInvoiceConnectedSheetsStage_('extracts', null, state);
   }
   throw new Error('Unsupported Invoice deployment stage: ' + stage);
 }
@@ -412,7 +471,8 @@ function getInvoiceConsumptionDeploymentPlan() {
     modifiesBigQuery: false,
     schemaChanges: [
       'ALTER TABLE `qbo-gateway-reporting.raw.invoice_snapshots` ADD COLUMN IF NOT EXISTS PrivateNote STRING',
-      'ALTER TABLE `qbo-gateway-reporting.raw.invoice_snapshots` ADD COLUMN IF NOT EXISTS IsVoided BOOL'
+      'ALTER TABLE `qbo-gateway-reporting.raw.invoice_snapshots` ADD COLUMN IF NOT EXISTS IsVoided BOOL',
+      'ALTER TABLE `qbo-gateway-reporting.mart.mart_invoice` ADD COLUMN IF NOT EXISTS IsVisible BOOL'
     ],
     views: [
       {
@@ -434,11 +494,27 @@ function getInvoiceConsumptionDeploymentPlan() {
 function deployInvoiceConsumptionSchemaAndViews() {
   const plan = getInvoiceConsumptionDeploymentPlan();
   plan.schemaChanges.forEach(sql => runBigQuerySingleRowQuery_(sql));
+  // Backfill before the views switch. All existing weeks remain represented in mart.
+  runBigQuerySingleRowQuery_(buildInvoiceMartVisibilityBackfillSql_());
   plan.views.forEach(view => runBigQuerySingleRowQuery_(view.sql));
   const verification = verifyInvoiceConsumptionViews_();
   const result = { status: 'completed', verification: verification };
   Logger.log(JSON.stringify({ event: 'invoice_consumption_schema_and_views_deployed', ...result }));
   return result;
+}
+
+function buildInvoiceMartVisibilityBackfillSql_() {
+  return [
+    'UPDATE `qbo-gateway-reporting.mart.mart_invoice` AS invoices',
+    'SET IsVisible = NOT EXISTS (',
+    '  SELECT 1 FROM `qbo-gateway-reporting.raw.invoice_snapshots` AS voided_headers',
+    '  WHERE voided_headers.SnapshotWeek = invoices.SnapshotWeek',
+    '    AND voided_headers.ClientId = invoices.ClientId',
+    '    AND voided_headers.InvoiceId = invoices.InvoiceId',
+    "    AND voided_headers.RecordType = 'HEADER'",
+    '    AND COALESCE(voided_headers.IsVoided, FALSE)',
+    ') WHERE invoices.IsVisible IS NULL'
+  ].join('\n');
 }
 
 function buildInvoiceViewColumns_(alias) {
@@ -501,8 +577,8 @@ function buildInvoiceHistoryViewSql_() {
     'CREATE OR REPLACE VIEW `qbo-gateway-reporting.views.vw_invoice_reports` AS',
     'SELECT',
     ...buildInvoiceViewColumns_('invoices'),
-    'FROM `qbo-gateway-reporting.raw.invoice_snapshots` AS invoices',
-    'WHERE ' + buildInvoiceActiveHierarchyPredicate_('invoices').join('\n'),
+    'FROM `qbo-gateway-reporting.mart.mart_invoice` AS invoices',
+    'WHERE invoices.IsVisible',
     'ORDER BY',
     '  invoices.SnapshotWeek DESC,',
     '  invoices.SnapshotDate DESC,',
@@ -518,14 +594,14 @@ function buildInvoiceLatestViewSql_() {
     'CREATE OR REPLACE VIEW `qbo-gateway-reporting.views.vw_latest_invoice_reports` AS',
     'WITH latest_snapshot AS (',
     '  SELECT MAX(SnapshotWeek) AS SnapshotWeek',
-    '  FROM `qbo-gateway-reporting.raw.invoice_snapshots`',
+    '  FROM `qbo-gateway-reporting.mart.mart_invoice`',
     ')',
     'SELECT',
     ...buildInvoiceViewColumns_('invoices'),
-    'FROM `qbo-gateway-reporting.raw.invoice_snapshots` AS invoices',
+    'FROM `qbo-gateway-reporting.mart.mart_invoice` AS invoices',
     'INNER JOIN latest_snapshot',
     '  ON invoices.SnapshotWeek = latest_snapshot.SnapshotWeek',
-    'WHERE ' + buildInvoiceActiveHierarchyPredicate_('invoices').join('\n'),
+    'WHERE invoices.IsVisible',
     'ORDER BY',
     '  invoices.SnapshotWeek DESC,',
     '  invoices.SnapshotDate DESC,',
@@ -548,7 +624,7 @@ function verifyInvoiceConsumptionViews_() {
     '  WHERE ' + buildInvoiceActiveHierarchyPredicate_('invoices').join('\n'),
     '), latest_snapshot AS (',
     '  SELECT MAX(SnapshotWeek) AS SnapshotWeek',
-    '  FROM `qbo-gateway-reporting.raw.invoice_snapshots`',
+    '  FROM `qbo-gateway-reporting.mart.mart_invoice`',
     '), voided_invoice_keys AS (',
     '  SELECT DISTINCT SnapshotWeek, ClientId, InvoiceId',
     '  FROM `qbo-gateway-reporting.raw.invoice_snapshots`',
@@ -556,11 +632,12 @@ function verifyInvoiceConsumptionViews_() {
     ')',
     'SELECT',
     '  (SELECT COUNT(*) FROM metadata) = 2 AS views_exist,',
-    "  (SELECT COUNTIF(REGEXP_CONTAINS(REGEXP_REPLACE(LOWER(view_definition), r'\\s+', ''), r'coalesce\\(voided_headers.isvoided,false\\)')) FROM metadata) = 2 AS exclude_voided,",
+    "  (SELECT COUNTIF(STRPOS(LOWER(view_definition), 'invoices.isvisible') > 0 AND STRPOS(LOWER(view_definition), 'voided_headers') = 0 AND STRPOS(LOWER(view_definition), '.raw.') = 0) FROM metadata) = 2 AS exclude_voided,",
     '  (SELECT COUNT(*) FROM `qbo-gateway-reporting.views.vw_invoice_reports`) AS history_actual_rows,',
     '  (SELECT COUNT(*) FROM active_raw) AS history_expected_rows,',
     '  (SELECT COUNT(*) FROM `qbo-gateway-reporting.views.vw_latest_invoice_reports`) AS latest_actual_rows,',
     '  (SELECT COUNT(*) FROM active_raw, latest_snapshot WHERE active_raw.SnapshotWeek = latest_snapshot.SnapshotWeek) AS latest_expected_rows,',
+    '  (SELECT COUNT(*) FROM `qbo-gateway-reporting.mart.mart_invoice` WHERE IsVisible IS NULL) AS unresolved_mart_rows,',
     '  (SELECT COUNT(*)',
     '   FROM `qbo-gateway-reporting.views.vw_invoice_reports` AS visible',
     '   INNER JOIN voided_invoice_keys USING (SnapshotWeek, ClientId, InvoiceId)) AS visible_voided_rows',
@@ -573,14 +650,16 @@ function verifyInvoiceConsumptionViews_() {
     historyExpectedRows: Number(result.history_expected_rows || 0),
     latestActualRows: Number(result.latest_actual_rows || 0),
     latestExpectedRows: Number(result.latest_expected_rows || 0),
-    visibleVoidedRows: Number(result.visible_voided_rows || 0)
+    visibleVoidedRows: Number(result.visible_voided_rows || 0),
+    unresolvedMartRows: Number(result.unresolved_mart_rows || 0)
   };
   if (
     !verification.viewsExist ||
     !verification.excludeVoided ||
     verification.historyActualRows !== verification.historyExpectedRows ||
     verification.latestActualRows !== verification.latestExpectedRows ||
-    verification.visibleVoidedRows !== 0
+    verification.visibleVoidedRows !== 0 ||
+    verification.unresolvedMartRows !== 0
   ) {
     throw new Error('Invoice consumption view validation failed: ' + JSON.stringify(verification));
   }
@@ -597,12 +676,24 @@ function refreshInvoiceConnectedSheetsPipeline_(spreadsheet) {
   };
 }
 
-function refreshInvoiceConnectedSheetsStage_(stage, spreadsheetOverride) {
+function refreshInvoiceConnectedSheetsStage_(stage, spreadsheetOverride, operationState) {
   const spreadsheet = spreadsheetOverride || getInvoiceReportSpreadsheet_();
   SpreadsheetApp.enableBigQueryExecution();
   const targets = getInvoiceConnectedSheetTargets_(spreadsheet, stage);
-  targets.forEach(target => target.refresh());
-  spreadsheet.waitForAllDataExecutionsCompletion(INVOICE_CONNECTED_SHEETS_CONFIG.timeoutSeconds);
+  const stageState = operationState && operationState.stages && operationState.stages[stage];
+  if (!stageState || !stageState.refreshIssuedAt) {
+    targets.forEach(target => target.refresh());
+    if (stageState) {
+      const current = readInvoiceDeploymentState_();
+      if (current && current.operationId === operationState.operationId) {
+        current.stages[stage].refreshIssuedAt = new Date().toISOString();
+        persistInvoiceDeploymentState_(current);
+        stageState.refreshIssuedAt = current.stages[stage].refreshIssuedAt;
+      }
+    } else {
+      spreadsheet.waitForAllDataExecutionsCompletion(INVOICE_CONNECTED_SHEETS_CONFIG.timeoutSeconds);
+    }
+  }
 
   const executions = targets.map(target => {
     const status = target.getStatus();
@@ -621,13 +712,16 @@ function refreshInvoiceConnectedSheetsStage_(stage, spreadsheetOverride) {
   });
 
   const failures = executions.filter(execution =>
-    execution.state !== 'SUCCESS' ||
-    execution.errorCode !== 'NONE' ||
-    execution.truncated === true
+    execution.errorCode !== 'NONE' || execution.truncated === true ||
+    ['ERROR', 'FAILED', 'CANCELLED'].includes(execution.state)
   );
   if (failures.length) {
     throw new Error('Invoice Connected Sheets stage failed: ' + JSON.stringify({ stage: stage, failures: failures }));
   }
+  if (stageState && executions.some(execution =>
+    execution.state !== 'SUCCESS' || !execution.lastRefreshedAt ||
+    Date.parse(execution.lastRefreshedAt) < Date.parse(stageState.refreshRequestedAt)
+  )) return { status: 'pending', stage: stage, executions: executions };
 
   const result = {
     status: 'passed',
@@ -778,6 +872,39 @@ function deleteInvoiceDeploymentWorkerTriggers_() {
   );
   triggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));
   return triggers.length;
+}
+
+function ensureInvoiceDeploymentRecoveryTrigger_() {
+  const existing = ScriptApp.getProjectTriggers().find(trigger =>
+    trigger.getHandlerFunction() === INVOICE_OPERATIONAL_DEPLOYMENT.recoveryHandler
+  );
+  if (existing) return existing;
+  return ScriptApp.newTrigger(INVOICE_OPERATIONAL_DEPLOYMENT.recoveryHandler)
+    .timeBased().everyHours(1).create();
+}
+
+function deleteInvoiceDeploymentRecoveryTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === INVOICE_OPERATIONAL_DEPLOYMENT.recoveryHandler)
+    .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+}
+
+function recoverInvoiceConfigurationDeployment() {
+  const state = readInvoiceDeploymentState_();
+  if (!state || !['pending', 'processing'].includes(state.status)) {
+    deleteInvoiceDeploymentRecoveryTriggers_();
+    if (state) queueDeferredInvoiceWeeklySheetRefresh_(state);
+    return { status: 'idle' };
+  }
+  const hasWorker = ScriptApp.getProjectTriggers().some(trigger =>
+    trigger.getHandlerFunction() === INVOICE_OPERATIONAL_DEPLOYMENT.workerHandler
+  );
+  const updatedAt = Date.parse(state.updatedAt || '');
+  const stale = !Number.isFinite(updatedAt) ||
+    Date.now() - updatedAt >= INVOICE_OPERATIONAL_DEPLOYMENT.recoveryDelayMs;
+  if (hasWorker && !stale) return { status: 'scheduled' };
+  scheduleInvoiceDeploymentWorker_(INVOICE_OPERATIONAL_DEPLOYMENT.busyRetryDelayMs, state.currentStage, state.operationId);
+  return { status: 'recovered', stage: state.currentStage };
 }
 
 function updateInvoiceDeploymentReceipt_(state) {

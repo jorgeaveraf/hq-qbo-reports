@@ -84,7 +84,18 @@ test('subset checkpoint never schedules stale cleanup outside the requested clie
   assert.equal(checkpoint.scope_mode, 'subset');
   assert.equal(checkpoint.stale_cleanup_job_id, null);
   assert.equal(checkpoint.stale_cleanup_completed, true);
-  assert.match(context.buildJournalClientDeleteQuery_('2026-10-12', 'missing'), /ClientId = 'missing'/);
+  const reconcile = context.buildJournalMartClientReconcileQuery_(
+    '2026-10-12', 'missing', '2026-10-19T00:00:00.000Z', 2
+  );
+  assert.match(reconcile, /BEGIN TRANSACTION/);
+  assert.match(reconcile, /DELETE FROM `qbo-gateway-reporting\.mart\.mart_journal_entry`/);
+  assert.match(reconcile, /INSERT INTO `qbo-gateway-reporting\.mart\.mart_journal_entry`/);
+  assert.match(reconcile, /LoadedAt = TIMESTAMP\('2026-10-19T00:00:00.000Z'\)/);
+  assert.match(reconcile, /COMMIT TRANSACTION/);
+  const empty = context.buildJournalMartClientReconcileQuery_(
+    '2026-10-12', 'missing', '2026-10-19T00:00:00.000Z', 0
+  );
+  assert.doesNotMatch(empty, /INSERT INTO/);
 });
 
 test('rolling retry requests only failed clients and leaves successful clients out of retry scope', () => {
@@ -225,11 +236,53 @@ test('worker blocks both Connected Sheets refresh stages when final validation f
   context.persistJournalRollingState_ = () => 1;
   context.replaceJournalRollingSchedule_ = () => {};
   context.deleteJournalRollingTriggers_ = () => {};
+  context.ensureJournalRollingRecoveryTrigger_ = () => {};
+  context.deleteJournalRollingRecoveryTriggers_ = () => {};
   context.validateJournalRollingReconciliation_ = () => { throw new Error('validation failed'); };
   context.refreshJournalConnectedSheetsStage_ = () => { refreshCount++; };
   assert.throws(() => context.processJournalRollingReconciliation(), /validation failed/);
   assert.equal(refreshCount, 0);
   assert.equal(state.status, 'failed');
+});
+
+test('recovery resumes an active Journal window with no worker trigger', () => {
+  const context = loadJournalRollingContext();
+  const state = { status: 'pending', updatedAt: new Date().toISOString() };
+  let resumed = 0;
+  context.readJournalRollingState_ = () => state;
+  context.ScriptApp = { getProjectTriggers: () => [] };
+  context.processJournalRollingReconciliation = () => { resumed++; return { status: 'resumed' }; };
+  assert.equal(context.recoverJournalRollingReconciliation().status, 'resumed');
+  assert.equal(resumed, 1);
+
+  context.ScriptApp = { getProjectTriggers: () => [{
+    getHandlerFunction: () => 'processJournalRollingReconciliation'
+  }] };
+  assert.equal(context.recoverJournalRollingReconciliation().status, 'scheduled');
+  assert.equal(resumed, 1);
+});
+
+test('Journal recovery trigger exists only while a window is active', () => {
+  const context = loadJournalRollingContext();
+  const triggers = [];
+  context.ScriptApp = {
+    getProjectTriggers: () => triggers,
+    newTrigger: handler => ({ timeBased: () => ({ everyHours: hours => ({
+      create: () => {
+        assert.equal(hours, 1);
+        const trigger = { getHandlerFunction: () => handler };
+        triggers.push(trigger);
+        return trigger;
+      }
+    }) }) }),
+    deleteTrigger: trigger => triggers.splice(triggers.indexOf(trigger), 1)
+  };
+  context.ensureJournalRollingRecoveryTrigger_();
+  context.ensureJournalRollingRecoveryTrigger_();
+  assert.equal(triggers.length, 1);
+  context.readJournalRollingState_ = () => ({ status: 'completed' });
+  assert.equal(context.recoverJournalRollingReconciliation().status, 'idle');
+  assert.equal(triggers.length, 0);
 });
 
 test('productive worst-case rolling state remains below Script Properties limit', () => {
