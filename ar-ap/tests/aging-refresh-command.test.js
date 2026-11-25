@@ -12,7 +12,7 @@ const OTHER_RUN_ID = '68c63eb8-04d6-459c-a93f-aeeec961e492';
 function setup() {
   const context = vm.createContext({});
   const project = path.resolve(__dirname, '..');
-  for (const file of ['1.Config.js', '3.Functions.js', '8.RefreshCommand.js']) {
+  for (const file of ['1.Config.js', '3.Functions.js']) {
     vm.runInContext(fs.readFileSync(path.join(project, file), 'utf8'), context, { filename: file });
   }
   const values = new Map([['QBO_AGING_REFRESH_COMMAND_SECRET', SECRET]]);
