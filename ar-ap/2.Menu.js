@@ -8,7 +8,6 @@ function onOpen() {
     .addItem('All entities', 'updateAgingExport')
     .addSeparator()
     .addItem('botanical', 'updateAgingExportBotanical')
-    .addItem('constellation', 'updateAgingExportConstellation')
     .addItem('punch', 'updateAgingExportPunch')
     .addItem('nova_farms', 'updateAgingExportNovaFarms')
     .addItem('headset', 'updateAgingExportHeadset')
@@ -17,7 +16,6 @@ function onOpen() {
     .addItem('wessels', 'updateAgingExportWessels')
     .addItem('fresh', 'updateAgingExportFresh')
     .addItem('eaze', 'updateAgingExportEaze')
-    .addItem('demo', 'updateAgingExportDemo')
     .addSeparator()
     .addItem('Select multiple entities...', 'showAgingEntityPicker');
 
@@ -48,7 +46,8 @@ function showAgingEntityPicker() {
 }
 
 function getAgingEntityPickerOptions() {
-  return getAgingOutputSheetNames_(resolveAgingEntitySelection_());
+  return getAgingOutputSheetNames_(resolveAgingEntitySelection_())
+    .filter(name => name !== 'constellation' && name !== 'demo');
 }
 
 function runSelectedAgingExport(entities) {

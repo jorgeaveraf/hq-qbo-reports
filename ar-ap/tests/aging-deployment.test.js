@@ -620,7 +620,9 @@ test('Aging multi-entity menu opens a checkbox dialog and submits selected alias
     clientsById: {
       a: { outputSheetName: 'botanical' },
       b: { outputSheetName: 'nova_farms' },
-      c: { outputSheetName: 'botanical' }
+      c: { outputSheetName: 'botanical' },
+      d: { outputSheetName: 'constellation' },
+      e: { outputSheetName: 'demo' }
     }
   }));
   installFunction(context, 'updateAgingExport', aliases => { calls.push(['export', aliases]); return { status: 'passed' }; });
@@ -659,6 +661,10 @@ test('QBO menu opens a submenu whose entity choices call the matching export sco
   assert.equal(submenu.items.at(-1).caption, 'Select multiple entities...');
   assert.equal(submenu.items.at(-1).handler, 'showAgingEntityPicker');
   const entityItems = submenu.items.slice(1, -1);
+  assert.deepEqual(entityItems.map(item => item.caption), [
+    'botanical', 'punch', 'nova_farms', 'headset', 'primetime',
+    'mfny', 'wessels', 'fresh', 'eaze'
+  ]);
   entityItems.forEach(item => context[item.handler]());
   assert.deepEqual(calls, entityItems.map(item => item.caption));
 });
