@@ -692,7 +692,48 @@ function agingSecureHexEquals_(left, right) {
  * Sheet Export
  ***********************/
 
-function updateAgingExport() {
+function normalizeAgingExportEntities_(entities) {
+  if (entities === undefined || entities === 'all') return 'all';
+  // Apps Script clock triggers pass an event object to their handler.
+  if (entities && typeof entities === 'object' && !Array.isArray(entities) &&
+      typeof entities.triggerUid === 'string') return 'all';
+  const values = Array.isArray(entities) ? entities : [entities];
+  const aliases = values.reduce((result, value) => {
+    if (typeof value !== 'string') throw new Error('Aging export entities must be alias names.');
+    return result.concat(value.split(','));
+  }, []).map(value => value.trim().toLowerCase());
+
+  if (!aliases.length || aliases.some(value => !value)) {
+    throw new Error('At least one Aging export entity alias is required.');
+  }
+  if (aliases.includes('all')) {
+    if (aliases.length === 1) return 'all';
+    throw new Error('Use "all" by itself, or list specific Aging export entities.');
+  }
+  return [...new Set(aliases)];
+}
+
+function filterAgingSelectionByAliases_(selection, entities) {
+  if (entities === 'all') return selection;
+  const availableAliases = getAgingOutputSheetNames_(selection);
+  const unknownAliases = entities.filter(alias => !availableAliases.includes(alias));
+  if (unknownAliases.length) {
+    throw new Error(
+      'Unknown or inactive Aging export entity: ' + unknownAliases.join(', ') +
+      '. Available: ' + availableAliases.join(', ')
+    );
+  }
+
+  const requestedAliases = new Set(entities);
+  const clientsById = {};
+  Object.keys(selection.clientsById).forEach(clientId => {
+    const client = selection.clientsById[clientId];
+    if (requestedAliases.has(client.outputSheetName)) clientsById[clientId] = client;
+  });
+  return { ...selection, clientsById };
+}
+
+function updateAgingExport(entities) {
   const executionStartedAt = Date.now();
   Logger.log('--- AGING EXPORT START ---');
   const lock = LockService.getScriptLock();
@@ -722,7 +763,9 @@ function updateAgingExport() {
     }
 
     const selectionStartedAt = Date.now();
-    const selection = resolveAgingEntitySelection_();
+    const requestedEntities = normalizeAgingExportEntities_(entities);
+    const fullSelection = resolveAgingEntitySelection_();
+    const selection = filterAgingSelectionByAliases_(fullSelection, requestedEntities);
     const clientIds = Object.keys(selection.clientsById);
     const selectionDurationMs = Date.now() - selectionStartedAt;
     const directExport = fetchAgingDirectExport_(selection);
@@ -730,7 +773,7 @@ function updateAgingExport() {
       .filter(sheet => sheet.status !== 'fresh_qbo')
       .map(sheet => sheet.sheetName);
     const fallback = failedSheetNames.length
-      ? loadAgingCompletedSnapshotFallback_(selection, deploymentState)
+      ? loadAgingCompletedSnapshotFallback_(fullSelection, deploymentState)
       : { available: false, reason: 'not_needed', rowsBySheet: {} };
     const spreadsheet = getTargetSpreadsheet_();
     const sheetResults = [];
@@ -801,6 +844,7 @@ function updateAgingExport() {
     const result = {
       status: warningCount ? 'completed_with_warnings' : 'passed',
       event: 'aging_sheet_export_completed',
+      requestedEntities: requestedEntities === 'all' ? 'all' : [...requestedEntities],
       entityConfiguration: buildAgingEntityConfigurationSummary_(selection),
       clientCount: clientIds.length,
       outputSheetCount: directExport.sheets.length,

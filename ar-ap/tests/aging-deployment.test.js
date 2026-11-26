@@ -8,7 +8,7 @@ function loadAgingContext() {
   const context = vm.createContext({});
   const projectDir = path.resolve(__dirname, '..');
 
-  ['1.Config.js', '3.Functions.js', '5.Deployment.js'].forEach(fileName => {
+  ['1.Config.js', '2.Menu.js', '3.Functions.js', '5.Deployment.js'].forEach(fileName => {
     const source = fs.readFileSync(path.join(projectDir, fileName), 'utf8');
     vm.runInContext(source, context, { filename: fileName });
   });
@@ -518,6 +518,186 @@ test('scheduled export delegates when the configuration deployment is active', (
   assert.equal(result.status, 'delegated_to_configuration_deployment');
   assert.equal(result.currentStage, 'bigquery');
   assert.equal(released, true);
+});
+
+test('direct Aging export scopes requests and writes by alias while preserving all-client defaults', () => {
+  const context = loadAgingContext();
+  const selection = {
+    source: 'test',
+    configuration: {
+      report_key: 'aging', configuration_version: 1, configuration_hash: 'hash',
+      published_at: '2026-09-01T00:00:00.000Z', entities: [{}, {}, {}]
+    },
+    clientsById: {
+      a: { id: 'a', outputSheetName: 'botanical' },
+      b: { id: 'b', outputSheetName: 'botanical' },
+      c: { id: 'c', outputSheetName: 'nova_farms' },
+      d: { id: 'd', outputSheetName: 'constellation' }
+    }
+  };
+  const requests = [];
+  const writes = [];
+  let released = 0;
+  context.LockService = { getScriptLock: () => ({
+    tryLock: () => true,
+    releaseLock: () => { released++; }
+  }) };
+  installFunction(context, 'readAgingDeploymentState_', () => null);
+  installFunction(context, 'resolveAgingEntitySelection_', () => selection);
+  installFunction(context, 'fetchAgingDirectExport_', scoped => {
+    const ids = Object.keys(scoped.clientsById).sort();
+    requests.push(ids);
+    return {
+      requestCount: ids.length * 2, batchCount: 1, failedReportCount: 0, durationMs: 1,
+      sheets: context.getAgingOutputSheetNames_(scoped).map(sheetName => ({
+        sheetName, status: 'fresh_qbo', rows: [[sheetName]], failures: []
+      }))
+    };
+  });
+  installFunction(context, 'getTargetSpreadsheet_', () => ({}));
+  installFunction(context, 'writeOutputSheet_', (rows, name) => writes.push(name));
+
+  const one = context.updateAgingExport(' BOTANICAL ');
+  assert.deepEqual(requests.pop(), ['a', 'b']);
+  assert.deepEqual(writes.splice(0), ['botanical']);
+  assert.equal(one.clientCount, 2);
+  assert.equal(one.gateway.requestCount, 4);
+  assert.deepEqual([...one.requestedEntities], ['botanical']);
+
+  const several = context.updateAgingExport(['nova_farms', 'botanical', 'botanical']);
+  assert.deepEqual(requests.pop(), ['a', 'b', 'c']);
+  assert.deepEqual(writes.splice(0), ['botanical', 'nova_farms']);
+  assert.deepEqual([...several.requestedEntities], ['nova_farms', 'botanical']);
+
+  for (const argument of [undefined, 'all', { triggerUid: 'clock-trigger-1' }]) {
+    const result = context.updateAgingExport(argument);
+    assert.deepEqual(requests.pop(), ['a', 'b', 'c', 'd']);
+    assert.deepEqual(writes.splice(0), ['botanical', 'constellation', 'nova_farms']);
+    assert.equal(result.requestedEntities, 'all');
+  }
+  assert.equal(released, 5);
+});
+
+test('invalid Aging export scope rejects before report requests or sheet writes', () => {
+  const context = loadAgingContext();
+  let requests = 0;
+  let writes = 0;
+  let released = false;
+  context.LockService = { getScriptLock: () => ({
+    tryLock: () => true,
+    releaseLock: () => { released = true; }
+  }) };
+  installFunction(context, 'readAgingDeploymentState_', () => null);
+  installFunction(context, 'resolveAgingEntitySelection_', () => ({
+    clientsById: { a: { outputSheetName: 'botanical' } }
+  }));
+  installFunction(context, 'fetchAgingDirectExport_', () => { requests++; });
+  installFunction(context, 'writeOutputSheet_', () => { writes++; });
+
+  for (const invalid of ['', 'unknown', ['all', 'botanical'], [], ['botanical', '']]) {
+    assert.throws(() => context.updateAgingExport(invalid));
+  }
+  assert.equal(requests, 0);
+  assert.equal(writes, 0);
+  assert.equal(released, true);
+});
+
+test('Aging multi-entity menu opens a checkbox dialog and submits selected aliases', () => {
+  const context = loadAgingContext();
+  const calls = [];
+  const html = {
+    setWidth: width => { calls.push(['width', width]); return html; },
+    setHeight: height => { calls.push(['height', height]); return html; }
+  };
+  context.HtmlService = { createHtmlOutputFromFile: name => {
+    calls.push(['file', name]);
+    return html;
+  } };
+  context.SpreadsheetApp = { getUi: () => ({
+    showModalDialog: (output, title) => calls.push(['dialog', output, title])
+  }) };
+  installFunction(context, 'resolveAgingEntitySelection_', () => ({
+    clientsById: {
+      a: { outputSheetName: 'botanical' },
+      b: { outputSheetName: 'nova_farms' },
+      c: { outputSheetName: 'botanical' }
+    }
+  }));
+  installFunction(context, 'updateAgingExport', aliases => { calls.push(['export', aliases]); return { status: 'passed' }; });
+
+  context.showAgingEntityPicker();
+  assert.deepEqual(calls.slice(0, 3), [['file', 'AgingEntityPicker'], ['width', 420], ['height', 510]]);
+  assert.deepEqual(calls[3], ['dialog', html, 'Update Aging Export']);
+  assert.deepEqual([...context.getAgingEntityPickerOptions()], ['botanical', 'nova_farms']);
+  assert.throws(() => context.runSelectedAgingExport('botanical'), /Select one or more entities/);
+  context.runSelectedAgingExport(['botanical', 'nova_farms']);
+  assert.deepEqual(calls[4], ['export', ['botanical', 'nova_farms']]);
+});
+
+test('QBO menu opens a submenu whose entity choices call the matching export scope', () => {
+  const context = loadAgingContext();
+  const calls = [];
+  const menus = [];
+  const ui = { createMenu: name => {
+    const menu = {
+      name, items: [],
+      addItem(caption, handler) { this.items.push({ caption, handler }); return this; },
+      addSeparator() { return this; },
+      addSubMenu(submenu) { this.items.push({ submenu }); return this; },
+      addToUi() { menus.push(this); }
+    };
+    return menu;
+  } };
+  context.SpreadsheetApp = { getUi: () => ui };
+  installFunction(context, 'updateAgingExport', entity => calls.push(entity));
+
+  context.onOpen();
+  const submenu = menus[0].items[0].submenu;
+  assert.equal(menus[0].name, 'QBO');
+  assert.equal(submenu.name, 'Update Aging Export');
+  assert.equal(submenu.items[0].caption, 'All entities');
+  assert.equal(submenu.items.at(-1).caption, 'Select multiple entities...');
+  assert.equal(submenu.items.at(-1).handler, 'showAgingEntityPicker');
+  const entityItems = submenu.items.slice(1, -1);
+  entityItems.forEach(item => context[item.handler]());
+  assert.deepEqual(calls, entityItems.map(item => item.caption));
+});
+
+test('scoped Aging export validates fallback against the complete authorized selection', () => {
+  const context = loadAgingContext();
+  const selection = {
+    source: 'test',
+    configuration: {
+      report_key: 'aging', configuration_version: 1, configuration_hash: 'hash',
+      entities: [{}, {}]
+    },
+    clientsById: {
+      a: { id: 'a', outputSheetName: 'botanical' },
+      b: { id: 'b', outputSheetName: 'nova_farms' }
+    }
+  };
+  const writes = [];
+  context.LockService = { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) };
+  installFunction(context, 'readAgingDeploymentState_', () => ({ status: 'completed' }));
+  installFunction(context, 'resolveAgingEntitySelection_', () => selection);
+  installFunction(context, 'fetchAgingDirectExport_', scoped => ({
+    requestCount: 2, batchCount: 1, failedReportCount: 1, durationMs: 1,
+    sheets: [{ sheetName: context.getAgingOutputSheetNames_(scoped)[0], status: 'incomplete_qbo', rows: [], failures: [{}] }]
+  }));
+  installFunction(context, 'loadAgingCompletedSnapshotFallback_', received => {
+    assert.deepEqual(Object.keys(received.clientsById).sort(), ['a', 'b']);
+    return { available: true, reason: 'completed_snapshot_available', snapshotDate: '2026-09-01',
+      rowsBySheet: { botanical: [['AR', 'botanical']], nova_farms: [['AR', 'nova_farms']] } };
+  });
+  installFunction(context, 'chooseAgingSheetFallback_', (spreadsheet, sheetName, fallback) => ({
+    source: 'fallback_bigquery', rows: fallback.rowsBySheet[sheetName]
+  }));
+  installFunction(context, 'getTargetSpreadsheet_', () => ({}));
+  installFunction(context, 'writeOutputSheet_', (rows, name) => writes.push(name));
+
+  const result = context.updateAgingExport('botanical');
+  assert.deepEqual(writes, ['botanical']);
+  assert.equal(result.fallbackSheetCount, 1);
 });
 
 test('sheet writes clear only the export columns and reuse the supplied spreadsheet', () => {
